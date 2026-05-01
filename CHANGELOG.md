@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.9.4] — 2026-05-01
+
+### Исправлено
+- **Windows-служба не стартовала на чистой машине без предустановленного pywin32** ([#13](https://github.com/Dach-Coin/rlm-tools-bsl/issues/13)) — `pythonservice.exe` падал с `ModuleNotFoundError: No module named 'servicemanager'` (Event ID 14, Service Error 1053). В uv tool env `pythonservice.exe` запускается без `python.exe` рядом и без обработки `.pth`, поэтому `pywin32_bootstrap` не добавлял каталоги `win32/`, `win32/lib/`, `Pythonwin/` на `sys.path`. Фикс: helper `build_service_pythonpath()` теперь явно прописывает все четыре каталога в `PYTHONPATH`, который пишется в реестр службы (REG_MULTI_SZ `Environment`). На машинах с уже зарегистрированным системным pywin32 поведение не меняется. Для применения нужна переустановка службы — `simple-install-from-pip.ps1` (или `service uninstall && service install`).
+- **Диагностический `diagnose-service-win.ps1 -RunDebug`** — путь до `pythonservice.exe` теперь читается из `ImagePath` в реестре (раньше искал в `Lib\site-packages\win32\` — этого пути нет в uv tool env, секция `12-debug-run` всегда скипалась с `not found`). PYTHONPATH для debug-запуска расширен до тех же 4 каталогов, что и в установленной службе — диагностика теперь воспроизводит реальное окружение службы.
+
 ## [1.9.3] — 2026-04-25
 
 ### Добавлено

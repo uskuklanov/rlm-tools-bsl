@@ -479,13 +479,32 @@ if ($RunDebug) {
             "skip: -RunDebug requires Administrator"
             return
         }
-        if (-not $rlmToolRoot) { "skip: tool root unknown"; return }
-        $ps = Join-Path $rlmToolRoot "Lib\site-packages\win32\pythonservice.exe"
+        if (-not $imagePath) { "skip: ImagePath unavailable (service not installed or not admin)"; return }
+        $ps = $imagePath
+        if ($ps -match '^"([^"]+)"') { $ps = $matches[1] } else { $ps = ($ps -split ' ')[0] }
         if (-not (Test-Path $ps)) { "skip: $ps not found"; return }
+        # Derive site-packages from the *actual* pythonservice.exe directory
+        # (not $rlmToolRoot, which comes from `uv tool dir` and may point to a
+        # different env if the service was installed against global Python or
+        # a different uv profile). This mirrors install-time logic in
+        # _service_win.py: pythonservice.exe is copied to <env>\ and the
+        # matching site-packages is at <env>\Lib\site-packages.
+        $sp = Join-Path (Split-Path -Parent $ps) "Lib\site-packages"
+        if (-not (Test-Path $sp)) { "skip: site-packages not found at $sp"; return }
         "Running: $ps -debug rlm-tools-bsl (5s)"
         $oldPP  = $env:PYTHONPATH
         $oldCFG = $env:RLM_CONFIG_FILE
-        $env:PYTHONPATH      = Join-Path $rlmToolRoot "Lib\site-packages"
+        # Mirror build_service_pythonpath() in src/rlm_tools_bsl/_service_env.py:
+        # pythonservice.exe in a uv tool env has no python.exe sibling, so site
+        # processing / .pth files do not run and pywin32's win32 / Pythonwin
+        # sub-dirs are not on sys.path. We bake them in explicitly so -RunDebug
+        # reproduces the real installed-service environment.
+        $env:PYTHONPATH = @(
+            $sp,
+            (Join-Path $sp "win32"),
+            (Join-Path $sp "win32\lib"),
+            (Join-Path $sp "Pythonwin")
+        ) -join ";"
         $env:RLM_CONFIG_FILE = Join-Path $env:USERPROFILE ".config\rlm-tools-bsl\service.json"
         $stdout = Join-Path $workDir "_debug-stdout.txt"
         $stderr = Join-Path $workDir "_debug-stderr.txt"

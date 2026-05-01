@@ -20,6 +20,7 @@ import win32event
 import win32service
 import win32serviceutil
 
+from rlm_tools_bsl._service_env import build_service_env_vars
 from rlm_tools_bsl.service import _config_path, load_config, save_config
 
 SERVICE_NAME = "rlm-tools-bsl"
@@ -203,21 +204,22 @@ def _set_service_environment(service_name: str, site_packages: str, config_file:
 
     We set:
       PYTHONPATH  — so pythonservice.exe (system Python) can import rlm_tools_bsl
+                    AND find pywin32's servicemanager.pyd / win32 helpers
+                    (site processing does not run for pythonservice.exe in a
+                    uv tool env, so pywin32.pth is not honored — we replicate
+                    its effect via build_service_pythonpath)
       RLM_CONFIG_FILE — so load_config() finds the user's service.json
                         (LocalSystem has a different home dir)
     """
     import winreg
 
     key_path = rf"SYSTEM\CurrentControlSet\Services\{service_name}"
-    env_vars = [
-        f"PYTHONPATH={site_packages}",
-        f"RLM_CONFIG_FILE={config_file}",
-    ]
+    env_vars = build_service_env_vars(site_packages, config_file)
     try:
         with winreg.OpenKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, env_vars)
-        print(f"PYTHONPATH set in service environment: {site_packages}")
-        print(f"RLM_CONFIG_FILE set in service environment: {config_file}")
+        for ev in env_vars:
+            print(f"Service env set: {ev}")
     except Exception as exc:
         print(f"Warning: could not set Environment in registry: {exc}")
 
