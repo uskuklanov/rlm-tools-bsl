@@ -291,6 +291,48 @@ class TestCollector:
         results = _collect_object_synonyms(str(tmp_path))
         assert results == []
 
+    def test_collector_skips_malformed_xml_does_not_crash(self, tmp_path):
+        """BUG-3 (round 13 e2e): один битый/пустой/обрезанный XML НЕ должен
+        ронять весь _collect_object_synonyms — раньше rlm-bsl-index update
+        падал с xml.etree.ElementTree.ParseError, прерывая всю переиндексацию.
+
+        Сейчас: парсер заворачивает Exception в warning и продолжает обход.
+        """
+        cat_dir = tmp_path / "Documents"
+        cat_dir.mkdir()
+
+        # Битый XML 1: полностью пустой файл (воспроизводит реальный кейс с одного из проектов)
+        empty = cat_dir / "БитыйПустой"
+        empty.mkdir()
+        (empty / "БитыйПустой.mdo").write_text("", encoding="utf-8")
+
+        # Битый XML 2: обрезанный
+        truncated = cat_dir / "БитыйОбрезанный"
+        truncated.mkdir()
+        (truncated / "БитыйОбрезанный.mdo").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<mdclass:Document', encoding="utf-8"
+        )
+
+        # Корректный документ — должен пройти
+        good = cat_dir / "ХорошийДокумент"
+        good.mkdir()
+        (good / "ХорошийДокумент.mdo").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<mdclass:Document xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass">'
+            "<name>ХорошийДокумент</name>"
+            "<synonym><key>ru</key><value>Хороший</value></synonym>"
+            "</mdclass:Document>",
+            encoding="utf-8",
+        )
+
+        # Не должно бросить исключение
+        results = _collect_object_synonyms(str(tmp_path))
+        names = {r[0] for r in results}
+        # Корректный документ найден; битые пропущены
+        assert "ХорошийДокумент" in names
+        assert "БитыйПустой" not in names
+        assert "БитыйОбрезанный" not in names
+
     def test_collector_cf_sibling_only_layout(self, tmp_path):
         """CF sibling-only layout: Category/<Name>.xml без объектного подкаталога.
 
@@ -893,8 +935,16 @@ class TestRecipesSearchObjects:
     def test_all_recipes_start_with_search_objects(self):
         from rlm_tools_bsl.bsl_knowledge import _BUSINESS_RECIPES
 
-        # Some recipes use specialized helpers instead of search_objects
-        _NO_SEARCH_OBJECTS = {"тип реквизита", "ссылки"}
+        # Some recipes use specialized helpers instead of search_objects.
+        # v1.10.0 adds: перечисления (find_enum_values), ввод на основании (find_based_on_documents),
+        # структура объекта (get_object_full_structure).
+        _NO_SEARCH_OBJECTS = {
+            "тип реквизита",
+            "ссылки",
+            "перечисления",
+            "ввод на основании",
+            "структура объекта",
+        }
         for domain, recipe in _BUSINESS_RECIPES.items():
             if domain in _NO_SEARCH_OBJECTS:
                 continue

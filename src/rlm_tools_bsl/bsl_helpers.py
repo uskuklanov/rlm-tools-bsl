@@ -765,6 +765,117 @@ def make_bsl_helpers(
             },
         }
 
+    def find_call_hierarchy(
+        name: str,
+        direction: str = "callers",
+        depth: int = 2,
+    ) -> dict:
+        """Build multi-level call hierarchy. v1.10.0: only direction='callers'
+        (uses existing idx_calls_callee). callees/both → structured error-dict.
+
+        Args:
+            name: Target procedure/function name.
+            direction: 'callers' only in v1.10.0.
+            depth: Levels to traverse (1..3, default 2).
+
+        Returns:
+            On success: {root, direction, depth, tree:[{name, callers:[...]}], visited}
+              where each caller is {caller_name, module_path, category, object_name,
+              line, is_export, level}.
+            On unsupported direction: {error, hint, supported_directions}.
+        """
+        if direction not in ("callers", "callees", "both"):
+            return {
+                "error": f"Unknown direction: {direction!r}",
+                "hint": "Use direction='callers' (the only supported direction in v1.10.0).",
+                "supported_directions": ["callers"],
+            }
+        if direction != "callers":
+            return {
+                "error": f"Direction '{direction}' not supported in v1.10.0",
+                "hint": (
+                    "Use direction='callers' to find callers transitively. "
+                    "For callees, the alternative is: extract_procedures(path) + "
+                    "safe_grep over names in the procedure body."
+                ),
+                "supported_directions": ["callers"],
+            }
+        try:
+            depth_int = int(depth)
+        except (TypeError, ValueError):
+            depth_int = 2
+        depth_int = max(1, min(3, depth_int))
+
+        result: dict = {
+            "root": name,
+            "direction": "callers",
+            "depth": depth_int,
+            "tree": [],
+            "visited": 0,
+            "truncated_targets": [],
+        }
+
+        # BFS by levels with cycle protection ON NAME (not on (name, level)).
+        # Если cycle A → B → A: на уровне 1 обрабатываем A, на уровне 2 — B,
+        # на уровне 3 пытаемся снова A. С protection (name, level) ключ (A, 3)
+        # отличается от (A, 1) и A обрабатывается заново → дубликаты + ложное
+        # ощущение «глубокого» дерева. С protection по имени — A обрабатывается
+        # один раз, цикл корректно отсекается.
+        visited_names: set[str] = set()
+        queue: list[tuple[str, int]] = [(name, 1)]
+        # Group callers by callee name for tree[i].
+        by_target: dict[str, list[dict]] = {}
+        # Аккумуляция truncated targets — find_callers_context имеет limit=200
+        # и при популярных методах легко обрезается; молча терять данные нельзя.
+        per_target_truncation: dict[str, dict] = {}
+
+        while queue:
+            target_name, level = queue.pop(0)
+            name_key = target_name.lower()
+            if name_key in visited_names:
+                continue
+            visited_names.add(name_key)
+            result["visited"] += 1
+
+            try:
+                ctx = find_callers_context(target_name, module_hint="", offset=0, limit=200)
+            except Exception:
+                continue
+
+            callers_list: list = []
+            if isinstance(ctx, dict):
+                callers_list = ctx.get("callers", []) or []
+                meta = ctx.get("_meta", {}) or {}
+                if meta.get("has_more"):
+                    per_target_truncation[target_name] = {
+                        "name": target_name,
+                        "level": level,
+                        "total": meta.get("total_callers"),
+                        "returned": meta.get("returned"),
+                    }
+
+            for c in callers_list:
+                caller_dict = {
+                    "caller_name": c.get("caller_name", ""),
+                    "module_path": c.get("file", ""),
+                    "category": c.get("category", ""),
+                    "object_name": c.get("object_name", ""),
+                    "line": c.get("line", 0),
+                    "is_export": bool(c.get("caller_is_export", False)),
+                    "level": level,
+                }
+                by_target.setdefault(target_name, []).append(caller_dict)
+                if level < depth_int:
+                    next_name = c.get("caller_name", "")
+                    if next_name and next_name.lower() not in visited_names:
+                        queue.append((next_name, level + 1))
+
+        for target_name, callers_list in by_target.items():
+            result["tree"].append({"name": target_name, "callers": callers_list})
+        result["truncated_targets"] = list(per_target_truncation.values())
+
+        return result
+
     # XML file names by metadata category (CF format: Ext/<name>.xml)
     _CATEGORY_XML_NAMES = {
         "documents": "Document",
@@ -788,35 +899,59 @@ def make_bsl_helpers(
         """Resolve path to the actual XML file.
 
         Accepts:
-          - Direct path: 'Documents/Name/Ext/Document.xml' → as-is
+          - Direct path: 'Documents/Name/Ext/Document.xml' → as-is if exists
           - Directory path: 'Documents/Name' → tries Ext/<Type>.xml, then .xml, then .mdo
-          - Object path without Ext: 'Documents/Name.xml' → as-is
-        """
-        path_lower = path.lower().replace("\\", "/")
-        if path_lower.endswith(".xml") or path_lower.endswith(".mdo"):
-            return path
+          - "Fake" file path: 'Documents/Name.mdo' / 'Documents/Name.xml'
+            (no actual file at that exact location) → normalize base by stripping
+            the extension and try the same candidate set as for a directory.
 
-        # Try CF format: <path>/Ext/<Type>.xml
-        parts = path.replace("\\", "/").split("/")
+        Raises FileNotFoundError with an explicit hint when nothing resolves.
+        """
+        normalized = path.replace("\\", "/")
+        path_lower = normalized.lower()
+        ends_with_xml = path_lower.endswith(".xml")
+        ends_with_mdo = path_lower.endswith(".mdo")
+
+        if ends_with_xml or ends_with_mdo:
+            try:
+                if resolve_safe(normalized).exists():
+                    return normalized
+            except Exception:
+                pass
+            # Fake .xml/.mdo path: normalize base (strip extension) and rebuild candidates.
+            base = normalized[:-4]
+        else:
+            base = normalized
+
+        if not base:
+            raise FileNotFoundError(f"Path not found: {path!r}")
+
+        parts = base.split("/")
         category = parts[0].lower() if parts else ""
         xml_name = _CATEGORY_XML_NAMES.get(category)
-
         last_segment = parts[-1] if parts else ""
 
-        candidates = []
-        if xml_name:
-            candidates.append(f"{path}/Ext/{xml_name}.xml")
+        candidates: list[str] = []
         # EDT format: Documents/Name/Name.mdo
         if last_segment:
-            candidates.append(f"{path}/{last_segment}.mdo")
-        # Generic fallbacks
-        candidates.append(f"{path}.xml")
-        candidates.append(f"{path}.mdo")
-        # Try glob for any XML in Ext/ (CF) or any .mdo (EDT)
-        candidates_glob = glob_files_fn(f"{path}/Ext/*.xml")
+            candidates.append(f"{base}/{last_segment}.mdo")
+        # CF format: Documents/Name/Ext/<Type>.xml
+        if xml_name:
+            candidates.append(f"{base}/Ext/{xml_name}.xml")
+        # Generic fallbacks for degenerate paths
+        candidates.append(f"{base}.xml")
+        candidates.append(f"{base}.mdo")
+        # Glob fallbacks: any XML in Ext/ (CF) or any .mdo at base (EDT)
+        try:
+            candidates_glob = glob_files_fn(f"{base}/Ext/*.xml")
+        except Exception:
+            candidates_glob = []
         if candidates_glob:
             candidates.extend(candidates_glob[:1])
-        candidates_mdo = glob_files_fn(f"{path}/*.mdo")
+        try:
+            candidates_mdo = glob_files_fn(f"{base}/*.mdo")
+        except Exception:
+            candidates_mdo = []
         if candidates_mdo:
             candidates.extend(candidates_mdo[:1])
 
@@ -827,7 +962,16 @@ def make_bsl_helpers(
             except Exception:
                 continue
 
-        return path  # return original, let read_file_fn produce the error
+        if ends_with_xml or ends_with_mdo:
+            raise FileNotFoundError(
+                f"Path not found: {path!r}. "
+                f"Возможно вы передали '{path}' (фейковый файл). "
+                f"Попробуйте '{base}' (директория) или '{base}/{last_segment}.mdo' (EDT) / "
+                f"'{base}/Ext/{xml_name or '<Type>'}.xml' (CF)."
+            )
+        raise FileNotFoundError(
+            f"Path not found: {path!r}. Use find_module('{last_segment}') to discover the correct path."
+        )
 
     def parse_object_xml(path: str) -> dict:
         """Read a 1C metadata XML file and extract its structure:
@@ -1028,6 +1172,591 @@ def make_bsl_helpers(
             result["parse_error"] = parse_error
         return result
 
+    # ── Categories whose objects are pure metadata (no BSL module by default) ──
+    # Used by _resolve_object_for_full_structure live-fallback to find XML-only
+    # objects (Enums, FunctionalOptions, EventSubscriptions, etc.) when the index
+    # is unavailable.
+    _METADATA_ONLY_CATEGORIES = (
+        "Enums",
+        "Constants",
+        "FunctionalOptions",
+        "EventSubscriptions",
+        "ScheduledJobs",
+        "DefinedTypes",
+        "ExchangePlans",
+        "Subsystems",
+        "Roles",
+        "ChartsOfCharacteristicTypes",
+        "ChartsOfAccounts",
+        "ChartsOfCalculationTypes",
+        # Categories that usually have modules but can also be XML-only:
+        "Catalogs",
+        "Documents",
+        "InformationRegisters",
+        "AccumulationRegisters",
+        "AccountingRegisters",
+        "CalculationRegisters",
+        "BusinessProcesses",
+        "Tasks",
+        "Reports",
+        "DataProcessors",
+    )
+
+    def _resolve_object_for_full_structure(name: str) -> tuple[str | None, str | None]:
+        """Return (category, object_name) for a metadata object via a cascade:
+
+        1. Index path: object_attributes (catches anything with attrs/dims/columns)
+        2. Index path: object_synonyms via search_objects (catches synonym-only objects)
+        3. Index path: enum_values (Enums often have no attributes table row)
+        4. BSL-module path: find_module (legacy fallback for objects with modules)
+        5. Live glob across known metadata categories (XML-only objects without index)
+
+        Returns (None, None) if nothing matched.
+        """
+        name_lower = name.lower()
+
+        # 1. object_attributes — большинство объектов с реквизитами/измерениями/ТЧ
+        if idx_reader is not None:
+            try:
+                rows = idx_reader.get_object_attributes(object_name=name, limit=50)
+            except Exception:
+                rows = None
+            if rows:
+                for r in rows:
+                    if (r.get("object_name") or "").lower() == name_lower:
+                        return r.get("category"), r.get("object_name")
+                # close match — берём первый
+                first = rows[0]
+                return first.get("category"), first.get("object_name")
+
+            # 2. object_synonyms — XML-only объекты с synonym (Enum без атрибутов
+            #    в таблице, Constant, FunctionalOption и т.п.)
+            try:
+                so_rows = idx_reader.search_objects(name, limit=20)
+            except Exception:
+                so_rows = None
+            if so_rows:
+                for s in so_rows:
+                    if (s.get("object_name") or "").lower() == name_lower:
+                        return s.get("category"), s.get("object_name")
+                first = so_rows[0]
+                return first.get("category"), first.get("object_name")
+
+            # 3. enum_values — на случай, если объект Enum, но object_synonyms
+            #    у него нет (старый индекс / специфический проект)
+            try:
+                ev = idx_reader.get_enum_values(name)
+            except Exception:
+                ev = None
+            if ev and not ev.get("error") and ev.get("name"):
+                return "Enums", ev["name"]
+
+        # 4. find_module — объекты с BSL-модулями
+        modules = find_module(name)
+        exact = [m for m in modules if (m.get("object_name") or "").lower() == name_lower]
+        if exact:
+            return exact[0].get("category"), exact[0].get("object_name")
+        if modules:
+            return modules[0].get("category"), modules[0].get("object_name")
+
+        # 5. Live glob по известным метаданным категориям — для конфигов без индекса.
+        for cat in _METADATA_ONLY_CATEGORIES:
+            # Try CF directory layout: {Cat}/{name}/Ext/*.xml
+            try:
+                hits = glob_files_fn(f"{cat}/{name}/Ext/*.xml")
+            except Exception:
+                hits = []
+            if hits:
+                return cat, name
+            # Try EDT layout: {Cat}/{name}/{name}.mdo
+            try:
+                hits = glob_files_fn(f"{cat}/{name}/{name}.mdo")
+            except Exception:
+                hits = []
+            if hits:
+                return cat, name
+            # Try CF sibling-only layout: {Cat}/{name}.xml
+            try:
+                hits = glob_files_fn(f"{cat}/{name}.xml")
+            except Exception:
+                hits = []
+            if hits:
+                return cat, name
+
+        return None, None
+
+    def get_object_full_structure(name: str) -> dict:
+        """Aggregating helper: full object structure in one call.
+
+        Combines metadata from object_attributes / predefined_items / object_synonyms /
+        enum_values / form_elements (when index exists), with live XML fallback.
+        Replaces the typical chain: parse_object_xml + find_attributes + find_predefined +
+        find_enum_values per EnumRef.X.
+
+        _meta semantics:
+          index_used=True  означает «возвращённые в результате СТРУКТУРНЫЕ
+                            секции (attributes, dimensions, resources,
+                            tabular_sections, predefined_items) взяты из
+                            индекса». Это контракт об ИСТОЧНИКЕ возвращаемых
+                            данных, а НЕ об их полноте: если индекс stale
+                            (например, часть TS не успела попасть в
+                            object_attributes, но есть в XML), результат
+                            вернёт только то, что есть в индексе, без чтения
+                            live XML. Это сознательный performance-tradeoff —
+                            хелпер не делает второй парсинг XML «ради
+                            проверки полноты». Если агенту нужна гарантия
+                            полноты — пусть дополнительно вызывает
+                            parse_object_xml() или проверяет свежесть индекса
+                            через get_index_info(). synonym/forms могут быть
+                            подтянуты из live (они вспомогательные); synonym
+                            самой ТЧ может быть обогащён из live по name
+                            (это enrichment, а не замена структурных данных).
+          index_used=False означает «хотя бы часть структуры пришла из live
+                            XML». Причина — в fallback_reason:
+            'index_unavailable_or_table_missing'        — индекса нет / таблицы нет.
+            'index_empty_for_object'                    — индекс есть, но
+                                                         object_attributes пустой
+                                                         для нормальной категории
+                                                         (stale/incomplete index).
+            'category_without_attributes_filled_via_live_xml' — индекс есть, но
+                                                         категория (Enum/Constant/...)
+                                                         по природе не имеет attrs;
+                                                         структура взята live.
+            'index_partially_enriched_from_live_xml'    — индекс дал часть структуры,
+                                                         live XML был вызван
+                                                         (для synonym/forms/ts-synonym
+                                                         enrichment) и ЗАОДНО
+                                                         дозаполнил недостающие
+                                                         структурные секции.
+                                                         Источник смешанный. ВАЖНО:
+                                                         этот reason возникает только
+                                                         когда live в принципе
+                                                         вызывался; если индекс дал
+                                                         synonym+forms+attributes без
+                                                         нужды в live, скрытые в XML
+                                                         TS могут остаться
+                                                         незамеченными — это всё ещё
+                                                         index_used=True (см. выше).
+            'parse_failed: ...'                         — live XML тоже не смог.
+
+          ts_synonyms_available=True ставится ТОЛЬКО когда хотя бы у одной TS
+          в результате есть непустой synonym (не просто факт «мы парсили live»).
+
+        posting для документов:
+          posting в индексе v12 не хранится. На чистом index path
+          (index_used=True без enrichment) posting остаётся None — это согласовано
+          с контрактом «без чтения live XML». Если live был вызван по другим
+          причинам (synonym/forms/ts enrichment, fallback) — posting подхватывается
+          из того же XML-чтения. Если posting нужен гарантированно, агенту
+          следует использовать find_register_movements(doc_name): при пустом
+          результате он сам делает live posting check.
+
+        Returns dict:
+          {object_name, category, synonym, posting,
+           attributes, tabular_sections:[{name, synonym, columns}],
+           dimensions, resources, predefined_items,
+           enum_values_for_typed_refs:{Enum.X:[...]},
+           forms:[str],
+           _meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}
+        """
+        name = _strip_meta_prefix(name)
+
+        # --- Resolve (category, object_name) via metadata-first cascade ---
+        # find_module() работает только по BSL-модулям, поэтому XML-only объекты
+        # (Enums, Constants, многие Catalogs без ObjectModule, FunctionalOption и т.п.)
+        # через него не находятся. Каскад: index metadata → index synonyms →
+        # index enum_values → BSL modules → live glob по категориям.
+        category, obj_name = _resolve_object_for_full_structure(name)
+        if not category and not obj_name:
+            return {
+                "error": f"Объект '{name}' не найден",
+                "_meta": {"index_used": False, "fallback_reason": "object_not_found", "ts_synonyms_available": False},
+            }
+        category = category or ""
+        obj_name = obj_name or name
+
+        result: dict = {
+            "object_name": obj_name,
+            "category": category,
+            "synonym": None,
+            "posting": None,
+            "attributes": [],
+            "tabular_sections": [],
+            "dimensions": [],
+            "resources": [],
+            "predefined_items": [],
+            "enum_values_for_typed_refs": {},
+            "forms": [],
+            "_meta": {
+                "index_used": False,
+                "fallback_reason": None,
+                "ts_synonyms_available": False,
+            },
+        }
+
+        # Категории, у которых ОБЪЕКТНЫХ атрибутов нет по природе:
+        # для них пустой результат get_object_attributes — это норма, а не
+        # признак "stale index". Не путать с _METADATA_ONLY_CATEGORIES, который
+        # включает в т.ч. Catalogs/Documents — у них атрибуты есть.
+        _CATEGORIES_WITHOUT_ATTRIBUTES = {
+            "enums",
+            "constants",
+            "functionaloptions",
+            "eventsubscriptions",
+            "scheduledjobs",
+            "definedtypes",
+            "subsystems",
+            "roles",
+            "exchangeplans",  # имеют content вместо обычных атрибутов
+        }
+
+        def _populate_from_live_xml() -> str | None:
+            """Read object via parse_object_xml and fill result fields.
+
+            Возвращает None при успехе, текст ошибки при неудаче.
+
+            Side-effects через `result["_meta"]`:
+              - Если live дозаполнил СТРУКТУРНЫЕ секции (attributes, dimensions,
+                resources, tabular_sections, predefined_items, которые были
+                пустыми до вызова) — выставляется приватный маркер
+                `_meta["_live_filled_structural"] = True`. Вызывающий код
+                (index path) использует его чтобы понизить index_used=False
+                с fallback_reason='index_partially_enriched_from_live_xml'.
+              - `_meta["ts_synonyms_available"]` ставится True ТОЛЬКО когда после
+                наполнения/обогащения у хотя бы одной TS есть НЕПУСТОЙ synonym.
+            """
+            try:
+                meta = parse_object_xml(f"{category}/{obj_name}" if category else obj_name)
+            except Exception as exc:
+                return f"parse_failed: {type(exc).__name__}: {exc}"
+            if not isinstance(meta, dict):
+                return "parse_failed: non-dict result"
+
+            structural_filled_from_live = False  # для понижения index_used
+
+            # synonym / posting — НЕ структурные данные, обогащение не считается
+            # за «mixed source».
+            if not result["synonym"]:
+                result["synonym"] = meta.get("synonym") or None
+            if meta.get("posting") and not result.get("posting"):
+                result["posting"] = meta["posting"]
+
+            # --- Structural sections ---
+            if not result["attributes"]:
+                for attr in meta.get("attributes", []) or []:
+                    result["attributes"].append(
+                        {
+                            "name": attr.get("name", ""),
+                            "synonym": attr.get("synonym", "") or "",
+                            "type": [attr.get("type", "")]
+                            if isinstance(attr.get("type"), str)
+                            else (attr.get("type") or []),
+                        }
+                    )
+                if result["attributes"]:
+                    structural_filled_from_live = True
+            if not result["dimensions"]:
+                for dim in meta.get("dimensions", []) or []:
+                    result["dimensions"].append(
+                        {
+                            "name": dim.get("name", ""),
+                            "synonym": dim.get("synonym", "") or "",
+                            "type": [dim.get("type", "")]
+                            if isinstance(dim.get("type"), str)
+                            else (dim.get("type") or []),
+                        }
+                    )
+                if result["dimensions"]:
+                    structural_filled_from_live = True
+            if not result["resources"]:
+                for res_attr in meta.get("resources", []) or []:
+                    result["resources"].append(
+                        {
+                            "name": res_attr.get("name", ""),
+                            "synonym": res_attr.get("synonym", "") or "",
+                            "type": [res_attr.get("type", "")]
+                            if isinstance(res_attr.get("type"), str)
+                            else (res_attr.get("type") or []),
+                        }
+                    )
+                if result["resources"]:
+                    structural_filled_from_live = True
+
+            # --- Tabular sections: либо полное заполнение, либо обогащение synonym ---
+            if not result["tabular_sections"]:
+                # Index не дал TS — заполняем целиком из live (synonym у TS будет).
+                for ts in meta.get("tabular_sections", []) or []:
+                    result["tabular_sections"].append(
+                        {
+                            "name": ts.get("name", ""),
+                            "synonym": ts.get("synonym", "") or None,
+                            "columns": [
+                                {
+                                    "name": c.get("name", ""),
+                                    "synonym": c.get("synonym", "") or "",
+                                    "type": [c.get("type", "")]
+                                    if isinstance(c.get("type"), str)
+                                    else (c.get("type") or []),
+                                }
+                                for c in ts.get("attributes", []) or []
+                            ],
+                        }
+                    )
+                if result["tabular_sections"]:
+                    structural_filled_from_live = True
+            else:
+                # TS уже из индекса — у них synonym=None. Обогащаем по name.
+                live_ts_by_name = {(ts.get("name") or "").lower(): ts for ts in meta.get("tabular_sections", []) or []}
+                for ts_in_result in result["tabular_sections"]:
+                    name_key = (ts_in_result.get("name") or "").lower()
+                    live_ts = live_ts_by_name.get(name_key)
+                    if not live_ts:
+                        continue
+                    if not ts_in_result.get("synonym"):
+                        new_syn = live_ts.get("synonym", "") or None
+                        if new_syn:
+                            ts_in_result["synonym"] = new_syn
+
+            # ts_synonyms_available: True ТОЛЬКО если у хотя бы одной TS есть
+            # реально непустой synonym (после полного заполнения / обогащения).
+            if any(ts.get("synonym") for ts in result["tabular_sections"]):
+                result["_meta"]["ts_synonyms_available"] = True
+
+            # forms — НЕ структурные данные.
+            forms = meta.get("forms")
+            if forms and not result["forms"]:
+                result["forms"] = list(forms)
+
+            # predefined_items — структурные.
+            if not result["predefined_items"]:
+                try:
+                    pi_results = find_predefined(object_name=f"{category}/{obj_name}" if category else obj_name)
+                except Exception:
+                    pi_results = []
+                for item in pi_results or []:
+                    result["predefined_items"].append(
+                        {
+                            "name": item.get("item_name", ""),
+                            "synonym": item.get("item_synonym", "") or "",
+                            "code": item.get("item_code", "") or "",
+                            "types": item.get("types", []) or [],
+                            "is_folder": item.get("is_folder", False),
+                        }
+                    )
+                if result["predefined_items"]:
+                    structural_filled_from_live = True
+
+            if structural_filled_from_live:
+                # Приватный маркер для index path: сигнал что live дозаполнил
+                # структуру → нужно понизить index_used.
+                result["_meta"]["_live_filled_structural"] = True
+            return None
+
+        # --- Index path ---
+        attrs_rows: list[dict] | None = None
+        if idx_reader is not None:
+            try:
+                attrs_rows = idx_reader.get_object_attributes(object_name=obj_name, category=category, limit=2000)
+            except Exception:
+                attrs_rows = None
+
+        index_attempted = attrs_rows is not None  # таблица существует и доступна
+        if index_attempted:
+            # Group attributes by attr_kind / ts_name.
+            ts_groups: dict[str, list[dict]] = {}
+            for row in attrs_rows or []:
+                kind = row.get("attr_kind") or ""
+                attr_dict = {
+                    "name": row.get("attr_name", ""),
+                    "synonym": row.get("attr_synonym", "") or "",
+                    "type": row.get("attr_type", []) or [],
+                }
+                if kind == "attribute":
+                    result["attributes"].append(attr_dict)
+                elif kind == "dimension":
+                    result["dimensions"].append(attr_dict)
+                elif kind == "resource":
+                    result["resources"].append(attr_dict)
+                elif kind == "ts_attribute":
+                    ts_name = row.get("ts_name") or ""
+                    ts_groups.setdefault(ts_name, []).append(attr_dict)
+
+            for ts_name, columns in ts_groups.items():
+                result["tabular_sections"].append(
+                    {
+                        "name": ts_name,
+                        "synonym": None,  # TS synonym is not in object_attributes table
+                        "columns": columns,
+                    }
+                )
+
+            # Predefined items
+            try:
+                pi_rows = idx_reader.get_predefined_items(object_name=obj_name, limit=2000)
+            except Exception:
+                pi_rows = None
+            if pi_rows:
+                result["predefined_items"] = [
+                    {
+                        "name": r.get("item_name", ""),
+                        "synonym": r.get("item_synonym", "") or "",
+                        "code": r.get("item_code", "") or "",
+                        "types": r.get("types", []) or [],
+                        "is_folder": r.get("is_folder", False),
+                    }
+                    for r in pi_rows
+                ]
+
+            # Object synonym (object_synonyms table) — small targeted query via search_objects.
+            try:
+                so_rows = idx_reader.search_objects(obj_name, limit=20)
+            except Exception:
+                so_rows = None
+            if so_rows:
+                for s in so_rows:
+                    if (s.get("object_name") or "").lower() == obj_name.lower() and (
+                        not category or (s.get("category") or "").lower() == category.lower()
+                    ):
+                        result["synonym"] = s.get("synonym") or None
+                        break
+
+            # Forms from form_elements (distinct form_name).
+            try:
+                fe_rows = idx_reader.get_form_elements(object_name=obj_name)
+            except Exception:
+                fe_rows = None
+            if fe_rows:
+                seen_forms: list[str] = []
+                for r in fe_rows:
+                    fname = r.get("form_name") or ""
+                    if fname and fname not in seen_forms:
+                        seen_forms.append(fname)
+                result["forms"] = seen_forms
+
+            # --- Determine if index actually delivered STRUCTURAL data ---
+            # Семантика _meta.index_used:
+            #   True  ⇒ структурные данные (attributes / dimensions / resources /
+            #            tabular_sections / predefined_items) взяты из индекса.
+            #   False ⇒ структуру дал live XML (или объект — XML-only по природе).
+            #
+            # synonym и forms сюда НЕ входят: одна строка в object_synonyms
+            # без записей в object_attributes — это «индекс знает что объект
+            # есть», но не «индекс дал структуру». Для нормальных категорий
+            # (Catalogs/Documents/Registers/...) это сигнал stale/incomplete index
+            # → нужен live fallback.
+            cat_lower = category.lower() if category else ""
+            has_structural_index_data = bool(
+                result["attributes"]
+                or result["dimensions"]
+                or result["resources"]
+                or result["tabular_sections"]
+                or result["predefined_items"]
+            )
+
+            if has_structural_index_data:
+                # Структура реально взята из индекса.
+                result["_meta"]["index_used"] = True
+                # synonym/forms — вспомогательные. Если индекс их не дал
+                # (например, object_synonyms не наполнен или это объект без форм),
+                # дополним live XML.
+                # Также: TS из object_attributes идут с synonym=None — таблица
+                # не хранит синоним самой ТЧ. Если есть TS без synonym —
+                # подтягиваем синонимы из live XML по совпадению name (см.
+                # _populate_from_live_xml). Ошибки игнорируем — структура уже
+                # на руках.
+                ts_needs_synonyms = any(ts.get("synonym") is None for ts in result["tabular_sections"])
+                if not result["synonym"] or not result["forms"] or ts_needs_synonyms:
+                    _populate_from_live_xml()
+                # Если live дозаполнил СТРУКТУРНЫЕ секции (например, индекс дал
+                # attributes, но не TS — а live добавил TS), это уже не «чистый
+                # index path». Понижаем index_used и сигнализируем смешанный
+                # источник через специальный fallback_reason. Маркер
+                # _live_filled_structural — приватный, удаляем после использования.
+                if result["_meta"].pop("_live_filled_structural", False):
+                    result["_meta"]["index_used"] = False
+                    result["_meta"]["fallback_reason"] = "index_partially_enriched_from_live_xml"
+            else:
+                # Структурных данных индекс не дал. Идём в live XML fallback,
+                # независимо от того, нашёлся ли synonym/forms — они остаются
+                # как «бонус из индекса», но index_used=False, потому что
+                # СТРУКТУРА (то ради чего вызывается этот хелпер) пришла live.
+                result["_meta"]["index_used"] = False
+                if cat_lower in _CATEGORIES_WITHOUT_ATTRIBUTES:
+                    # XML-only категория (Enum/Constant/FunctionalOption/...) —
+                    # пустой object_attributes здесь норма, не stale index.
+                    # Помечаем отдельной причиной чтобы агент не паниковал.
+                    result["_meta"]["fallback_reason"] = "category_without_attributes_filled_via_live_xml"
+                else:
+                    # Нормальная категория, но object_attributes пустой —
+                    # признак stale/incomplete index для конкретного объекта.
+                    result["_meta"]["fallback_reason"] = "index_empty_for_object"
+                err = _populate_from_live_xml()
+                if err:
+                    # И live тоже не смог — фиксируем причину парсинга,
+                    # перетирая category_without_attributes_filled_via_live_xml.
+                    result["_meta"]["fallback_reason"] = err
+                # Приватный маркер уже отражён через index_used=False и
+                # явный fallback_reason — удаляем чтобы не утекал в API.
+                result["_meta"].pop("_live_filled_structural", None)
+        else:
+            # --- Fallback: live XML parse (index unavailable / table missing) ---
+            result["_meta"]["index_used"] = False
+            result["_meta"]["fallback_reason"] = "index_unavailable_or_table_missing"
+            err = _populate_from_live_xml()
+            if err:
+                result["_meta"]["fallback_reason"] = err
+                result["_meta"].pop("_live_filled_structural", None)
+                return result
+            result["_meta"].pop("_live_filled_structural", None)
+
+        # NOTE: posting для документов в индексе v12 не хранится. Если live XML
+        # был вызван (для enrichment / fallback), posting подхватывается внутри
+        # _populate_from_live_xml. На чистом index path без enrichment posting
+        # остаётся None — это согласовано с контрактом «index_used=True
+        # = без чтения live XML». Если posting нужен независимо от пути —
+        # используй find_register_movements(doc_name): при пустом результате
+        # он сам делает live posting check (см. Tier 1.2).
+
+        # --- Expand enum-ref types → values ---
+        # Принимаем три формы записи типа перечисления:
+        #   EnumRef.X            — стандартный 1С-формат (CF/EDT)
+        #   ПеречислениеСсылка.X — русскоязычный alias
+        #   Enum.X               — канонизированный формат, который может появиться
+        #                          в нормализованных таблицах метаданных
+        _ENUM_TYPE_PREFIXES = ("EnumRef.", "ПеречислениеСсылка.", "Enum.")
+
+        def _is_enum_ref(t) -> bool:
+            return isinstance(t, str) and t.startswith(_ENUM_TYPE_PREFIXES)
+
+        enum_refs: list[str] = []
+        for attr_group in (
+            result["attributes"],
+            result["dimensions"],
+            result["resources"],
+        ):
+            for a in attr_group:
+                for t in a.get("type", []) or []:
+                    if _is_enum_ref(t) and t not in enum_refs:
+                        enum_refs.append(t)
+        for ts in result["tabular_sections"]:
+            for c in ts.get("columns", []) or []:
+                for t in c.get("type", []) or []:
+                    if _is_enum_ref(t) and t not in enum_refs:
+                        enum_refs.append(t)
+
+        for ref in enum_refs:
+            short_name = ref.split(".", 1)[1] if "." in ref else ref
+            try:
+                ev = find_enum_values(short_name)
+            except Exception:
+                continue
+            if isinstance(ev, dict) and not ev.get("error"):
+                result["enum_values_for_typed_refs"][ref] = [
+                    {"name": v.get("name", ""), "synonym": v.get("synonym", "") or ""} for v in (ev.get("values") or [])
+                ]
+
+        return result
+
     def analyze_object(name: str) -> dict:
         """Full object profile in one call: XML metadata + all modules + procedures + exports.
 
@@ -1125,8 +1854,10 @@ def make_bsl_helpers(
     def find_event_subscriptions(
         object_name: str = "",
         custom_only: bool = False,
-    ) -> list[dict]:
-        """Find event subscriptions, optionally filtered by object name.
+        event_filter: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict] | dict:
+        """Find event subscriptions, optionally filtered by object name and/or event.
         Shows what fires when an object is written/posted/deleted.
         Uses SQLite index when available (instant), falls back to XML parsing.
 
@@ -1135,47 +1866,72 @@ def make_bsl_helpers(
                          match against source types). Empty = return all.
             custom_only: If True, return only subscriptions whose name starts
                          with a detected custom prefix (auto-detected from codebase).
+            event_filter: List of event substrings (case-insensitive) — отбор
+                          по полю event. None = без фильтра. ['BeforeWrite']
+                          вернёт все подписки, у которых event содержит 'beforewrite'.
+            limit: Если задан, возврат становится top-level dict
+                   {"subscriptions", "total", "returned", "has_more"}. Если None
+                   (default) — возвращается list[dict] (контракт прежний).
 
-        Returns: list of dicts with name, synonym, source_count, event,
-                 handler, handler_module, handler_procedure, file."""
+        Returns:
+            Default (limit is None): list[dict] of subscriptions.
+            With limit: dict {"subscriptions": [...], "total": N, "returned": K,
+                              "has_more": bool}."""
         if object_name:
             object_name = _strip_meta_prefix(object_name)
 
         # --- Fast path: SQLite index ---
+        result: list[dict] | None = None
         if idx_reader is not None:
-            idx_result = idx_reader.get_event_subscriptions(object_name)
+            idx_result = idx_reader.get_event_subscriptions(object_name, event_filter=event_filter)
             if idx_result is not None:
                 if custom_only:
                     prefixes = _ensure_prefixes()
                     if prefixes:
                         idx_result = [s for s in idx_result if any(s["name"].lower().startswith(p) for p in prefixes)]
-                return idx_result
+                result = idx_result
 
-        all_subs = _ensure_event_subscriptions()
+        if result is None:
+            all_subs = _ensure_event_subscriptions()
 
-        if not object_name:
-            # Return without source_types to keep output compact
-            result = [{k: v for k, v in s.items() if k != "source_types"} for s in all_subs]
-        else:
-            name_lower = object_name.lower()
-            result = []
-            for s in all_subs:
-                # Include subscriptions that explicitly list this object in source_types,
-                # OR subscriptions with empty source_types (source_count=0) — these apply
-                # to all objects of a given type (catch-all subscriptions).
-                if not s["source_types"]:
-                    matched = True
-                else:
-                    matched = any(name_lower in t.lower() for t in s["source_types"])
-                if matched:
-                    result.append(dict(s))  # include source_types for filtered results
+            if not object_name:
+                # Return without source_types to keep output compact
+                result = [{k: v for k, v in s.items() if k != "source_types"} for s in all_subs]
+            else:
+                name_lower = object_name.lower()
+                result = []
+                for s in all_subs:
+                    # Include subscriptions that explicitly list this object in source_types,
+                    # OR subscriptions with empty source_types (source_count=0) — these apply
+                    # to all objects of a given type (catch-all subscriptions).
+                    if not s["source_types"]:
+                        matched = True
+                    else:
+                        matched = any(name_lower in t.lower() for t in s["source_types"])
+                    if matched:
+                        result.append(dict(s))  # include source_types for filtered results
 
-        if custom_only:
-            prefixes = _ensure_prefixes()
-            if prefixes:
-                result = [s for s in result if any(s["name"].lower().startswith(p) for p in prefixes)]
+            if event_filter:
+                evs_lower = [e.lower() for e in event_filter]
+                result = [s for s in result if any(ev in (s.get("event", "") or "").lower() for ev in evs_lower)]
 
-        return result
+            if custom_only:
+                prefixes = _ensure_prefixes()
+                if prefixes:
+                    result = [s for s in result if any(s["name"].lower().startswith(p) for p in prefixes)]
+
+        if limit is None:
+            return result
+
+        # Paginated mode — return top-level dict.
+        total = len(result)
+        page = result[: max(0, int(limit))]
+        return {
+            "subscriptions": page,
+            "total": total,
+            "returned": len(page),
+            "has_more": total > len(page),
+        }
 
     _sched_job_lazy = LazyList()
 
@@ -1391,6 +2147,26 @@ def make_bsl_helpers(
                     seen_refs.add(item["ref"])
         return results
 
+    def _check_document_postable(document_name: str) -> dict:
+        """Live read of Document.posting via parse_object_xml.
+        Returns {"is_postable": bool, "posting": "Allow|Deny|UseSelectively|None"}
+        or empty dict when posting cannot be determined.
+
+        UseSelectively means part of the document types post — НЕ ставим is_postable=False.
+        Только Deny → is_postable=False.
+        """
+        try:
+            meta = parse_object_xml(f"Documents/{document_name}")
+        except Exception:
+            return {}
+        if not isinstance(meta, dict) or meta.get("object_type") != "Document":
+            return {}
+        posting = (meta.get("posting") or "").strip()
+        if not posting:
+            return {"posting": None}
+        is_postable = posting.lower() != "deny"
+        return {"posting": posting, "is_postable": is_postable}
+
     def find_register_movements(document_name: str) -> dict:
         """Find all registers that a document writes to during posting.
         Searches ObjectModule code for 'Движения.RegisterName' pattern.
@@ -1398,14 +2174,17 @@ def make_bsl_helpers(
         Args:
             document_name: Document name (or fragment).
 
-        Returns: dict with document, code_registers, modules_scanned."""
+        Returns: dict with document, code_registers, modules_scanned, и при пустом
+                 итоговом результате — is_postable + hint, если документ непроводимый
+                 (Posting=Deny в XML)."""
         document_name = _strip_meta_prefix(document_name)
 
+        result: dict
         # Fast path: SQLite index
         if idx_reader is not None:
             idx_movements = idx_reader.get_register_movements(document_name)
             if idx_movements is not None:
-                return {
+                result = {
                     "document": document_name,
                     "code_registers": [
                         {"name": m["register_name"], "source": m["source"], "file": m["file"]}
@@ -1417,17 +2196,21 @@ def make_bsl_helpers(
                     "manager_tables": [m["register_name"] for m in idx_movements if m["source"] == "manager_table"],
                     "adapted_registers": [m["register_name"] for m in idx_movements if m["source"] == "adapted"],
                 }
+                _maybe_add_postability_hint(result, document_name)
+                return result
 
         modules = find_by_type("Documents", document_name)
         obj_modules = [m for m in modules if m.get("module_type") == "ObjectModule"]
 
         if not obj_modules:
-            return {
+            result = {
                 "document": document_name,
                 "code_registers": [],
                 "modules_scanned": [],
                 "error": f"ObjectModule для документа '{document_name}' не найден",
             }
+            _maybe_add_postability_hint(result, document_name)
+            return result
 
         movement_re = re.compile(r"Движения\.(\w+)", re.IGNORECASE)
         code_registers: dict[str, dict] = {}  # name -> {name, lines, file}
@@ -1499,7 +2282,35 @@ def make_bsl_helpers(
         result["manager_tables"] = manager_tables
         result["adapted_registers"] = adapted_registers
 
+        _maybe_add_postability_hint(result, document_name)
         return result
+
+    def _maybe_add_postability_hint(result: dict, document_name: str) -> None:
+        """If the combined result has no register movements at all,
+        live-read Document.posting from XML and annotate the result when posting=Deny.
+        Полный итог: code_registers + erp_mechanisms + manager_tables + adapted_registers == [].
+        """
+        empty = (
+            not result.get("code_registers")
+            and not result.get("erp_mechanisms")
+            and not result.get("manager_tables")
+            and not result.get("adapted_registers")
+        )
+        if not empty:
+            return
+        info = _check_document_postable(document_name)
+        if not info:
+            return
+        # info contains: posting (str | None) and optionally is_postable (bool)
+        if info.get("posting"):
+            result["posting"] = info["posting"]
+        if info.get("is_postable") is False:
+            result["is_postable"] = False
+            result["hint"] = (
+                "Документ непроводимый (Posting=Deny) — движений регистров нет. "
+                "Связь с регистрами ищите через find_event_subscriptions / "
+                "регистры сведений с типом источника = документ."
+            )
 
     def find_register_writers(register_name: str) -> dict:
         """Find all documents that write to a specific register.
@@ -2542,11 +3353,24 @@ def make_bsl_helpers(
                     lines.append(f"  help('{name}') - {first_line}")
             return "\n".join(lines)
 
-        # Search by helper name first
+        # Search by helper name first (exact match)
         if task_lower in _registry and _registry[task_lower]["recipe"]:
             return _registry[task_lower]["recipe"]
 
-        # Search by keywords
+        # Pass 1: ТОЧНОЕ совпадение task с keyword.
+        # Без этого прохода длинные keywords типа "иерархия вызовов" в
+        # find_call_hierarchy теряются: substring "вызов" в kw у
+        # find_callers_context (зарегистрирован раньше) ловится первым.
+        # Точное совпадение даёт правильный приоритет независимо от порядка
+        # регистрации.
+        for name, entry in _registry.items():
+            if not entry["recipe"]:
+                continue
+            for kw in entry["kw"]:
+                if kw == task_lower:
+                    return entry["recipe"]
+
+        # Pass 2: substring matching (для запросов, не совпадающих точно).
         for name, entry in _registry.items():
             if not entry["recipe"]:
                 continue
@@ -2555,6 +3379,24 @@ def make_bsl_helpers(
             for kw in entry["kw"]:
                 if kw in task_lower:
                     return entry["recipe"]
+
+        # Bridge to _BUSINESS_RECIPES (G.5b) — for words that are recipe domain
+        # keys / aliases but not helper keywords.
+        try:
+            from rlm_tools_bsl.bsl_knowledge import _BUSINESS_RECIPES, _match_recipe
+
+            domain = _match_recipe(task_lower)
+            if domain and domain in _BUSINESS_RECIPES:
+                recipe = _BUSINESS_RECIPES[domain]
+                lines = [f"BUSINESS RECIPE: {domain}", ""]
+                for i, step in enumerate(recipe.get("compact", []), 1):
+                    lines.append(f"  {i}. {step}")
+                code_hint = recipe.get("code_hint")
+                if code_hint:
+                    lines += ["", "Ready-to-use code:", code_hint]
+                return "\n".join(lines)
+        except Exception:
+            pass  # bridge не должен ломать существующее поведение
 
         # Fallback: show all recipes
         return bsl_help("")
@@ -3325,10 +4167,13 @@ def make_bsl_helpers(
         ["export", "экспорт", "find_exports", "процедур", "функци"],
         "FIND EXPORTS:\n"
         "  modules = find_module('Name')  # replace 'Name'\n"
-        "  path = modules[0]['path']\n"
-        "  exports = find_exports(path)\n"
-        "  for e in exports:\n"
-        "      print(e['name'], 'line:', e['line'], 'export:', e['is_export'])",
+        "  if not modules:\n"
+        "      print('Не найдено')\n"
+        "  else:\n"
+        "      path = modules[0]['path']\n"
+        "      exports = find_exports(path)\n"
+        "      for e in exports:\n"
+        "          print(e['name'], 'line:', e['line'], 'export:', e['is_export'])",
     )
     _reg(
         "read_procedure",
@@ -3337,11 +4182,22 @@ def make_bsl_helpers(
         "code",
         ["read", "чтени", "читать", "содержим", "content", "тело", "body"],
         "READ PROCEDURE BODY:\n"
-        "  body = read_procedure('path/to/Module.bsl', 'ProcedureName')  # numbered in MCP session\n"
-        "  print(body)\n"
-        "  # Or read full file:\n"
-        "  content = read_file('path/to/Module.bsl')\n"
-        "  print(content[:2000])",
+        "  modules = find_module('Name')\n"
+        "  if not modules:\n"
+        "      print('Не найдено')\n"
+        "  else:\n"
+        "      path = modules[0]['path']\n"
+        "      body = read_procedure(path, 'ProcedureName')  # numbered in MCP session\n"
+        "      if body is None:\n"
+        "          # имя неточное или у объекта только XML-метаданные (КОДСобытия и т.п.)\n"
+        "          procs = extract_procedures(path)\n"
+        "          for p in procs:\n"
+        "              print(p['name'], 'export=', p['is_export'])\n"
+        "      else:\n"
+        "          print(body)\n"
+        "  # Если расширения перехватили метод — читать с перехватами:\n"
+        "  full = read_procedure(path, 'ProcName', include_overrides=True)\n"
+        "  # full = оригинал + '=== Перехвачен &Аннотация в расширении X ===' + тело перехвата",
     )
     _reg(
         "find_callers_context",
@@ -3352,15 +4208,70 @@ def make_bsl_helpers(
         "BUILD CALL GRAPH:\n"
         "  # With index: instant across the whole codebase, hint is optional\n"
         "  # Without index: parallel file scan, hint narrows scope\n"
-        "  exports = find_exports('path/to/Module.bsl')\n"
-        "  for e in exports:\n"
-        "      data = find_callers_context(e['name'], '', 0, 50)\n"
-        "      for c in data['callers']:\n"
-        "          print(e['name'], '<-', c['caller_name'], c['file'], 'line:', c['line'])\n"
-        "      if data['_meta']['has_more']:\n"
-        "          print('  ... more callers, increase offset')",
+        "  modules = find_module('Name')\n"
+        "  if not modules:\n"
+        "      print('Не найдено')\n"
+        "  else:\n"
+        "      path = modules[0]['path']\n"
+        "      exports = find_exports(path)\n"
+        "      for e in exports:\n"
+        "          data = find_callers_context(e['name'], '', 0, 50)\n"
+        "          for c in data['callers']:\n"
+        "              print(e['name'], '<-', c['caller_name'], c['file'], 'line:', c['line'])\n"
+        "          if data['_meta']['has_more']:\n"
+        "              print('  ... more callers, increase offset')",
     )
-    _reg("find_callers", find_callers, "find_callers(proc, hint, max_files=20) -> [{file, line, text}]", "code")
+    _reg(
+        "find_call_hierarchy",
+        find_call_hierarchy,
+        "find_call_hierarchy(name, direction='callers', depth=2) -> "
+        "{root, direction, depth, tree:[{name, callers:[{caller_name, module_path, category, "
+        "object_name, line, is_export, level}]}], visited:int, "
+        "truncated_targets:[{name, level, total, returned}]} | {error, hint, supported_directions}",
+        "code",
+        [
+            "иерархия вызовов",
+            "call hierarchy",
+            "граф вызовов",
+            "цепочка вызовов",
+            "depth",
+            "глубина",
+            "транзитивный",
+        ],
+        "BUILD CALL HIERARCHY (multi-level callers tree):\n"
+        "  # depth=1..3 (по умолчанию 2). Только direction='callers' в v1.10.0.\n"
+        "  res = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)\n"
+        "  if 'error' in res:\n"
+        "      print(res['hint'])  # callees/both пока не поддержаны\n"
+        "  else:\n"
+        "      for node in res['tree']:\n"
+        "          for c in node['callers']:\n"
+        "              print(f\"  L{c['level']} {c['caller_name']} <- {c['object_name']} ({c['module_path']}:{c['line']})\")\n"
+        "      # Если на каком-то таргете callers > 200 — узел truncated, дерево неполное:\n"
+        "      for t in res['truncated_targets']:\n"
+        "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): returned {t['returned']}/{t['total']}\")\n"
+        "          # для полного списка callers конкретного метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
+        "  # Одноимённые методы возвращают список носителей — выбирай по object_name/category\n"
+        "  # Для глубины 1 эффективнее обычный find_callers_context()",
+    )
+    _reg(
+        "find_callers",
+        find_callers,
+        "find_callers(proc, hint, max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE: thin wrapper над find_callers_context, default limit=20, без _meta/has_more — quick view; для полного аудита callers — find_callers_context",
+        "code",
+        ["compact callers", "плоский список вызовов", "только пути вызовов"],
+        "COMPACT FIRST PAGE OF CALLERS (для quick view: 3 поля вместо 7, без пагинации):\n"
+        "  hits = find_callers(proc, hint, max_files=20)\n"
+        "  for h in hits:\n"
+        "      print(h['file'], 'line:', h['line'], h['text'])\n"
+        "  # Когда брать find_callers vs find_callers_context:\n"
+        "  #   find_callers          → quick view, первые max_files (default 20). Без has_more —\n"
+        "  #                           если callers > max_files, остаток молча отбрасывается.\n"
+        "  #   find_callers_context  → полный API: caller_name, object_name, category, is_export\n"
+        "  #                           + _meta с total_callers/has_more и пагинация (offset/limit).\n"
+        "  # Под капотом find_callers вызывает find_callers_context — поиск тот же, но контракт\n"
+        "  # урезан. Для аудита/полного списка — всегда find_callers_context.",
+    )
     _reg(
         "safe_grep",
         safe_grep,
@@ -3373,8 +4284,11 @@ def make_bsl_helpers(
         "      print(r['file'], 'line:', r['line'], r['text'])\n"
         "  # Or find modules by name:\n"
         "  modules = find_module('PartOfName')\n"
-        "  for m in modules:\n"
-        "      print(m['path'], m['category'], m['object_name'])",
+        "  if not modules:\n"
+        "      print('Не найдено')\n"
+        "  else:\n"
+        "      for m in modules:\n"
+        "          print(m['path'], m['category'], m['object_name'])",
     )
 
     _reg(
@@ -3400,6 +4314,9 @@ def make_bsl_helpers(
         "  # Accepts directory or XML path — auto-resolves:\n"
         "  meta = parse_object_xml('Documents/РеализацияТоваровУслуг')  # directory\n"
         "  meta = parse_object_xml('Documents/Name/Ext/Document.xml')   # direct XML\n"
+        "  # Также принимает 'фейковый' .mdo-путь — авто-нормализует base:\n"
+        "  meta = parse_object_xml('Documents/X.mdo')   # => Documents/X/X.mdo (EDT) или Ext/Document.xml (CF)\n"
+        "  # Если ничего не найдено — FileNotFoundError с явной подсказкой про директорию.\n"
         "  for key in meta:\n"
         "      print(key, ':', meta[key])",
     )
@@ -3462,7 +4379,9 @@ def make_bsl_helpers(
         "  # All attributes of a document:\n"
         "  attrs = find_attributes(object_name='РеализацияТоваровУслуг')\n"
         "  # Only dimensions of a register:\n"
-        "  dims = find_attributes(object_name='ТоварыОрганизаций', kind='dimension')",
+        "  dims = find_attributes(object_name='ТоварыОрганизаций', kind='dimension')\n"
+        "  # БЕЗ ИНДЕКСА: find_attributes(name='X') без object_name вернёт [] — невозможно сканировать всю кодовую базу.\n"
+        "  # Решение: всегда передавай object_name на проектах без индекса.",
     )
     _reg(
         "find_predefined",
@@ -3478,7 +4397,9 @@ def make_bsl_helpers(
         "  # All predefined of an object:\n"
         "  all_sub = find_predefined(object_name='ВидыСубконтоХозрасчетные')\n"
         "  # Predefined of a catalog:\n"
-        "  countries = find_predefined(object_name='СтраныМира')",
+        "  countries = find_predefined(object_name='СтраныМира')\n"
+        "  # БЕЗ ИНДЕКСА: find_predefined(name='X') без object_name вернёт [] — невозможно сканировать всю кодовую базу.\n"
+        "  # Решение: всегда передавай object_name на проектах без индекса.",
     )
 
     _reg(
@@ -3494,6 +4415,44 @@ def make_bsl_helpers(
         "  print(f\"Реквизитов: {len(meta.get('attributes', []))}\")\n"
         "  for m in result.get('modules', []):\n"
         "      print(f\"  {m['module_type']}: {m['procedures_count']} проц, {m['exports_count']} эксп\")",
+    )
+    _reg(
+        "get_object_full_structure",
+        get_object_full_structure,
+        "get_object_full_structure(name) -> {object_name, category, synonym, posting, attributes, "
+        "tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
+        "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, forms:[str], "
+        "_meta:{index_used: bool — True когда возвращённые структурные секции взяты из индекса "
+        "(контракт об ИСТОЧНИКЕ, не о ПОЛНОТЕ — для проверки полноты на stale-индексе вызывай parse_object_xml); "
+        "fallback_reason: 'index_unavailable_or_table_missing' | 'index_empty_for_object' | "
+        "'category_without_attributes_filled_via_live_xml' | 'index_partially_enriched_from_live_xml' | "
+        "'parse_failed: ...' | None; "
+        "ts_synonyms_available: bool — True ТОЛЬКО если у хотя бы одной TS в результате непустой synonym}}",
+        "composite",
+        [
+            "структура объекта",
+            "полная структура",
+            "карточка объекта",
+            "object structure",
+            "object profile",
+            "вся структура",
+            "реквизиты документа",
+            "реквизиты справочника",
+            "табличные части",
+            "колонки тч",
+        ],
+        "FULL OBJECT STRUCTURE (1 вызов вместо 3-5 — заменяет parse_object_xml + find_attributes + find_predefined + find_enum_values):\n"
+        "  s = get_object_full_structure('РеализацияТоваровУслуг')\n"
+        "  print(f\"{s['object_name']} ({s.get('synonym')}) posting={s.get('posting')}\")\n"
+        "  print(f\"Реквизитов: {len(s['attributes'])}, ТЧ: {len(s['tabular_sections'])}, форм: {len(s['forms'])}\")\n"
+        "  for ts in s['tabular_sections']:\n"
+        "      print(f\"  ТЧ {ts['name']}: {len(ts['columns'])} колонок\")\n"
+        "  # Перечисления уже раскрыты:\n"
+        "  for ref_type, values in s['enum_values_for_typed_refs'].items():\n"
+        "      print(f\"  {ref_type}: {[v['name'] for v in values]}\")\n"
+        "  # _meta.index_used=False означает live XML fallback (синонимы ТЧ доступны только в этом режиме)\n"
+        "  if not s['_meta']['index_used']:\n"
+        "      print('Fallback:', s['_meta']['fallback_reason'])",
     )
     _reg(
         "analyze_document_flow",
@@ -3548,14 +4507,19 @@ def make_bsl_helpers(
     _reg(
         "find_event_subscriptions",
         find_event_subscriptions,
-        "find_event_subscriptions(obj, custom_only=False) -> [{event, handler, handler_module, handler_procedure, ...}]",
+        "find_event_subscriptions(obj, custom_only=False, event_filter=None, limit=None) -> list[dict] (default) | {subscriptions, total, returned, has_more} (when limit set)",
         "business",
         ["подписк", "subscription", "событи", "event", "BeforeWrite", "OnWrite", "ПриЗаписи", "ПередЗаписью"],
-        "FIND EVENT SUBSCRIPTIONS (what fires on document write/post):\n"
-        "  # With index: instant. Without: parses XML on first call.\n"
+        "FIND EVENT SUBSCRIPTIONS:\n"
+        "  # Default — весь список (контракт прежний):\n"
         "  subs = find_event_subscriptions('АвансовыйОтчет')\n"
-        "  for s in subs:\n"
-        "      print(f\"{s['event']}: {s['handler']} ({s['name']})\")",
+        "  for s in subs: print(s['event'], s['handler'])\n"
+        "  # С фильтром по событию (case-insensitive substring):\n"
+        "  before_write = find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite','ПередЗаписью'])\n"
+        "  # С пагинацией (формат меняется на dict!):\n"
+        "  page = find_event_subscriptions('', limit=50)\n"
+        "  # page = {'subscriptions': [...], 'total': N, 'returned': K, 'has_more': bool}\n"
+        "  if page['has_more']: ...  # увеличить limit или сузить event_filter",
     )
     _reg(
         "find_scheduled_jobs",
@@ -3580,6 +4544,9 @@ def make_bsl_helpers(
         "  for r in result['code_registers']:\n"
         "      detail = r.get('lines') or r.get('source', '')\n"
         "      print(f\"  Движения.{r['name']} ({detail})\")\n"
+        "  # Если документ непроводимый — результат содержит is_postable=False + hint:\n"
+        "  if result.get('is_postable') is False:\n"
+        "      print(result['hint'])  # подсказка про подписки/регистры сведений\n"
         "\n"
         "FIND WHO WRITES TO REGISTER:\n"
         "  result = find_register_writers('ТоварыНаСкладах')\n"
@@ -3592,6 +4559,13 @@ def make_bsl_helpers(
         find_register_writers,
         "find_register_writers(reg_name) -> {writers: [{document, source|lines, file}]}",
         "business",
+        ["писатели регистра", "кто пишет", "register writer", "writer"],
+        "FIND WHO WRITES TO REGISTER (обратное к find_register_movements):\n"
+        "  result = find_register_writers('ТоварыНаСкладах')\n"
+        "  for w in result['writers']:\n"
+        "      detail = w.get('lines') or w.get('source', '')\n"
+        "      print(f\"  {w['document']} ({detail})\")\n"
+        "  # Связка: find_register_movements(doc) ↔ find_register_writers(reg) — двусторонний поиск.",
     )
     _reg(
         "find_based_on_documents",
@@ -3740,10 +4714,26 @@ def make_bsl_helpers(
     _reg(
         "get_index_info",
         get_index_info,
-        "get_index_info() -> {builder_version, config_name, has_fts, has_synonyms, ...}",
+        "get_index_info() -> {status, builder_version, config_name, has_fts, has_synonyms, ...}",
         "discovery",
         ["index", "version", "индекс", "версия", "info", "get_index_info"],
-        "CHECK INDEX:\n  info = get_index_info()\n  print(info['builder_version'], info['has_synonyms'])",
+        "CHECK INDEX CAPABILITIES:\n"
+        "  info = get_index_info()\n"
+        "  if info.get('status') != 'ok':\n"
+        "      print('No index — все хелперы работают через filesystem fallback (медленнее).')\n"
+        "      print('USER может построить индекс командой rlm_index(action=\\'build\\') — НЕ вызывай эту команду сам.')\n"
+        "  else:\n"
+        "      print(f\"Index v{info['builder_version']} ({info['methods']} methods)\")\n"
+        "      caps = []\n"
+        "      if info.get('has_fts'): caps.append('search_methods')\n"
+        "      if info.get('has_synonyms'): caps.append('search_objects')\n"
+        "      if info.get('has_regions'): caps.append('search_regions')\n"
+        "      if info.get('has_module_headers'): caps.append('search_module_headers')\n"
+        "      if info.get('has_form_elements'): caps.append('parse_form')\n"
+        "      if info.get('has_object_attributes'): caps.append('find_attributes')\n"
+        "      if info.get('has_predefined_items'): caps.append('find_predefined')\n"
+        "      if info.get('has_extension_overrides'): caps.append('get_overrides')\n"
+        "      print('INSTANT helpers:', caps)",
     )
 
     _reg(
@@ -3835,12 +4825,32 @@ def make_bsl_helpers(
         detect_extensions,
         "detect_extensions() -> {config_role, nearby_extensions, nearby_main, warnings}",
         "extension",
+        ["обнаружить расширения", "детект", "detect", "extension list"],
+        "DETECT EXTENSIONS (диагностика контекста):\n"
+        "  ctx = detect_extensions()\n"
+        "  print(f\"Роль: {ctx['config_role']}\")  # main / extension / unknown\n"
+        "  for e in ctx.get('nearby_extensions', []):\n"
+        "      print(f\"  {e.get('name')} (prefix={e.get('prefix')})\")  # ключ 'prefix', не 'name_prefix'\n"
+        "  # Дальше: get_overrides() для индексных перехватов или find_ext_overrides(ext_path) live",
     )
     _reg(
         "find_ext_overrides",
         find_ext_overrides,
-        "find_ext_overrides(ext_path, obj='') -> {overrides: [{annotation, target_method, extension_method, ...}]}",
+        "find_ext_overrides(ext_path, obj='') -> {extension_path, object_filter, overrides:[{annotation, target_method, extension_method, ...}], total}",
         "extension",
+        ["перехваты расширения", "ext_overrides", "live overrides", "перехваты live"],
+        "FIND OVERRIDES IN EXTENSION (live, без индекса):\n"
+        "  ctx = detect_extensions()\n"
+        "  for e in ctx.get('nearby_extensions', []):\n"
+        "      print(f\"  {e.get('name')} -> {e.get('path')}\")\n"
+        "      ovr = find_ext_overrides(e['path'])  # все перехваты этого расширения\n"
+        "      print(f\"    total={ovr['total']}\")\n"
+        "      for o in ovr['overrides'][:5]:\n"
+        "          print(f\"      &{o['annotation']} {o['target_method']}\")\n"
+        "  # Прицельный поиск по объекту:\n"
+        "  ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
+        "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
+        "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.",
     )
     _reg(
         "get_overrides",

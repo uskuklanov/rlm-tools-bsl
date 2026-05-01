@@ -4,9 +4,9 @@ from rlm_tools_bsl.bsl_knowledge import (
     BSL_PATTERNS,
     EFFORT_LEVELS,
     EffortConfig,
-    RLM_EXECUTE_DESCRIPTION,
     RLM_START_DESCRIPTION,
     _BUSINESS_RECIPES,
+    _RECIPE_ALIASES,
     _match_recipe,
     get_strategy,
 )
@@ -158,24 +158,32 @@ def test_rlm_start_description():
     assert "find_module" in RLM_START_DESCRIPTION
 
 
-def test_rlm_execute_description():
-    assert "BSL" in RLM_EXECUTE_DESCRIPTION
-    assert "find_module" in RLM_EXECUTE_DESCRIPTION
-    assert "grep" in RLM_EXECUTE_DESCRIPTION
-
-
 # --- Business recipes ---
 
 
 def test_business_recipes_structure():
     """All domains must have compact and full keys."""
-    assert len(_BUSINESS_RECIPES) == 9
+    # v1.10.0: 9 base + перечисления + ввод на основании + структура объекта = 12
+    assert len(_BUSINESS_RECIPES) == 12
+    short_full_allowed = {
+        "тип реквизита": 3,
+        "ссылки": 3,
+        "перечисления": 4,
+        "ввод на основании": 4,
+        "структура объекта": 4,
+    }
     for domain, recipe in _BUSINESS_RECIPES.items():
         assert "compact" in recipe, f"{domain}: missing compact"
         assert "full" in recipe, f"{domain}: missing full"
         assert len(recipe["compact"]) >= 2, f"{domain}: compact too short"
-        min_full = 3 if domain in ("тип реквизита", "ссылки") else 6
+        min_full = short_full_allowed.get(domain, 6)
         assert len(recipe["full"]) >= min_full or domain == "интеграция", f"{domain}: full too short"
+
+
+def test_recipe_aliases_consistency():
+    """Each alias must point to an existing _BUSINESS_RECIPES domain."""
+    for alias, dom in _RECIPE_ALIASES.items():
+        assert dom in _BUSINESS_RECIPES, f"alias '{alias}' points to missing domain '{dom}'"
 
 
 def test_match_recipe_found():
@@ -233,7 +241,7 @@ def test_strategy_compact_recipe_low_effort():
     text = get_strategy("low", None, query="себестоимость")
     assert "BUSINESS RECIPE: себестоимость" in text
     # Extract only the recipe section
-    start = text.index("BUSINESS RECIPE")
+    start = text.index("BUSINESS RECIPE: себестоимость")
     rest = text[start:]
     end = rest.index("\n\n") if "\n\n" in rest else len(rest)
     recipe_section = rest[:end]
@@ -267,14 +275,14 @@ def test_strategy_full_recipe_max_effort():
 
 def test_strategy_no_recipe_without_query():
     text = get_strategy("high", None, query="")
-    assert "BUSINESS RECIPE" not in text
+    assert "BUSINESS RECIPE: " not in text
     # Step 0 generic hint still present
     assert "Step 0" in text
 
 
 def test_strategy_no_recipe_no_match():
     text = get_strategy("high", None, query="Найди HTTP-сервисы")
-    assert "BUSINESS RECIPE" not in text
+    assert "BUSINESS RECIPE: " not in text
 
 
 def test_strategy_recipe_all_domains():

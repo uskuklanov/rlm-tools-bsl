@@ -1932,7 +1932,12 @@ def _collect_metadata_tables(
         content = _read(fp)
         if not content:
             continue
-        parsed = parse_metadata_xml(content)
+        # Битый XML одного файла не должен ронять весь сбор подсистем.
+        try:
+            parsed = parse_metadata_xml(content)
+        except Exception as exc:
+            logger.warning("subsystems collector: skipping malformed %s: %s", fp, exc)
+            continue
         if not parsed or parsed.get("object_type") != "Subsystem":
             continue
         sub_name = parsed.get("name", "")
@@ -3645,8 +3650,18 @@ def _refresh_global_object(
     # `parse_metadata_xml`, не специализированный парсер. Лишний один парсинг
     # на объект гарантирует совпадение синонима с bulk path.
     if opt.get("has_synonyms") and opt.get("has_synonyms_table"):
-        meta_parsed = parse_metadata_xml(content) or {}
-        _insert_synonym_for_object(conn, category, object_name, meta_parsed, rel)
+        try:
+            meta_parsed = parse_metadata_xml(content) or {}
+        except Exception as exc:
+            logger.warning(
+                "pointwise synonym refresh: skipping %s/%s due to parse error: %s",
+                category,
+                object_name,
+                exc,
+            )
+            meta_parsed = {}
+        if meta_parsed:
+            _insert_synonym_for_object(conn, category, object_name, meta_parsed, rel)
 
 
 # ---------------------------------------------------------------------------
@@ -4052,7 +4067,27 @@ def _collect_object_synonyms(
         content = _read_safe(fp)
         if not content:
             return
-        parsed = parse_metadata_xml(content)
+        # Защита от битых/пустых/обрезанных XML: один файл не должен ронять
+        # всю переиндексацию категории. Логируем и пропускаем.
+        import xml.etree.ElementTree as _ET
+
+        try:
+            parsed = parse_metadata_xml(content)
+        except _ET.ParseError as exc:
+            logger.warning(
+                "_collect_object_synonyms: skipping malformed XML %s: %s",
+                fp,
+                exc,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "_collect_object_synonyms: skipping %s due to unexpected parse error: %s: %s",
+                fp,
+                type(exc).__name__,
+                exc,
+            )
+            return
         if not parsed:
             return
         raw_synonym = parsed.get("synonym") or ""
@@ -7061,12 +7096,16 @@ class IndexReader:
         self,
         object_name: str = "",
         custom_only: bool = False,
+        event_filter: list[str] | None = None,
     ) -> list[dict] | None:
         """Get event subscriptions from the index, optionally filtered.
 
         Args:
             object_name: Filter by source type (case-insensitive substring).
             custom_only: Not applied here (requires prefix detection from helpers).
+            event_filter: List of event substrings (case-insensitive) — match on
+                          event column. Server-side SQL filter, applied in addition
+                          to object_name filter (which runs on JSON source_types).
 
         Returns:
             List of dicts matching find_event_subscriptions format, or None
@@ -7074,14 +7113,36 @@ class IndexReader:
         """
         with self._lock:
             try:
-                rows = self._conn.execute(
+                sql = (
                     "SELECT name, synonym, event, handler_module, handler_procedure, "
                     "source_types, source_count, file FROM event_subscriptions"
-                ).fetchall()
+                )
+                params: list = []
+                if event_filter:
+                    clauses = []
+                    for ev in event_filter:
+                        clauses.append("py_lower(event) LIKE '%' || py_lower(?) || '%'")
+                        params.append(ev)
+                    sql += " WHERE " + " OR ".join(clauses)
+                rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 return None
 
             if not rows:
+                # Distinguish three cases:
+                #   (1) table missing                       → None (handled above by OperationalError)
+                #   (2) table empty / stale                 → None (caller should fall back live)
+                #   (3) table non-empty, filter matched 0   → []   (authoritative)
+                if event_filter:
+                    # Дополнительно проверяем что таблица в принципе непустая,
+                    # чтобы НЕ заглушить live fallback на stale/empty index.
+                    try:
+                        cnt_row = self._conn.execute("SELECT COUNT(*) AS cnt FROM event_subscriptions").fetchone()
+                    except sqlite3.OperationalError:
+                        return None
+                    if cnt_row is None or cnt_row["cnt"] == 0:
+                        return None  # table is empty → caller should try live XML
+                    return []  # table has rows, filter matched nothing — authoritative
                 return None
 
             result: list[dict] = []

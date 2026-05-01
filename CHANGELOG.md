@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.10.0] — 2026-05-01
+
+### Добавлено
+- **`get_object_full_structure(name)`** — агрегирующий хелпер: метаданные + ТЧ + реквизиты + предопределённые + раскрытые перечисления + список форм за **один вызов вместо 3-5**. Заменяет цепочку `parse_object_xml + find_attributes + find_predefined + find_enum_values`. Работает поверх существующих таблиц `object_attributes`, `predefined_items`, `object_synonyms`, `enum_values`, `form_elements`. При отсутствии индекса — fallback на live XML с пометкой `_meta.index_used=False` (в этом режиме доступны синонимы ТЧ, не индексируемые в v12). Закрывает сценарий D1 из e2e-тестов 2026-04.
+- **`find_call_hierarchy(name, direction='callers', depth=1..3)`** — транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации `find_callers_context`). Использует существующий `idx_calls_callee` (без bump индекса). `direction='callees'/'both'` пока не поддержано — возвращает структурированный error-dict с hint, без traceback. Закрывает D2 (частично).
+- **Anti-duplicate detection** в `Sandbox._wrap_helpers` — session-wide: при повторном вызове хелпера с идентичными аргументами в ответе `rlm_execute` появляется секция `duplicates: [{call: seq, prev_call: seq, helper: name}]`. Cross-execute дубли тоже видны — состояние не обнуляется на каждый `execute()`. Возвращаемые значения хелперов не меняются. Закрывает C3.
+- **`is_postable` hint в `find_register_movements`** — при пустом итоговом результате (`code_registers + erp_mechanisms + manager_tables + adapted_registers == []`) helper делает live-чтение `Document.posting` через `parse_object_xml` и при `Posting=Deny` возвращает `is_postable: false` + `hint`. `UseSelectively` НЕ помечается непроводимым. Закрывает B1. `parse_metadata_xml` расширен на извлечение атрибута `posting` для документов (CF child-tag `<Posting>` + EDT attribute `posting=`).
+- **`event_filter` + `limit` в `find_event_subscriptions`** — при заданном `limit` возврат становится top-level dict `{subscriptions, total, returned, has_more}`; default `limit=None` сохраняет прежний контракт `list[dict]`. Серверная SQL-фильтрация по `event` через `IndexReader.get_event_subscriptions(event_filter=...)`. Закрывает C1.
+- **2 новых BR-домена**: `«перечисления»`, `«ввод на основании»`, `«структура объекта»`. Расширен домен `«ссылки»` (find_defined_types). 18+ новых алиасов (`движения`, `проводки`, `posting`, `макеты`, `печатные формы`, `enum`, `статусы`, `карточка объекта`, `формы`, `register movements` и др.).
+- **`bsl_help` bridge** к `_BUSINESS_RECIPES`/`_RECIPE_ALIASES` — `help('движения')`, `help('как проводится документ')`, `help('структура объекта')` и т.п. теперь возвращают рецепты доменов (не только helper-recipes).
+- **Recipes** для `find_register_writers`, `detect_extensions`, `find_ext_overrides`, `get_object_full_structure`, `find_call_hierarchy`. Расширены recipes `find_attributes`, `find_predefined`, `get_index_info`, `read_procedure`. У `find_callers` теперь явно прописан компактный режим (3 поля vs 7 у `find_callers_context`, идентичный поиск под капотом) — добавлена пара в DISAMBIGUATION + recipe.
+- **DISAMBIGUATION-секция** в strategy: `get_object_full_structure` vs `analyze_object`, `find_call_hierarchy` vs `find_callers_context`, `find_register_movements` vs `find_register_writers`/`analyze_document_flow`, `parse_object_xml` vs `find_attributes`, `search` vs `search_X`, `read_procedure` ± `include_overrides`.
+
+### Изменено
+- **`_resolve_object_xml`** — жёсткая проверка пути с нормализацией base. При несуществующем `.mdo`/`.xml` пути сначала отрезает расширение и пробует кандидаты для нормализованного base (`<base>/<seg>.mdo`, `<base>/Ext/<XML>.xml`, `<base>.xml`, `<base>.mdo`, glob). Раньше возвращался AS-IS — мусорные `Documents/X.mdo/X.mdo.mdo` могли строиться через старую ветку. Теперь FileNotFoundError содержит явную подсказку про директорию. Закрывает A1.
+- **Sandbox `_add_error_hints`** — добавлены ветки для `read_procedure` (XML-only объекты вроде КОДСобытия + подсказка про `extract_procedures(path)`) и расширенный hint для `parse_object_xml` (фейковые `.mdo`-пути авто-нормализуются). Закрывает A2/A3.
+- **Step 4 ANALYZE в стратегии** расширен с разбивкой INSTANT (`find_register_writers`, `find_register_movements`, `find_event_subscriptions`, `find_scheduled_jobs`, `find_roles`, `find_defined_types`, `find_enum_values`, `get_object_full_structure`) / HYBRID (`find_functional_options`) / LIVE (`find_based_on_documents`, `find_print_forms`, `analyze_object`, `analyze_document_flow`).
+- **Step 0 UNDERSTAND** переписан: «If a BUSINESS RECIPE section appears below — follow it. No recipe? → analyze_subsystem».
+- **Step 2 READ** — добавлено уточнение по контракту `read_procedure`: «`str | None`. None = имя неточное или у объекта только XML — звони `extract_procedures(path)`.»
+- **Step 3 TRACE** — добавлен `find_call_hierarchy(name, direction='callers', depth=2)`.
+- **Recipe-рецепт `проведение`** — добавлен шаг `проверить is_postable` + `event_filter` для подписок + `find_call_hierarchy('ОбработкаПроведения', depth=2)`.
+- **Server `rlm_execute` docstring** — упрощён, убрано устаревшее перечисление хелперов. Полный список агент получает в `rlm_start.strategy` через `build_helpers_table` (динамика). Удалён мёртвый `RLM_EXECUTE_DESCRIPTION` из `bsl_knowledge.py`.
+
+### Обратная совместимость
+- **Индекс не меняется** (BUILDER_VERSION=12 как в v1.9.x) — миграция не требуется, fresh build не нужен.
+- `find_event_subscriptions` без `limit` (default) сохраняет прежний `list[dict]` контракт. Top-level dict — только при явно заданном `limit`.
+- `read_procedure` остался `str | None`.
+- `find_register_movements` всегда возвращает поля `code_registers/modules_scanned/...`; новые `is_postable/posting/hint` появляются только при пустом результате для непроводимого документа.
+- `find_callers` остался — внутренняя логика поиска не менялась (та же обёртка над `find_callers_context`, идентичные fast path и FS-fallback). В реестре теперь позиционируется как «compact mode» того же поиска.
+
+### Перенесено в parking lot (требует bump индекса в следующем релизе)
+- `parse_form` расширения (FormParameters, DataPath, иерархия элементов).
+- `find_register_writers` расширение на `RegisterRecords.X.Add()` / `СоздатьНаборЗаписей()`.
+- `find_call_hierarchy(direction='callees'/'both')` — упирается в отсутствие `idx_calls_caller` (осознанно вырезан ради -56 МБ на ERP).
+
 ## [1.9.4] — 2026-05-01
 
 ### Исправлено

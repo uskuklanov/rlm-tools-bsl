@@ -51,6 +51,8 @@ BLOCKED_BUILTINS = frozenset(
 class HelperCall:
     name: str
     elapsed: float
+    seq: int = 0
+    duplicate_of: int | None = None
 
 
 @dataclass
@@ -91,6 +93,9 @@ class Sandbox:
         self._namespace: dict = {}
         self._resolve_safe = None
         self._helper_calls: list[HelperCall] = []
+        # Session-wide state for duplicate-call detection. NOT cleared in execute().
+        self._session_call_count: int = 0
+        self._session_call_signatures: dict[str, int] = {}
         self._setup_namespace()
 
     def _setup_namespace(self) -> None:
@@ -177,7 +182,7 @@ class Sandbox:
                 self._namespace[name] = self._wrap_helpers({name: fn})[name]
 
     def _wrap_helpers(self, helpers: dict) -> dict:
-        """Wrap callable helpers with timing instrumentation."""
+        """Wrap callable helpers with timing + session-wide duplicate-call detection."""
         wrapped = {}
         for name, obj in helpers.items():
             if callable(obj):
@@ -185,10 +190,31 @@ class Sandbox:
                 @functools.wraps(obj)
                 def _timed(*args, _fn=obj, _name=name, **kwargs):
                     t0 = _time.monotonic()
+                    self._session_call_count += 1
+                    seq = self._session_call_count
+                    duplicate_of: int | None = None
+                    sig_key: str | None = None
+                    try:
+                        sig_key = repr((_name, args, sorted(kwargs.items())))
+                    except Exception:
+                        sig_key = None
+                    if sig_key is not None:
+                        prev = self._session_call_signatures.get(sig_key)
+                        if prev is not None:
+                            duplicate_of = prev
+                        else:
+                            self._session_call_signatures[sig_key] = seq
                     try:
                         return _fn(*args, **kwargs)
                     finally:
-                        self._helper_calls.append(HelperCall(_name, _time.monotonic() - t0))
+                        self._helper_calls.append(
+                            HelperCall(
+                                _name,
+                                _time.monotonic() - t0,
+                                seq=seq,
+                                duplicate_of=duplicate_of,
+                            )
+                        )
 
                 wrapped[name] = _timed
             else:
@@ -273,10 +299,19 @@ class Sandbox:
         if "FileNotFoundError" in error or "No such file" in error:
             if "parse_object_xml" in code:
                 hints.append(
-                    "HINT: parse_object_xml accepts directory paths too: "
-                    "parse_object_xml('Documents/Name') — it auto-finds the XML."
+                    "HINT: parse_object_xml auto-resolves directory paths and 'fake' .mdo/.xml paths. "
+                    "Call parse_object_xml('Documents/Name') — it tries Documents/Name/Name.mdo (EDT) "
+                    "and Documents/Name/Ext/Document.xml (CF) automatically."
                 )
-            elif ".xml" in code or ".bsl" in code:
+            if "read_procedure" in code:
+                hints.append(
+                    "HINT: read_procedure raised FileNotFoundError. Possible causes: "
+                    "(1) wrong path — use find_module(name) to discover modules; "
+                    "(2) object has only XML metadata (e.g. КОДСобытия, ДействияСобытия) — no BSL file. "
+                    "If the path is correct but the procedure name might be wrong, call "
+                    "extract_procedures(path) for the actual list (with case)."
+                )
+            if "parse_object_xml" not in code and "read_procedure" not in code and (".xml" in code or ".bsl" in code):
                 hints.append(
                     "HINT: Use find_module('Name') or glob_files('**/pattern') to discover correct file paths first."
                 )

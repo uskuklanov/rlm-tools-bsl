@@ -542,6 +542,19 @@ def _parse_cf_xml(root) -> dict:
                             }
                         )
 
+        # Document.Posting (Allow / Deny / UseSelectively).
+        # CF stores it as <Posting>Allow</Posting> in Properties; check namespaced and bare tags.
+        if meta_tag == "Document":
+            posting_text = _xml_find_text(props, "md:Posting", ns)
+            if not posting_text:
+                for ch in props:
+                    local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+                    if local.lower() == "posting" and ch.text:
+                        posting_text = ch.text.strip()
+                        break
+            if posting_text:
+                result["posting"] = posting_text
+
     if references:
         result["references"] = references
 
@@ -805,6 +818,21 @@ def _parse_mdo_xml(root) -> dict:
                                 "used_in_suffix": "Type",
                             }
                         )
+
+    # Document.posting (Allow / Deny / UseSelectively).
+    # EDT хранит признак проводимости как:
+    #   - атрибут на корневом элементе: <Document posting="Allow" ...>
+    #   - дочерний тег <posting>Allow</posting>
+    # Поле <realTimePosting> здесь НЕ учитывается — это отдельная семантика
+    # (оперативное проведение): документ может быть posting=Allow и
+    # realTimePosting=Deny одновременно. Их нельзя путать.
+    # Отсутствие <posting> в EDT = default Allow (документ проводимый).
+    if meta_tag == "Document":
+        posting_text = root.attrib.get("posting", "").strip()
+        if not posting_text:
+            posting_text = _xml_direct_text(root, "posting")
+        if posting_text:
+            result["posting"] = posting_text
 
     if references:
         result["references"] = references

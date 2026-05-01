@@ -60,8 +60,8 @@ If a helper returns an error, read the HINT at the end — it tells you what to 
 BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
 
 Step 0 — UNDERSTAND: decode the business question
-  Check _BUSINESS_RECIPES for guided analysis plan
-  analyze_subsystem('ПодсистемаИмя') → all objects in the business domain
+  If a "BUSINESS RECIPE" section appears below — follow it. It was auto-selected by your query.
+  No recipe? → analyze_subsystem('ПодсистемаИмя') for domain overview, then proceed to Step 1.
 
 Step 1 — DISCOVER: find what you need
   search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
@@ -80,21 +80,46 @@ Step 1 — DISCOVER: find what you need
 
 Step 2 — READ: understand the code
   extract_procedures(path) → list all procedures with lines
-  read_procedure(path, 'ProcName') → get procedure body (numbered)
+  read_procedure(path, 'ProcName') → str | None. None = имя неточное или у объекта только XML — звони extract_procedures(path).
   find_exports(path) → exported API of a module
 
 Step 3 — TRACE: follow the call chains
-  find_callers_context(proc, hint) → who calls this procedure
+  find_callers_context(proc, hint) → who calls this procedure (1 уровень + контекст вызова)
+  find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
   safe_grep(pattern, hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
 Step 4 — ANALYZE: get the full picture
+  get_object_full_structure(name) → INSTANT: метаданные + ТЧ + реквизиты + предопределённые + раскрытые перечисления + список форм. Используй ВМЕСТО parse_object_xml + find_attributes + find_predefined.
   analyze_object(name) → metadata + all modules + procedures
   analyze_document_flow(doc_name) → subscriptions + register movements + jobs
   find_custom_modifications(object_name) → find non-standard code by prefix
-  find_register_movements(doc_name) → which registers a document writes to
+  find_register_movements(doc_name) → which registers a document writes to (is_postable hint при пустом результате)
   CAUTION: analyze_document_flow and analyze_object scan many files — on large configs (10K+)
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
+
+== STEP 4 EXTENDED (по перформансу) ==
+
+INSTANT (индексный путь, OK для batch 5-10 в одном rlm_execute):
+  find_register_writers(reg_name)        → документы-писатели регистра
+  find_register_movements(doc_name)      → регистры, в которые пишет документ
+  find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
+  find_scheduled_jobs(name='')           → регламентные задания
+  find_roles(obj_name)                   → роли с правами на объект
+  find_defined_types(name)               → раскрытие ОпределяемогоТипа
+  find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
+  get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
+
+HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
+  find_functional_options(obj_name)      → xml_options из индекса; code_options через safe_grep (live, всегда)
+
+LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
+  find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
+  find_print_forms(obj_name)             → read_procedure(ДобавитьКомандыПечати) — медленно на CommonModules
+  analyze_object(name)                   → читает ВСЕ модули объекта
+  analyze_document_flow(doc)             → объединяет subscriptions + registers + jobs + based_on + print
+
+CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.
 
 Step 5 — EXTENSIONS: check if behavior is modified
   get_overrides('ObjectName') → indexed overrides (instant)
@@ -103,10 +128,59 @@ Step 5 — EXTENSIONS: check if behavior is modified
   NOTE: extension files are OUTSIDE the sandbox. Do NOT read them via read_file/glob_files.
   Use ONLY the helpers above — they read extension code internally.
 
+== DISAMBIGUATION ==
+get_object_full_structure(name) vs analyze_object(name):
+  - get_object_full_structure → ТОЛЬКО metadata (attrs, ТЧ, predefined, enums, forms list). INSTANT с индексом.
+  - analyze_object → metadata + modules + procedures_count + exports. Тяжелее, читает все модули.
+  Сначала get_object_full_structure; analyze_object — только если нужны процедуры.
+
+find_call_hierarchy(name, depth=N) vs find_callers_context(name):
+  - find_callers_context → 1 уровень callers + контекст вызова (line/text). Быстрее.
+  - find_call_hierarchy → N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.
+  Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy.
+
+find_callers(name) vs find_callers_context(name):
+  - find_callers          → COMPACT FIRST PAGE: тонкая обёртка над find_callers_context,
+                            default limit=20, без _meta/has_more, плоский [{file, line, text}].
+                            Quick view; если callers > max_files — остаток молча отбрасывается.
+  - find_callers_context  → ПОЛНЫЙ API: caller_name, object_name, category, is_export
+                            + _meta с total_callers/has_more и пагинация (offset/limit).
+  Под капотом — один и тот же поиск (find_callers вызывает find_callers_context).
+  Бери find_callers для быстрого «где зовётся»; для аудита/полного списка — find_callers_context.
+
+find_register_movements vs analyze_document_flow:
+  - find_register_movements → только регистры, признак is_postable.
+  - analyze_document_flow → подписки + регистры + задания + ввод на основании.
+  Если непроводимый (is_postable=False) — analyze_document_flow всё равно даёт подписки.
+
+parse_object_xml(path) vs find_attributes(object_name=X):
+  - parse_object_xml → читает XML напрямую, видит синонимы ТЧ и подробные типы. SLOW без индекса.
+  - find_attributes → flat-список из индекса, INSTANT, но синонимов ТЧ нет.
+  - Для «карточки объекта» используй get_object_full_structure (выбирает оптимальный путь).
+
+find_register_movements(doc) vs find_register_writers(reg):
+  - find_register_movements: документ → какие регистры пишет (есть is_postable).
+  - find_register_writers: регистр → какие документы пишут.
+  Двунаправленный поиск; запрашивай оба только если нужны обе стороны.
+
+search(q, scope='X') vs search_X(q):
+  - search() — broad-first, отдаёт unified [{source_type, text, path, path_kind, detail}].
+  - search_X() — точная типизация: поля специфичны (для search_methods → is_export, rank; для search_objects → category, synonym).
+  - Используй search для discovery; search_X — когда нужны типизированные поля для batch обработки.
+
+read_procedure(path, name) vs read_procedure(path, name, include_overrides=True):
+  - Без флага: только оригинальное тело.
+  - С include_overrides: оригинал + тело перехвата с маркером "=== Перехвачен &Аннотация ===".
+  - Используй с include_overrides когда rlm_start обнаружил расширения (extension_context).
+
 == BATCHING & OUTPUT ==
 Batch 3-5 related helpers per rlm_execute call — this is more efficient than one-at-a-time.
 If output is truncated (ends with '... [truncated]'), split into smaller calls.
 Print only summaries (counts, first N items) — never dump raw data.
+If response contains 'duplicates' section — you've called the same helper with identical args twice
+(possibly across rlm_execute calls). If you assigned the previous result to a variable, reuse it —
+variables persist across rlm_execute calls. Otherwise the second call is wasted work; restructure
+your batches. Note: helper return values are NOT cached automatically — only variables you assigned.
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -145,15 +219,18 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "find_register_movements('ДокИмя') → какие регистры пишет",
+            "проверить is_postable: если find_register_movements вернул is_postable=False — переходить к find_event_subscriptions, не искать ОбработкаПроведения",
             "analyze_document_flow('ДокИмя') → подписки + движения + задания",
         ],
         "full": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "find_register_movements('ДокИмя') → регистры, в которые пишет документ",
+            "проверить is_postable: если find_register_movements вернул is_postable=False — переходить к find_event_subscriptions, не искать ОбработкаПроведения",
             "analyze_document_flow('ДокИмя') → проводки + подписки + рег.задания",
-            "find_event_subscriptions('ДокИмя') → подписки на события документа",
+            "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки на ключевые события документа",
             "read_procedure(path, 'ОбработкаПроведения') → код проведения",
-            "find_callers_context('ОбработкаПроведения') → кто вызывает проведение",
+            "find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
+            "find_callers_context('ОбработкаПроведения') → 1 уровень callers + контекст вызова",
             "ALT: search_methods('Проведение') если имя процедуры нестандартное",
         ],
     },
@@ -261,12 +338,14 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "find_references_to_object('Справочник.Имя') → unified reverse-index",
             "Print res['by_kind'] и первые 20 references",
+            "Если объект упоминается через DefinedType — find_defined_types('Имя') раскроет составляющие",
         ],
         "full": [
             "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')",
             "print(res['by_kind'], res['total'])",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
             "Если res['partial'] — индекс старый (v11), запустить rlm_index(action='build')",
+            "Если объект упоминается через DefinedType — find_defined_types('ИмяТипа') раскроет составляющие; затем find_references_to_object('DefinedType.Имя') найдёт обратные использования",
             "Аналог конфигуратора 'Найти ссылки → В свойствах' — issue #10",
         ],
         "code_hint": (
@@ -275,7 +354,68 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "print(f\"total={res['total']} truncated={res['truncated']} partial={res['partial']}\")\n"
             "print('by_kind:', res['by_kind'])\n"
             "for r in res['references'][:20]:\n"
-            "    print(f\"  {r['kind']:25s} {r['used_in']} ({r['path']})\")"
+            "    print(f\"  {r['kind']:25s} {r['used_in']} ({r['path']})\")\n"
+            "# Раскрыть DefinedType:\n"
+            "dt = find_defined_types('ДенежнаяСумма')\n"
+            "print('DefinedType содержит:', dt['types'])\n"
+            "# Где этот DefinedType используется:\n"
+            "refs = find_references_to_object('DefinedType.ДенежнаяСумма')\n"
+            "print(refs['by_kind'])"
+        ),
+    },
+    "перечисления": {
+        "compact": [
+            "find_enum_values('ИмяПеречисления') → значения с синонимами",
+            "Если ищется тип статуса/состояния — find_attributes(name='Статус') покажет где используется",
+        ],
+        "full": [
+            "ev = find_enum_values('СтатусыЗаказовКлиентов') → {name, synonym, values:[{name, synonym}]}",
+            "find_attributes(name='Статус') → реквизиты типа EnumRef.Статус* для понимания контекста",
+            "search_objects('статус') → объекты с синонимом 'статус' (документы, регистры с этим полем)",
+            "get_object_full_structure(doc) → s['enum_values_for_typed_refs'] уже раскроет связанные перечисления",
+        ],
+        "code_hint": (
+            "ev = find_enum_values('СтатусыЗаказовКлиентов')\n"
+            "print(f\"{ev['name']} ({ev['synonym']}):\")\n"
+            "for v in ev['values']:\n"
+            "    print(f\"  {v['name']}: {v['synonym']}\")"
+        ),
+    },
+    "ввод на основании": {
+        "compact": [
+            "find_based_on_documents('ДокИмя') → {can_create_from_here, can_be_created_from}",
+            "Двунаправленно: что создаётся ИЗ документа и НА основании чего создаётся документ",
+        ],
+        "full": [
+            "rel = find_based_on_documents('ПриобретениеТоваровУслуг')",
+            "for d in rel['can_create_from_here']: print(f'  -> {d[\"document\"]}')",
+            "for d in rel['can_be_created_from']: print(f'  <- {d[\"type\"]}')",
+            "search_methods('Заполнить') → процедуры заполнения шапки/ТЧ при вводе на основании",
+            "find_event_subscriptions('ДокИмя', event_filter=['Filling','ОбработкаЗаполнения']) → подписки на заполнение",
+        ],
+    },
+    "структура объекта": {
+        "compact": [
+            "get_object_full_structure('ИмяОбъекта') → metadata + attrs + ТЧ + predefined + enums + forms за 1 вызов",
+            "Если _meta.index_used=False — индекс отсутствует, синонимы ТЧ доступны (live XML)",
+        ],
+        "full": [
+            "s = get_object_full_structure('ИмяОбъекта')",
+            "Анализируй s['attributes'] (kind=attribute), s['tabular_sections'][i]['columns'] (kind=ts_attribute)",
+            "Для регистров: s['dimensions'] + s['resources']",
+            "s['predefined_items'] — предопределённые значения с типами",
+            "s['enum_values_for_typed_refs'] — типы EnumRef уже раскрыты в значения",
+            "s['forms'] — список form_name; для деталей формы → parse_form(name)",
+            "Если нужен код: find_module(name) → modules → extract_procedures(path)",
+        ],
+        "code_hint": (
+            "s = get_object_full_structure('РеализацияТоваровУслуг')\n"
+            "print(f\"{s['object_name']}: posting={s.get('posting')}\")\n"
+            "print(f\"  attrs={len(s['attributes'])}, ts={len(s['tabular_sections'])}, forms={len(s['forms'])}\")\n"
+            "for ts in s['tabular_sections']:\n"
+            "    print(f\"  ТЧ {ts['name']}: {len(ts['columns'])} cols\")\n"
+            "for ref, vals in s['enum_values_for_typed_refs'].items():\n"
+            "    print(f\"  {ref}: {[v['name'] for v in vals]}\")"
         ),
     },
     "тип реквизита": {
@@ -309,6 +449,9 @@ _RECIPE_ALIASES: dict[str, str] = {
     "обработчики формы": "события формы",
     "элементы формы": "события формы",
     "кнопки формы": "события формы",
+    "формы": "события формы",
+    "form events": "события формы",
+    "form handlers": "события формы",
     "субконто": "тип реквизита",
     "тип субконто": "тип реквизита",
     "предопределённ": "тип реквизита",
@@ -320,6 +463,36 @@ _RECIPE_ALIASES: dict[str, str] = {
     "поиск ссылок": "ссылки",
     "в свойствах": "ссылки",
     "вхождения": "ссылки",
+    # «проведение»
+    "движения": "проведение",
+    "регистры документа": "проведение",
+    "проводки": "проведение",
+    "posting": "проведение",
+    "register movements": "проведение",
+    "как проводится документ": "проведение",
+    # «печать»
+    "макеты": "печать",
+    "печатные формы": "печать",
+    "templates": "печать",
+    # «права»
+    "роли": "права",
+    "role": "права",
+    "rights": "права",
+    "access": "права",
+    # «перечисления»
+    "enum": "перечисления",
+    "значения перечисления": "перечисления",
+    "статусы": "перечисления",
+    "состояния": "перечисления",
+    # «ввод на основании»
+    "based on": "ввод на основании",
+    "основание": "ввод на основании",
+    "can_create_from": "ввод на основании",
+    # «структура объекта»
+    "карточка объекта": "структура объекта",
+    "полная структура": "структура объекта",
+    "реквизиты документа": "структура объекта",
+    "object structure": "структура объекта",
 }
 
 _STRATEGY_IO_SECTION = """\
@@ -441,6 +614,7 @@ def get_strategy(
         instant_helpers = ["extract_procedures()", "find_exports()"]
         if calls_count:
             instant_helpers.append("find_callers_context()")
+            instant_helpers.append("find_call_hierarchy()")
         instant_helpers.extend(
             [
                 "find_event_subscriptions()",
@@ -470,6 +644,8 @@ def get_strategy(
             instant_helpers.append("find_attributes()")
         if pi_count:
             instant_helpers.append("find_predefined()")
+        if oa_count and pi_count:
+            instant_helpers.append("get_object_full_structure()")
         instant_helpers.append("search()")
         idx_lines.append(f"INSTANT from index: {', '.join(instant_helpers)}.")
 
@@ -641,21 +817,4 @@ RLM_START_DESCRIPTION = (
     "For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first.\n"
     "NEVER call rlm_index(action='build') yourself — only the user decides when to build indexes. "
     "Build runs in background but requires the project password. If no index exists, work without it."
-)
-
-RLM_EXECUTE_DESCRIPTION = (
-    "Execute Python code in the BSL sandbox. The 'code' parameter is Python code.\n"
-    "Call helper functions and use print() to see results. Variables persist between calls.\n"
-    "Example: code=\"modules = find_module('MyModule')\\nfor m in modules:\\n    print(m['path'])\"\n"
-    "BSL helpers: help, find_module, find_by_type, extract_procedures, find_exports,\n"
-    "safe_grep, read_procedure, find_callers, find_callers_context, parse_object_xml,\n"
-    "search, search_methods, search_objects, search_regions, search_module_headers,\n"
-    "extract_queries, code_metrics, parse_form.\n"
-    "Composite: analyze_object, analyze_subsystem, find_custom_modifications,\n"
-    "find_event_subscriptions, find_scheduled_jobs, find_register_movements,\n"
-    "find_register_writers, analyze_document_flow, find_based_on_documents,\n"
-    "find_print_forms, find_functional_options, find_roles, find_enum_values,\n"
-    "find_attributes, find_predefined, find_references_to_object, find_defined_types.\n"
-    "Standard: read_file, read_files, grep, grep_summary, grep_read, glob_files, tree, find_files.\n"
-    "CRITICAL: grep on path='.' ALWAYS times out on large 1C configs. Use find_module() first."
 )

@@ -710,6 +710,19 @@ def _rlm_execute(
         "error": result.error,
     }
 
+    if result.helper_calls:
+        duplicates = [
+            {
+                "call": h.seq,
+                "prev_call": h.duplicate_of,
+                "helper": h.name,
+            }
+            for h in result.helper_calls
+            if h.duplicate_of is not None
+        ]
+        if duplicates:
+            response["duplicates"] = duplicates
+
     if detail_level in {"usage", "full"}:
         response["usage"] = {
             "execute_calls_used": session.execute_calls,
@@ -882,7 +895,7 @@ async def rlm_execute(
         ),
     ] = 20,
 ) -> str:
-    """Execute Python code in the BSL sandbox. The 'code' parameter is Python code. Call helper functions and use print() to see results. Variables persist between calls. Example: code="modules = find_module('MyModule')\\nfor m in modules:\\n    print(m['path'])". BSL helpers: help, find_module, find_by_type, extract_procedures, find_exports, safe_grep, read_procedure, find_callers, find_callers_context, parse_object_xml. Standard: read_file, read_files, grep, grep_summary, grep_read, glob_files, tree. CRITICAL: grep on path='.' ALWAYS times out on large 1C configs. Use find_module() first."""
+    """Execute Python code in the BSL sandbox. Variables persist between calls. Use print() to see results. The full helper list is returned by rlm_start in the `strategy` field. CRITICAL: grep on path='.' ALWAYS times out on large 1C configs — use find_module() first."""
     return await anyio.to_thread.run_sync(lambda: _rlm_execute(session_id, code, detail_level, max_new_variables))
 
 

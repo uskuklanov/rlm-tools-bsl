@@ -48,19 +48,20 @@ Replace `РеализацияТоваровУслуг` with your target object n
 
 ## What it covers
 
-This prompt exercises all 38 BSL helpers without explicitly naming them. The AI agent discovers the toolset via `help()` and decides which helpers to use. Business questions in the prompt trigger `_BUSINESS_RECIPES` injection via `get_strategy()` (v1.3.5+).
+This prompt exercises all 45 BSL helpers (v1.10.0) without explicitly naming them. The AI agent discovers the toolset via `help()` and decides which helpers to use. Business questions in the prompt trigger `_BUSINESS_RECIPES` injection via `get_strategy()` (v1.3.5+).
 
 | Area | Expected helpers |
 |------|-----------------|
 | Navigation | `find_module`, `find_by_type`, `safe_grep`, `search`, `search_methods` |
-| Code analysis | `extract_procedures`, `find_exports`, `read_procedure`, `extract_queries`, `code_metrics` |
-| Call graph | `find_callers`, `find_callers_context` |
+| Code analysis | `extract_procedures`, `find_exports`, `read_procedure`, `extract_queries`, `code_metrics`, `find_call_hierarchy` |
+| Call graph | `find_callers_context`, `find_call_hierarchy` |
 | XML parsing | `parse_object_xml`, `find_enum_values` |
 | Business analysis | `analyze_object`, `analyze_document_flow`, `analyze_subsystem` |
+| Composite | `get_object_full_structure`, `analyze_object`, `analyze_document_flow` |
 | Customizations | `find_custom_modifications`, `detect_extensions`, `find_ext_overrides` |
 | Infrastructure | `find_register_movements`, `find_register_writers`, `find_based_on_documents`, `find_event_subscriptions`, `find_scheduled_jobs`, `find_print_forms`, `find_functional_options`, `find_roles` |
 | Integration (v1.4.0) | `find_http_services`, `find_web_services`, `find_xdto_packages`, `find_exchange_plan_content` |
-| Strategy | Step 0 UNDERSTAND + business recipe (проведение/печать/интеграция) via `get_strategy(query=...)` |
+| Strategy | Step 0 UNDERSTAND + business recipe (проведение/печать/интеграция/перечисления/ввод на основании/структура объекта) via `get_strategy(query=...)` |
 | Help | `help` |
 
 ## Recommended settings
@@ -1023,3 +1024,114 @@ Replace `Справочник.ВидыПодарочныхСертификато
 - CF индекс с 0 command_parameter_type refs (при наличии CommonCommands) → `<CommonCommand>` или `<v8:TypeSet>` парсинг сломан
 - DefinedType с потерянными примитивами → indexed path в `_normalize_dt_type` сломан
 - Дубли ссылок при `partial=True` на проекте с одновременным sibling+Ext layout → `seen_objects` дедуп сломан
+
+---
+
+# Aggregating Helpers Prompt — E2E Test for v1.10.0 Helpers
+
+Use this prompt to verify the new aggregating helpers added in v1.10.0:
+`get_object_full_structure`, `find_call_hierarchy`, обновлённые `find_register_movements` (is_postable),
+`find_event_subscriptions` (event_filter + limit) и anti-duplicate hint в `rlm_execute`.
+
+## Prompt
+
+```
+Мне нужно проверить новые агрегирующие хелперы и улучшения UX в v1.10.0.
+Путь: <путь к каталогу исходников 1С>
+
+Используй ТОЛЬКО MCP-сервер rlm-tools-bsl.
+
+Проверь:
+
+1. **Полная структура объекта (D1)**:
+   - get_object_full_structure('РеализацияТоваровУслуг') → один вызов вместо 3-5
+   - Сравни: время + содержимое vs ручная цепочка parse_object_xml + find_attributes + find_predefined + find_enum_values
+   - Покажи: posting, len(attributes), tabular_sections с колонками, раскрытые перечисления, _meta.index_used
+
+2. **Иерархия вызовов (D2)**:
+   - find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)
+   - Покажи дерево по уровням; обрати внимание на одноимённые методы (список носителей)
+   - find_call_hierarchy(direction='callees') → проверь что возвращает error-dict с hint (не traceback)
+
+3. **Непроводимые документы (B1)**:
+   - find_register_movements('ВходящееПисьмо') (или другой непроводимый)
+   - Проверь что result содержит is_postable: False + hint
+   - Сверь с подсказкой про find_event_subscriptions
+
+4. **Фильтрация подписок (C1)**:
+   - find_event_subscriptions('') → старый контракт list[dict] (default limit=None)
+   - find_event_subscriptions('', limit=50) → новый dict {subscriptions, total, returned, has_more}
+   - find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite']) → точечный фильтр
+
+5. **Path resolution (A1)**:
+   - parse_object_xml('Documents/X.mdo') ('фейковый' путь, без подкаталога) → должен авто-нормализоваться
+   - parse_object_xml('Documents/НеСуществует.mdo') → FileNotFoundError с подсказкой про директорию
+   - НЕ должно быть мусорных кандидатов вида X.mdo/X.mdo.mdo
+
+6. **Anti-duplicate hint (C3)**:
+   - Вызови find_module('X') дважды с одинаковым именем в разных rlm_execute
+   - В метаданных ответа должна появиться секция duplicates: [{call, prev_call, helper}]
+   - Возвращаемые значения хелпера должны быть прежними (не меняются)
+
+7. **read_procedure UX (A2/A3)**:
+   - read_procedure(path, 'НесуществующаяПроцедура') → None (контракт сохранён)
+   - В метаданных ответа sandbox-hint про XML-only / extract_procedures (если был FileNotFoundError)
+
+8. **Disambiguation проверка**:
+   - help('структура объекта') → должен дать get_object_full_structure
+   - help('иерархия вызовов') → find_call_hierarchy
+   - help('перечисления') → find_enum_values
+   - help('ввод на основании') → find_based_on_documents
+
+Дай итоговую сводку. Сохрани отчёт своими инструментами.
+```
+
+## ВАЖНЫЕ ПРАВИЛА
+
+1. Каждый rlm_execute должен батчить несколько связанных операций.
+2. Переменные сохраняются между вызовами rlm_execute.
+3. Используй print() для вывода результатов.
+4. Если хелпер падает с ошибкой — записывай её и продолжай: цель промпта — пройти ВСЕ 8 пунктов.
+5. В конце ОБЯЗАТЕЛЬНО вызови rlm_end для освобождения ресурсов.
+
+## What it covers
+
+This prompt validates the new aggregating helpers and behavioural changes in v1.10.0. It exercises 8 distinct verification points:
+
+| # | Verification | Helpers / behaviours |
+|---|---|---|
+| 1 | D1 — Object full structure (one call vs 3-5) | `get_object_full_structure` (`_meta.index_used`, `fallback_reason`, `ts_synonyms_available`) |
+| 2 | D2 — Multi-level call hierarchy + error contract | `find_call_hierarchy(direction='callers')` tree, `truncated_targets`; `direction='callees'` returns structured error-dict |
+| 3 | B1 — Non-postable documents | `find_register_movements` returns `is_postable: False` + hint when `Posting=Deny` |
+| 4 | C1 — Event subscription filter + pagination | `find_event_subscriptions(event_filter=[...], limit=N)` — filtered list + paginated dict contract |
+| 5 | A1 — Path resolution for fake `.mdo`/`.xml` | `parse_object_xml` normalises base; FileNotFoundError carries explicit hint; no `X.mdo/X.mdo.mdo` candidates |
+| 6 | C3 — Anti-duplicate hint cross-execute | `rlm_execute` response includes `duplicates: [{call, prev_call, helper}]` for repeat calls; helper return value unchanged |
+| 7 | A2/A3 — `read_procedure` UX | Returns `None` for missing procedure (contract preserved); sandbox hint about XML-only objects via `_add_error_hints` |
+| 8 | Disambiguation via `help()` | `help('структура объекта')` → `get_object_full_structure`; `help('иерархия вызовов')` → `find_call_hierarchy`; `help('перечисления')` → `find_enum_values`; `help('ввод на основании')` → `find_based_on_documents` |
+
+The prompt indirectly tests `_BUSINESS_RECIPES` bridge (G.5b), `_RECIPE_ALIASES` extension (G.4), DISAMBIGUATION section (S.3 / G.5), and the session-wide duplicate detection in `Sandbox._wrap_helpers` (1.5).
+
+## Recommended settings
+
+- **effort**: `high` (default since v1.1.0) — gives 50 execute calls, enough for the 8 verifications batched 1-2 per call
+- **max_output_chars**: `30000` — paginated subscription dumps and call hierarchy trees can be verbose
+- **execution_timeout_seconds**: `120` — `find_call_hierarchy(depth=2)` and aggregate helpers may need a few seconds
+- **query**: `'структура объекта и иерархия'` — auto-injects relevant `_BUSINESS_RECIPES` (структура объекта, иерархия вызовов) into strategy
+
+## Expected results
+
+On a fresh v12 index, all 8 verifications should PASS. Common observations:
+
+| Verification | Expected on v1.10.0 |
+|---|---|
+| D1 `get_object_full_structure('РеализацияТоваровУслуг')` | Single dict with `attributes`, `tabular_sections` (with synonyms via live enrichment), `predefined_items`, `enum_values_for_typed_refs`, `_meta.index_used=True` |
+| D2 `find_call_hierarchy('ОбработкаПроведения', depth=2)` | `tree:[{name, callers:[...]}]`, `visited≥2`, `truncated_targets` populated for popular methods (>200 callers); `callees` → `{error, hint, supported_directions:['callers']}` |
+| B1 non-postable document | When `Posting=Deny` is in XML: `is_postable: False`, `hint` mentions `find_event_subscriptions` |
+| C1 `find_event_subscriptions` | Default → `list[dict]` (legacy contract); with `limit=N` → `{subscriptions, total, returned, has_more}`; `event_filter=['BeforeWrite']` returns server-side filtered subset |
+| A1 fake `.mdo` path | `parse_object_xml('Documents/X.mdo')` auto-normalises to `Documents/X/X.mdo` (EDT) or `Documents/X/Ext/Document.xml` (CF); missing → FileNotFoundError with hint about directory |
+| C3 anti-duplicate | Response contains `duplicates: [{call: seq, prev_call: seq_prev, helper: name}]` for cross-execute repeats; helper return value bit-for-bit identical |
+| A2/A3 `read_procedure` | Missing procedure → `None`; missing path → FileNotFoundError; sandbox hint mentions `extract_procedures()` and XML-only objects |
+| Disambiguation | All 4 `help()` queries route to expected helpers (after BUG-2 fix in v1.10.x: exact keyword match wins over substring) |
+
+Real metrics from v1.10.0 e2e on Тест ЕРП (EDT, 2026-05-01): 8/8 verifications passed in 45 rlm_execute calls. EDT-specific note: documents that have **only** `<realTimePosting>Deny</realTimePosting>` without `<posting>` are still proper postable documents — `is_postable=False` triggers strictly on `<posting>Deny</posting>` (the operational-posting flag is orthogonal).
+
