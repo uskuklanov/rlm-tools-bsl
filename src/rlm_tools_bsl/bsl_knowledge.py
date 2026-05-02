@@ -158,6 +158,43 @@ parse_object_xml(path) vs find_attributes(object_name=X):
   - find_attributes → flat-список из индекса, INSTANT, но синонимов ТЧ нет.
   - Для «карточки объекта» используй get_object_full_structure (выбирает оптимальный путь).
 
+get_object_full_structure(name) ключи vs find_attributes:
+  - find_attributes:           [{attr_name, attr_synonym, attr_type, attr_kind}]
+  - get_object_full_structure: {attributes:[{name, synonym, type}], dimensions:[{name, synonym, type}],
+                                resources:[{name, synonym, type}],
+                                tabular_sections:[{name, synonym, columns:[{name, synonym, type}]}]}
+  Если используешь get_object_full_structure — НЕ обращайся r['attr_name'] (это контракт find_attributes),
+  получишь KeyError. Итерируй: for a in s['attributes']: a['name'].
+  Для регистров — данные в s['dimensions'] и s['resources'], s['attributes'] пустой.
+
+parse_object_xml(path) — путь к ДИРЕКТОРИИ объекта (не к файлу):
+  - 'Documents/X'                         → ПРЕДПОЧТИТЕЛЬНО (auto-resolves to .mdo or Ext/Document.xml).
+  - 'Documents/X.mdo'                     → допустимо: авто-нормализация base (v1.10.0 фикс A1).
+  - 'Documents/X/X.mdo'                   → допустимо: явный EDT path.
+  - 'Documents/X/Ext/Document.xml'        → допустимо: явный CF path.
+  - 'Documents/X/Document.xml' (без Ext/) → ошибка, такого файла нет.
+  Категория должна соответствовать типу объекта: для Регистра — InformationRegisters/X, не Documents/X.
+
+parse_object_xml для Roles vs find_roles(object_name):
+  - parse_object_xml('Roles/X')      → не подходит для анализа прав: отдаёт сырую XML без нормализации право→объект.
+  - find_roles(object_name)          → нормализованный список ролей с правами на объект.
+  Для прав доступа к объекту → ВСЕГДА find_roles, не parse_object_xml.
+
+find_event_subscriptions(event_filter=...) — list[str], НЕ голая строка:
+  - event_filter=['BeforeWrite']         → правильно, один substring-matcher по 'beforewrite'.
+  - event_filter='BeforeWrite'           → допустимо: хелпер сам обернёт в [строка] (v1.10.x фикс).
+  - event_filter=['BeforeWrite','OnWrite'] → два matcher через OR.
+  Если передать голую строку в version <1.10.x — Python итерировал её посимвольно
+  (['B','e','f',...]) и фильтр де-факто игнорировался: каждый одно-символьный
+  matcher ловил почти все события. Сейчас защита есть, но рекомендуется list[str].
+
+find_based_on_documents(doc_name) — прямой обход + back_scan:
+  - Прямой: ManagerModule.ДобавитьКомандыСозданияНаОсновании + ObjectModule.ОбработкаЗаполнения САМОГО документа.
+  - Back_scan (lazy fallback): если прямой пуст для can_create_from_here — сканируется
+    ОбработкаЗаполнения других Documents и собираются те, кто упомянул ДокументСсылка.<doc_name>.
+  - Записи из back_scan помечены via='back_scan' (типичный кейс — Письма в ДО3:
+    у них нет ДобавитьКомандыСозданияНаОсновании, но Задача/Поручение могут заполняться от них).
+
 find_register_movements(doc) vs find_register_writers(reg):
   - find_register_movements: документ → какие регистры пишет (есть is_postable).
   - find_register_writers: регистр → какие документы пишут.

@@ -1203,63 +1203,72 @@ def make_bsl_helpers(
     )
 
     def _resolve_object_for_full_structure(name: str) -> tuple[str | None, str | None]:
-        """Return (category, object_name) for a metadata object via a cascade:
+        """Return (category, object_name) for a metadata object via a strict cascade.
 
-        1. Index path: object_attributes (catches anything with attrs/dims/columns)
-        2. Index path: object_synonyms via search_objects (catches synonym-only objects)
-        3. Index path: enum_values (Enums often have no attributes table row)
-        4. BSL-module path: find_module (legacy fallback for objects with modules)
-        5. Live glob across known metadata categories (XML-only objects without index)
+        Pass 1 — exact-match через все источники по очереди (любой непустой
+                 источник НЕ блокирует следующий, если в нём нет точного
+                 совпадения):
+            1. object_attributes (большинство объектов с реквизитами/ТЧ)
+            2. object_synonyms via search_objects (synonym-only объекты)
+            3. enum_values (Enums без записей в object_attributes)
+            4. find_module (объекты с BSL-модулями)
 
-        Returns (None, None) if nothing matched.
+        Pass 2 — live glob по известным метаданным категориям (всегда exact:
+                 имя файла = name).
+
+        Pass 3 — close-match fallback: если ВСЕ источники Pass 1 прошли без
+                 exact-совпадения, вернуться к ним по тому же порядку и взять
+                 первый non-empty. Воспроизводит старое поведение для случаев,
+                 когда indexer положил объект под другим именем.
+
+        Returns (None, None) если ничего не нашлось.
+
+        v1.10.0 BUG-4 fix: ранее close-match из первого непустого источника
+        (object_attributes c LIKE '%name%') блокировал exact-match в других
+        источниках — БизнесПроцесс «Согласование» терялся за регистром-
+        омонимом «тст_СогласованиеЗаявокСБ».
         """
         name_lower = name.lower()
 
-        # 1. object_attributes — большинство объектов с реквизитами/измерениями/ТЧ
+        rows = None
+        so_rows = None
+        ev = None
+
+        # ── Pass 1: exact-match через все источники ──────────────────────
         if idx_reader is not None:
+            # 1. object_attributes — большинство объектов с реквизитами/ТЧ
             try:
                 rows = idx_reader.get_object_attributes(object_name=name, limit=50)
             except Exception:
                 rows = None
-            if rows:
-                for r in rows:
-                    if (r.get("object_name") or "").lower() == name_lower:
-                        return r.get("category"), r.get("object_name")
-                # close match — берём первый
-                first = rows[0]
-                return first.get("category"), first.get("object_name")
+            for r in rows or []:
+                if (r.get("object_name") or "").lower() == name_lower:
+                    return r.get("category"), r.get("object_name")
 
-            # 2. object_synonyms — XML-only объекты с synonym (Enum без атрибутов
-            #    в таблице, Constant, FunctionalOption и т.п.)
+            # 2. object_synonyms — synonym-only объекты (Enum/Constant/FO)
             try:
                 so_rows = idx_reader.search_objects(name, limit=20)
             except Exception:
                 so_rows = None
-            if so_rows:
-                for s in so_rows:
-                    if (s.get("object_name") or "").lower() == name_lower:
-                        return s.get("category"), s.get("object_name")
-                first = so_rows[0]
-                return first.get("category"), first.get("object_name")
+            for s in so_rows or []:
+                if (s.get("object_name") or "").lower() == name_lower:
+                    return s.get("category"), s.get("object_name")
 
-            # 3. enum_values — на случай, если объект Enum, но object_synonyms
-            #    у него нет (старый индекс / специфический проект)
+            # 3. enum_values — Enum, у которого нет записей в object_synonyms
             try:
                 ev = idx_reader.get_enum_values(name)
             except Exception:
                 ev = None
-            if ev and not ev.get("error") and ev.get("name"):
+            if ev and not ev.get("error") and ev.get("name") and ev["name"].lower() == name_lower:
                 return "Enums", ev["name"]
 
-        # 4. find_module — объекты с BSL-модулями
+        # 4. find_module — объекты с BSL-модулями (exact-проход)
         modules = find_module(name)
-        exact = [m for m in modules if (m.get("object_name") or "").lower() == name_lower]
-        if exact:
-            return exact[0].get("category"), exact[0].get("object_name")
-        if modules:
-            return modules[0].get("category"), modules[0].get("object_name")
+        exact_modules = [m for m in modules if (m.get("object_name") or "").lower() == name_lower]
+        if exact_modules:
+            return exact_modules[0].get("category"), exact_modules[0].get("object_name")
 
-        # 5. Live glob по известным метаданным категориям — для конфигов без индекса.
+        # ── Pass 2: live glob по категориям (всегда exact, имя файла = name) ─
         for cat in _METADATA_ONLY_CATEGORIES:
             # Try CF directory layout: {Cat}/{name}/Ext/*.xml
             try:
@@ -1282,6 +1291,22 @@ def make_bsl_helpers(
                 hits = []
             if hits:
                 return cat, name
+
+        # ── Pass 3: close-match fallback ────────────────────────────────
+        # Все источники Pass 1 не дали exact — берём первый non-empty в
+        # исходном порядке. Сохраняет прежнее поведение «get_enum_values
+        # как close-match» (агент пишет 'Статус', в индексе Enum
+        # 'СтатусыЗаказов' — substring-based get_enum_values его находит).
+        if rows:
+            first = rows[0]
+            return first.get("category"), first.get("object_name")
+        if so_rows:
+            first = so_rows[0]
+            return first.get("category"), first.get("object_name")
+        if ev and not ev.get("error") and ev.get("name"):
+            return "Enums", ev["name"]
+        if modules:
+            return modules[0].get("category"), modules[0].get("object_name")
 
         return None, None
 
@@ -1854,7 +1879,7 @@ def make_bsl_helpers(
     def find_event_subscriptions(
         object_name: str = "",
         custom_only: bool = False,
-        event_filter: list[str] | None = None,
+        event_filter: list[str] | str | None = None,
         limit: int | None = None,
     ) -> list[dict] | dict:
         """Find event subscriptions, optionally filtered by object name and/or event.
@@ -1869,6 +1894,10 @@ def make_bsl_helpers(
             event_filter: List of event substrings (case-insensitive) — отбор
                           по полю event. None = без фильтра. ['BeforeWrite']
                           вернёт все подписки, у которых event содержит 'beforewrite'.
+                          Допустима **одна строка** ('BeforeWrite') — она будет
+                          автоматически обёрнута в [event_filter] (типичная ошибка
+                          агентов: голая строка раньше итерировалась по символам
+                          и матчила ВСЕ события).
             limit: Если задан, возврат становится top-level dict
                    {"subscriptions", "total", "returned", "has_more"}. Если None
                    (default) — возвращается list[dict] (контракт прежний).
@@ -1879,6 +1908,12 @@ def make_bsl_helpers(
                               "has_more": bool}."""
         if object_name:
             object_name = _strip_meta_prefix(object_name)
+
+        # Normalize event_filter: голая строка → [строка]. Иначе Python итерирует
+        # по символам ('BeforeWrite' → ['B','e',...]) и каждый одно-символьный
+        # substring-matcher ловит почти все события — фильтр де-факто игнорируется.
+        if isinstance(event_filter, str):
+            event_filter = [event_filter] if event_filter else None
 
         # --- Fast path: SQLite index ---
         result: list[dict] | None = None
@@ -2375,13 +2410,19 @@ def make_bsl_helpers(
 
     def analyze_document_flow(document_name: str) -> dict:
         """Full document lifecycle analysis: metadata, event subscriptions,
-        register movements, and related scheduled jobs.
+        register movements, related scheduled jobs, based-on, print forms.
+
+        v1.10.0 enrichment (BUG-6 fix): для непроводимых документов добавлены
+        top-level is_postable=False + hint, чтобы агенту не нужно было лезть
+        внутрь register_movements; based_on/print_forms обогащают результат
+        для всех документов.
 
         Args:
             document_name: Document name (or fragment).
 
         Returns: dict with document, metadata, event_subscriptions,
-                 register_movements, related_scheduled_jobs."""
+                 register_movements, related_scheduled_jobs, based_on,
+                 print_forms; для непроводимых дополнительно is_postable+hint."""
         document_name = _strip_meta_prefix(document_name)
         obj = analyze_object(document_name)
         subs = find_event_subscriptions(document_name)
@@ -2396,21 +2437,56 @@ def make_bsl_helpers(
             if doc_lower in j.get("method_name", "").lower() or doc_lower in j.get("name", "").lower()
         ]
 
-        return {
+        # Composition graceful-degrade — каждый суб-вызов в try/except,
+        # чтобы один сломавшийся хелпер не валил весь analyze_document_flow.
+        try:
+            based_on = find_based_on_documents(document_name)
+        except Exception as exc:
+            based_on = {"error": f"{type(exc).__name__}: {exc}"}
+        try:
+            print_forms_data = find_print_forms(document_name)
+        except Exception as exc:
+            print_forms_data = {"error": f"{type(exc).__name__}: {exc}"}
+
+        result: dict = {
             "document": obj.get("name", document_name),
             "metadata": obj.get("metadata", {}),
             "event_subscriptions": subs,
             "register_movements": movements,
             "related_scheduled_jobs": related_jobs,
+            "based_on": based_on,
+            "print_forms": print_forms_data,
         }
+
+        # Top-level is_postable+hint для непроводимых — повторяем сигнал из
+        # register_movements на верхний уровень для удобства агента.
+        if isinstance(movements, dict) and movements.get("is_postable") is False:
+            result["is_postable"] = False
+            result["hint"] = (
+                "Документ непроводимый (Posting=Deny). register_movements ожидаемо пустой. "
+                "Связь с регистрами — через event_subscriptions, based_on "
+                "или регистры сведений с типом-источником = документ."
+            )
+
+        return result
 
     # ── Based-on documents / Print forms helpers ───────────────
 
     def find_based_on_documents(document_name: str) -> dict:
         """Find what documents can be created FROM this document and what it can be created FROM.
 
-        Parses ДобавитьКомандыСозданияНаОсновании in ManagerModule and
-        ОбработкаЗаполнения in ObjectModule.
+        Прямой обход:
+          - can_create_from_here:  ManagerModule.ДобавитьКомандыСозданияНаОсновании самого документа.
+          - can_be_created_from:   ObjectModule.ОбработкаЗаполнения самого документа.
+
+        Обратный обход (v1.10.x — BUG-9 fix): если прямой обход НИЧЕГО не нашёл
+        для can_create_from_here (типичный кейс — Письма в ДО3: у них нет
+        ДобавитьКомандыСозданияНаОсновании, но другие документы — Задача,
+        Поручение и т.п. — декларируют ДокументСсылка.ВходящееПисьмо в своих
+        ОбработкаЗаполнения), сканируется ОбработкаЗаполнения всех остальных
+        ObjectModule в Documents/ и собираются документы, у которых ссылка на
+        наш `document_name` есть в этой процедуре. Записи помечаются
+        `"via": "back_scan"`.
 
         Returns: dict with document, can_create_from_here, can_be_created_from."""
         document_name = _strip_meta_prefix(document_name)
@@ -2451,6 +2527,43 @@ def make_bsl_helpers(
                             "file": path,
                         }
                     )
+
+        # --- Reverse scan для can_create_from_here ---
+        # Только если прямой обход ничего не нашёл — иначе дёшево пропускаем.
+        if not result["can_create_from_here"]:
+            try:
+                obj_paths = glob_files_fn("Documents/*/Ext/ObjectModule.bsl") or []
+            except Exception:
+                obj_paths = []
+
+            doc_lower = document_name.lower()
+            # Pattern: ДокументСсылка.<our_name> с границей слова, case-insensitive.
+            ref_re = re.compile(rf"ДокументСсылка\.{re.escape(document_name)}\b", re.IGNORECASE)
+            seen: set[str] = set()
+            for raw_path in obj_paths:
+                # Path может прийти с разными разделителями (Windows/POSIX) — нормализуем.
+                segs = raw_path.replace("\\", "/").split("/")
+                if len(segs) < 2 or segs[0] != "Documents":
+                    continue
+                other = segs[1]
+                # Пропускаем ObjectModule самого документа (он уже обработан в прямом обходе)
+                # и дубли по object_name.
+                if other.lower() == doc_lower or other in seen:
+                    continue
+                try:
+                    body = read_procedure(raw_path, "ОбработкаЗаполнения")
+                except Exception:
+                    continue
+                if not body or not ref_re.search(body):
+                    continue
+                seen.add(other)
+                result["can_create_from_here"].append(
+                    {
+                        "document": other,
+                        "file": raw_path,
+                        "via": "back_scan",
+                    }
+                )
 
         return result
 
@@ -4442,6 +4555,10 @@ def make_bsl_helpers(
             "колонки тч",
         ],
         "FULL OBJECT STRUCTURE (1 вызов вместо 3-5 — заменяет parse_object_xml + find_attributes + find_predefined + find_enum_values):\n"
+        "  # ⚠️ КЛЮЧИ В РЕЗУЛЬТАТЕ ОТЛИЧАЮТСЯ от find_attributes!\n"
+        "  #   find_attributes:           [{attr_name, attr_synonym, attr_type, attr_kind}]\n"
+        "  #   get_object_full_structure: {attributes:[{name, synonym, type}], dimensions:[...], resources:[...], ...}\n"
+        "  #   Итерация: for a in s['attributes']: a['name']  (НЕ a['attr_name'] — будет KeyError)\n"
         "  s = get_object_full_structure('РеализацияТоваровУслуг')\n"
         "  print(f\"{s['object_name']} ({s.get('synonym')}) posting={s.get('posting')}\")\n"
         "  print(f\"Реквизитов: {len(s['attributes'])}, ТЧ: {len(s['tabular_sections'])}, форм: {len(s['forms'])}\")\n"
@@ -4450,6 +4567,12 @@ def make_bsl_helpers(
         "  # Перечисления уже раскрыты:\n"
         "  for ref_type, values in s['enum_values_for_typed_refs'].items():\n"
         "      print(f\"  {ref_type}: {[v['name'] for v in values]}\")\n"
+        "  # Для регистров — данные в dimensions/resources, attributes пустой:\n"
+        "  reg = get_object_full_structure('ТоварыНаСкладах')  # AccumulationRegister\n"
+        "  for d in reg.get('dimensions', []):\n"
+        "      print(f\"  измерение {d['name']}: {d['type']}\")\n"
+        "  for r in reg.get('resources', []):\n"
+        "      print(f\"  ресурс {r['name']}: {r['type']}\")\n"
         "  # _meta.index_used=False означает live XML fallback (синонимы ТЧ доступны только в этом режиме)\n"
         "  if not s['_meta']['index_used']:\n"
         "      print('Fallback:', s['_meta']['fallback_reason'])",
@@ -4514,8 +4637,9 @@ def make_bsl_helpers(
         "  # Default — весь список (контракт прежний):\n"
         "  subs = find_event_subscriptions('АвансовыйОтчет')\n"
         "  for s in subs: print(s['event'], s['handler'])\n"
-        "  # С фильтром по событию (case-insensitive substring):\n"
+        "  # С фильтром по событию (case-insensitive substring) — list[str] ИЛИ одна строка:\n"
         "  before_write = find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite','ПередЗаписью'])\n"
+        "  before_write_one = find_event_subscriptions('АвансовыйОтчет', event_filter='BeforeWrite')  # ок: одна строка\n"
         "  # С пагинацией (формат меняется на dict!):\n"
         "  page = find_event_subscriptions('', limit=50)\n"
         "  # page = {'subscriptions': [...], 'total': N, 'returned': K, 'has_more': bool}\n"
@@ -4577,10 +4701,15 @@ def make_bsl_helpers(
         "  result = find_based_on_documents('ПриобретениеТоваровУслуг')\n"
         "  print('Можно создать из этого документа:')\n"
         "  for d in result['can_create_from_here']:\n"
-        "      print(f\"  -> {d['document']}\")\n"
+        "      via = d.get('via', 'direct')  # 'direct' или 'back_scan' (обратный обход)\n"
+        "      print(f\"  -> {d['document']} ({via})\")\n"
         "  print('Этот документ создается на основании:')\n"
         "  for d in result['can_be_created_from']:\n"
-        "      print(f\"  <- {d['type']}\")",
+        "      print(f\"  <- {d['type']}\")\n"
+        "  # Если у документа нет ДобавитьКомандыСозданияНаОсновании (типичный кейс — Письма в ДО3),\n"
+        "  # хелпер автоматически делает back_scan по ОбработкаЗаполнения других Documents и находит\n"
+        "  # документы, у которых наш doc_name упомянут как ДокументСсылка.<doc_name>.\n"
+        "  # Записи из back_scan помечены via='back_scan'.",
     )
     _reg(
         "find_print_forms",

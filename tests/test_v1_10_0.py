@@ -1571,3 +1571,529 @@ def test_recipe_snippets_compile_as_top_level_exec(bsl_env):
         for line in recipe.splitlines():
             stripped = line.strip()
             assert not stripped.startswith("return"), f"{name}: top-level return in recipe: {line!r}"
+
+
+# ============================================================================
+# Post-e2e (Тест ДО3, 2026-05-02) bug fixes
+# ============================================================================
+
+
+def test_resolve_with_substring_collision_prefers_exact_match_from_other_source(bsl_env):
+    """BUG-4: substring close-match в object_attributes НЕ должен блокировать
+    exact-match в search_objects (другом источнике каскада).
+
+    Регрессия test02 на Тест ДО3: get_object_full_structure('Согласование')
+    возвращал реквизиты регистра 'тст_СогласованиеЗаявокСБ' (substring match),
+    хотя в object_synonyms был exact БизнесПроцесс 'Согласование'.
+    """
+
+    class _StubSubstringCollision(_StubIdxReader):
+        def get_object_attributes(self, **kwargs):
+            obj = (kwargs.get("object_name") or "").lower()
+            cat = kwargs.get("category") or ""
+            # Resolver call (без category): substring close — регистр-омоним
+            if obj == "согласование" and not cat:
+                return [
+                    {
+                        "object_name": "тст_СогласованиеЗаявокСБ",
+                        "category": "InformationRegisters",
+                        "attr_name": "ЗаявкаСБ",
+                        "attr_synonym": "Заявка СБ",
+                        "attr_type": ["DocumentRef.X"],
+                        "attr_kind": "dimension",
+                        "ts_name": None,
+                        "source_file": "InformationRegisters/тст_СогласованиеЗаявокСБ.xml",
+                    }
+                ]
+            # Index path call для разрешённого БП — пусто (БП без атрибутов в индексе)
+            if cat == "BusinessProcesses":
+                return []
+            return []
+
+        def search_objects(self, q, limit=20):
+            if q == "Согласование":
+                return [
+                    {
+                        "object_name": "Согласование",
+                        "category": "BusinessProcesses",
+                        "synonym": "Согласование",
+                        "file": "BusinessProcesses/Согласование.xml",
+                    }
+                ]
+            return []
+
+    # Live XML fixture для БП Согласование (CF layout) — без чужих реквизитов
+    bp_dir = bsl_env.path / "BusinessProcesses" / "Согласование" / "Ext"
+    bp_dir.mkdir(parents=True)
+    (bp_dir / "BusinessProcess.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+        "<BusinessProcess><Properties><Name>Согласование</Name></Properties>"
+        "<ChildObjects>"
+        "<Attribute><Properties>"
+        "<Name>Согласовать</Name>"
+        "<Type><v8:Type>xs:boolean</v8:Type></Type>"
+        "</Properties></Attribute>"
+        "</ChildObjects>"
+        "</BusinessProcess>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+    bsl = _make_bsl_with_stub_idx(str(bsl_env.path), _StubSubstringCollision())
+    res = bsl["get_object_full_structure"]("Согласование")
+
+    assert "error" not in res
+    # КЛЮЧЕВОЕ: разрешён БП, не регистр-омоним
+    assert res["object_name"] == "Согласование", (
+        f"resolver вернул неправильный объект: {res['object_name']} (ожидался БП 'Согласование')"
+    )
+    assert res["category"] == "BusinessProcesses"
+    # Структура чужого регистра не должна попасть в результат
+    attr_names = [a["name"] for a in res["attributes"]]
+    assert "ЗаявкаСБ" not in attr_names, f"структура регистра-омонима утекла в результат БП: {attr_names}"
+    # У БП нет dimensions (это контраст с регистром)
+    assert res["dimensions"] == []
+
+
+def test_resolve_close_match_used_only_when_no_exact_anywhere(bsl_env):
+    """BUG-4: если ни один источник не дал exact-match — fallback на close-match
+    из первого непустого источника (Pass 3). Сохраняет старое поведение.
+    """
+
+    class _StubOnlyCloseInAttrs(_StubIdxReader):
+        def get_object_attributes(self, **kwargs):
+            obj = (kwargs.get("object_name") or "").lower()
+            cat = kwargs.get("category") or ""
+            # Resolver call (substring close) — отдаём близкое имя
+            if obj == "контрагент" and not cat:
+                return [
+                    {
+                        "object_name": "Контрагенты",
+                        "category": "Catalogs",
+                        "attr_name": "ИНН",
+                        "attr_synonym": "ИНН",
+                        "attr_type": ["String"],
+                        "attr_kind": "attribute",
+                        "ts_name": None,
+                        "source_file": "Catalogs/Контрагенты.xml",
+                    }
+                ]
+            # Index path call для разрешённого имени Контрагенты
+            if cat == "Catalogs":
+                return [
+                    {
+                        "object_name": "Контрагенты",
+                        "category": "Catalogs",
+                        "attr_name": "ИНН",
+                        "attr_synonym": "ИНН",
+                        "attr_type": ["String"],
+                        "attr_kind": "attribute",
+                        "ts_name": None,
+                        "source_file": "Catalogs/Контрагенты.xml",
+                    }
+                ]
+            return []
+
+    cat_dir = bsl_env.path / "Catalogs" / "Контрагенты" / "Ext"
+    cat_dir.mkdir(parents=True)
+    (cat_dir / "Catalog.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+        "<Catalog><Properties><Name>Контрагенты</Name></Properties></Catalog>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+    bsl = _make_bsl_with_stub_idx(str(bsl_env.path), _StubOnlyCloseInAttrs())
+    res = bsl["get_object_full_structure"]("Контрагент")  # substring, не exact
+
+    assert "error" not in res
+    # close-match из object_attributes (Pass 3 fallback)
+    assert res["object_name"] == "Контрагенты"
+    assert res["category"] == "Catalogs"
+
+
+def test_resolve_close_match_falls_back_to_enum_values(bsl_env):
+    """BUG-4: get_enum_values сам substring-based; если все остальные источники
+    пустые, его непустой результат должен сработать как close-match (Pass 3).
+    """
+
+    class _StubOnlyEnumClose(_StubIdxReader):
+        def get_enum_values(self, name):
+            if name.lower() == "статус":
+                return {
+                    "name": "СтатусыЗаказов",
+                    "synonym": "Статусы заказов",
+                    "values": [{"name": "Открыт", "synonym": ""}, {"name": "Закрыт", "synonym": ""}],
+                }
+            return None
+
+    enum_dir = bsl_env.path / "Enums" / "СтатусыЗаказов" / "Ext"
+    enum_dir.mkdir(parents=True)
+    (enum_dir / "Enum.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">'
+        "<Enum><Properties>"
+        "<Name>СтатусыЗаказов</Name>"
+        "</Properties></Enum>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+    bsl = _make_bsl_with_stub_idx(str(bsl_env.path), _StubOnlyEnumClose())
+    res = bsl["get_object_full_structure"]("Статус")
+
+    assert "error" not in res
+    assert res["object_name"] == "СтатусыЗаказов"
+    assert res["category"] == "Enums"
+
+
+def test_sandbox_hint_for_key_error_attr_name_in_get_object_full_structure():
+    """BUG-5: при KeyError + 'get_object_full_structure' в коде — Sandbox должен
+    подсказать правильные ключи (агент применил паттерн find_attributes к новому
+    хелперу, потерял calls на retry).
+    """
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "Traceback (most recent call last):\n  File ...\nKeyError: 'attr_name'\n"
+    code = (
+        "s = get_object_full_structure('РеализацияТоваровУслуг')\nfor a in s['attributes']:\n    print(a['attr_name'])"
+    )
+
+    out = Sandbox._add_error_hints(error, code)
+
+    assert "name/synonym/type" in out, f"hint про ключи не выдан: {out!r}"
+    assert "find_attributes" in out
+    # Регистры тоже упоминаются (важно для BUG-5c контекста)
+    assert "dimensions" in out and "resources" in out
+
+
+def test_sandbox_hint_skipped_when_no_get_object_full_structure_in_code():
+    """BUG-5: hint про ключи НЕ должен лезть в чужой KeyError, если в коде
+    нет вызова get_object_full_structure.
+    """
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "KeyError: 'attr_name'"
+    code = "for a in find_attributes(object_name='X'):\n    print(a['attr_name'])"
+
+    out = Sandbox._add_error_hints(error, code)
+
+    assert "get_object_full_structure возвращает ключи" not in out
+
+
+def test_analyze_document_flow_non_postable_top_level_hint(bsl_env):
+    """BUG-6: для непроводимого документа (Posting=Deny) analyze_document_flow
+    добавляет top-level is_postable=False + hint, а также секции based_on / print_forms.
+    Контракт register_movements сохранён (ключ присутствует).
+    """
+    # CF Document с Posting=Deny
+    doc_dir = bsl_env.path / "Documents" / "ВходящееПисьмо" / "Ext"
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "Document.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+        "<Document><Properties>"
+        "<Name>ВходящееПисьмо</Name>"
+        "<Posting>Deny</Posting>"
+        "</Properties></Document>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+    res = bsl_env.bsl["analyze_document_flow"]("ВходящееПисьмо")
+
+    # Контракт сохранён — register_movements присутствует
+    assert "register_movements" in res
+    # Новые секции
+    assert "based_on" in res
+    assert "print_forms" in res
+    # Top-level hint — главный сигнал для агента
+    assert res.get("is_postable") is False, f"is_postable не выставлен на верхнем уровне: {res.get('is_postable')}"
+    assert "hint" in res
+    assert "event_subscriptions" in res["hint"]
+
+
+def test_get_object_full_structure_recipe_warns_about_keys_and_registers(bsl_env):
+    """BUG-5b/5c: recipe явно предупреждает о различии ключей с find_attributes
+    и содержит пример для регистров (dimensions/resources)."""
+    reg = bsl_env.bsl["_registry"]
+    recipe = reg["get_object_full_structure"]["recipe"]
+
+    # BUG-5b: предупреждение про различие ключей
+    assert "attr_name" in recipe, "recipe не упоминает attr_name (контраст с find_attributes)"
+    assert "find_attributes" in recipe
+    # Контракт нового хелпера явно перечислен
+    assert "name" in recipe and "synonym" in recipe and "type" in recipe
+
+    # BUG-5c: пример для регистров
+    assert "dimensions" in recipe
+    assert "resources" in recipe
+
+
+# ============================================================================
+# Round 3 (Тест ДО3 fix run, 2026-05-02) — BUG-8 / BUG-9
+# ============================================================================
+
+
+_EVENT_SUB_BEFORE_WRITE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+    xmlns:v8="http://v8.1c.ru/8.1/data/core"
+    xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config">
+<EventSubscription uuid="aaaa1111-0000-0000-0000-000000000001">
+  <Properties>
+    <Name>ПодпискаДоЗаписи</Name>
+    <Source>
+      <v8:Type>cfg:DocumentObject.МойДок</v8:Type>
+    </Source>
+    <Event>BeforeWrite</Event>
+    <Handler>CommonModule.МойМодуль.Обработчик1</Handler>
+  </Properties>
+</EventSubscription>
+</MetaDataObject>
+"""
+
+_EVENT_SUB_ON_EXECUTE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"
+    xmlns:v8="http://v8.1c.ru/8.1/data/core"
+    xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config">
+<EventSubscription uuid="bbbb2222-0000-0000-0000-000000000002">
+  <Properties>
+    <Name>ПодпискаПриВыполнении</Name>
+    <Source>
+      <v8:Type>cfg:DocumentObject.МойДок</v8:Type>
+    </Source>
+    <Event>OnExecute</Event>
+    <Handler>CommonModule.МойМодуль.Обработчик2</Handler>
+  </Properties>
+</EventSubscription>
+</MetaDataObject>
+"""
+
+
+def _make_two_subs_fixture(tmp_path):
+    """Fixture с двумя EventSubscription (BeforeWrite + OnExecute) без индекса.
+    Возвращает bsl helpers (live XML fallback path для find_event_subscriptions).
+    """
+    from rlm_tools_bsl.helpers import make_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    sub_dir = tmp_path / "EventSubscriptions"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / "ПодпискаДоЗаписи.xml").write_text(_EVENT_SUB_BEFORE_WRITE, encoding="utf-8")
+    (sub_dir / "ПодпискаПриВыполнении.xml").write_text(_EVENT_SUB_ON_EXECUTE, encoding="utf-8")
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+
+    helpers, resolve_safe = make_helpers(str(tmp_path))
+    format_info = detect_format(str(tmp_path))
+    bsl = make_bsl_helpers(
+        base_path=str(tmp_path),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+    return bsl
+
+
+def test_event_filter_string_normalized_not_iterated_per_char(tmp_path):
+    """BUG-8: голая строка 'BeforeWrite' раньше итерировалась посимвольно
+    (['B','e','f',...]) — каждый одно-символьный substring-matcher ловил почти
+    все события, фильтр де-факто игнорировался. После фикса: одиночная строка
+    оборачивается в [строка] → один substring-matcher.
+    """
+    bsl = _make_two_subs_fixture(tmp_path)
+
+    # String form — one matcher
+    res_str = bsl["find_event_subscriptions"](event_filter="BeforeWrite")
+    assert isinstance(res_str, list)
+    events = sorted({s.get("event") for s in res_str})
+    assert events == ["BeforeWrite"], (
+        f"event_filter='BeforeWrite' (string) после фикса должен вернуть только BeforeWrite, получено: {events}"
+    )
+
+    # List form — equivalent
+    res_list = bsl["find_event_subscriptions"](event_filter=["BeforeWrite"])
+    assert {s.get("event") for s in res_list} == {"BeforeWrite"}
+
+    # До фикса 'OnExecute' (string) посимвольно матчил бы и 'BeforeWrite' (буквы O,n,E,c,u → нет; но e,t,o есть в before).
+    # Проверим явный негативный кейс:
+    res_other = bsl["find_event_subscriptions"](event_filter="OnExecute")
+    assert {s.get("event") for s in res_other} == {"OnExecute"}
+
+
+def test_event_filter_empty_string_treated_as_no_filter(tmp_path):
+    """BUG-8: пустая строка должна нормализоваться в None (= без фильтра),
+    чтобы не превращаться в [''], который матчит всё (и побочно, '' в Like — это true)."""
+    bsl = _make_two_subs_fixture(tmp_path)
+    res_empty = bsl["find_event_subscriptions"](event_filter="")
+    res_none = bsl["find_event_subscriptions"](event_filter=None)
+    # Оба должны вернуть все подписки
+    assert {s.get("event") for s in res_empty} == {"BeforeWrite", "OnExecute"}
+    assert {s.get("event") for s in res_none} == {"BeforeWrite", "OnExecute"}
+
+
+def test_index_reader_get_event_subscriptions_string_filter(tmp_path):
+    """BUG-8 (нижний уровень): IndexReader.get_event_subscriptions сам
+    нормализует голую строку. Создаём минимальную БД руками и читаем через
+    IndexReader — обходим IndexBuilder для изоляции теста.
+    """
+    import sqlite3
+    from rlm_tools_bsl.bsl_index import IndexReader
+
+    db_path = tmp_path / "min.db"
+    # Минимальная схема: только event_subscriptions с двумя строками.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE event_subscriptions ("
+        "id INTEGER PRIMARY KEY, name TEXT, synonym TEXT, event TEXT, "
+        "handler_module TEXT, handler_procedure TEXT, source_types TEXT, "
+        "source_count INTEGER, file TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO event_subscriptions "
+        "(name, synonym, event, handler_module, handler_procedure, source_types, source_count, file) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("ПодпискаДоЗаписи", "", "BeforeWrite", "МойМодуль", "Обработчик1", "[]", 0, "X.xml"),
+            ("ПодпискаПриВыполнении", "", "OnExecute", "МойМодуль", "Обработчик2", "[]", 0, "Y.xml"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    reader = IndexReader(str(db_path))
+    try:
+        # Sanity: без фильтра — все 2.
+        all_rows = reader.get_event_subscriptions("", event_filter=None)
+        assert all_rows is not None and len(all_rows) == 2
+
+        # String form — нормализация в [string] → SQL с одним параметром.
+        rows_str = reader.get_event_subscriptions("", event_filter="BeforeWrite")
+        events = {r["event"] for r in rows_str}
+        assert events == {"BeforeWrite"}, f"string 'BeforeWrite' посимвольно итерировался — events: {events}"
+
+        # List form — эквивалент.
+        rows_list = reader.get_event_subscriptions("", event_filter=["BeforeWrite"])
+        assert {r["event"] for r in rows_list} == {"BeforeWrite"}
+
+        # Пустая строка → как None (без фильтра).
+        rows_empty = reader.get_event_subscriptions("", event_filter="")
+        assert {r["event"] for r in rows_empty} == {"BeforeWrite", "OnExecute"}
+    finally:
+        reader.close()
+
+
+def test_find_based_on_documents_back_scan_for_letters(tmp_path):
+    """BUG-9: для документа без ManagerModule.ДобавитьКомандыСозданияНаОсновании
+    (типичный кейс — Письма в ДО3) должен сработать обратный обход:
+    другой документ с ОбработкаЗаполнения упоминает ДокументСсылка.<наш> →
+    попадает в can_create_from_here с via='back_scan'.
+    """
+    from rlm_tools_bsl.helpers import make_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    # Document A — без ManagerModule (= нет ДобавитьКомандыСозданияНаОсновании).
+    # Object module пустой (никаких процедур).
+    doc_a_dir = tmp_path / "Documents" / "ВходящееПисьмо" / "Ext"
+    doc_a_dir.mkdir(parents=True)
+    (doc_a_dir / "ObjectModule.bsl").write_text("// empty\n", encoding="utf-8")
+
+    # Document B — есть ОбработкаЗаполнения с Тип("ДокументСсылка.ВходящееПисьмо")
+    doc_b_dir = tmp_path / "Documents" / "Задача" / "Ext"
+    doc_b_dir.mkdir(parents=True)
+    (doc_b_dir / "ObjectModule.bsl").write_text(
+        "Процедура ОбработкаЗаполнения(ДанныеЗаполнения, СтандартнаяОбработка) Экспорт\n"
+        '\tЕсли ТипЗнч(ДанныеЗаполнения) = Тип("ДокументСсылка.ВходящееПисьмо") Тогда\n'
+        "\t\tЗаполнитьИзПисьма(ДанныеЗаполнения);\n"
+        "\tКонецЕсли;\n"
+        "КонецПроцедуры\n",
+        encoding="utf-8",
+    )
+
+    # Document C — без ОбработкаЗаполнения (контрольный негативный, не должен ловиться)
+    doc_c_dir = tmp_path / "Documents" / "ИсходящееПисьмо" / "Ext"
+    doc_c_dir.mkdir(parents=True)
+    (doc_c_dir / "ObjectModule.bsl").write_text("// no fill\n", encoding="utf-8")
+
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+
+    helpers, resolve_safe = make_helpers(str(tmp_path))
+    format_info = detect_format(str(tmp_path))
+    bsl = make_bsl_helpers(
+        base_path=str(tmp_path),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+
+    res = bsl["find_based_on_documents"]("ВходящееПисьмо")
+
+    docs = [d["document"] for d in res["can_create_from_here"]]
+    assert "Задача" in docs, f"back_scan не нашёл Задача среди создаваемых: {res['can_create_from_here']}"
+    assert "ИсходящееПисьмо" not in docs  # контрольный негативный
+    # Записи помечены via='back_scan'
+    zad = next(d for d in res["can_create_from_here"] if d["document"] == "Задача")
+    assert zad.get("via") == "back_scan"
+
+
+def test_find_based_on_documents_back_scan_skipped_when_direct_finds(tmp_path):
+    """BUG-9: если прямой обход уже нашёл can_create_from_here — back_scan
+    пропускается (не должен дублировать или мешать)."""
+    from rlm_tools_bsl.helpers import make_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    # Document X с ManagerModule.ДобавитьКомандыСозданияНаОсновании (прямой обход → найдёт Y)
+    doc_x_dir = tmp_path / "Documents" / "ИсточникX" / "Ext"
+    doc_x_dir.mkdir(parents=True)
+    (doc_x_dir / "ManagerModule.bsl").write_text(
+        "Процедура ДобавитьКомандыСозданияНаОсновании(КомандыСоздания) Экспорт\n"
+        "\tДокументы.ЦельY.ДобавитьКомандуСозданияНаОснованииМассово(КомандыСоздания);\n"
+        "КонецПроцедуры\n",
+        encoding="utf-8",
+    )
+
+    # Document Z — никак не связан, но для контроля чтобы back_scan был не пуст,
+    # упомянём ИсточникX в его ОбработкаЗаполнения.
+    doc_z_dir = tmp_path / "Documents" / "ОмофонZ" / "Ext"
+    doc_z_dir.mkdir(parents=True)
+    (doc_z_dir / "ObjectModule.bsl").write_text(
+        "Процедура ОбработкаЗаполнения(ДанныеЗаполнения, СтандартнаяОбработка) Экспорт\n"
+        '\tТипЗнч(ДанныеЗаполнения) = Тип("ДокументСсылка.ИсточникX");\n'
+        "КонецПроцедуры\n",
+        encoding="utf-8",
+    )
+
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+
+    helpers, resolve_safe = make_helpers(str(tmp_path))
+    format_info = detect_format(str(tmp_path))
+    bsl = make_bsl_helpers(
+        base_path=str(tmp_path),
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+
+    res = bsl["find_based_on_documents"]("ИсточникX")
+    docs = res["can_create_from_here"]
+    # Прямой обход нашёл ЦельY → back_scan пропущен → ОмофонZ НЕ должен попасть в результат.
+    names = [d["document"] for d in docs]
+    assert "ЦельY" in names
+    assert "ОмофонZ" not in names, f"back_scan не должен срабатывать когда прямой обход дал результат: {names}"
+    # И записи прямого обхода НЕ помечены via='back_scan' (опциональное поле)
+    yel = next(d for d in docs if d["document"] == "ЦельY")
+    assert yel.get("via") != "back_scan"

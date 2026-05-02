@@ -97,6 +97,24 @@ def test_strategy_contains_helper_signatures():
     assert "find_callers" in text
 
 
+def test_disambiguation_section_warns_about_keys_and_paths():
+    """BUG-5b/7: DISAMBIGUATION в strategy header содержит:
+    - предупреждение о различии ключей get_object_full_structure vs find_attributes;
+    - guidance по путям parse_object_xml (директория vs файл);
+    - указание find_roles для прав вместо parse_object_xml('Roles/X').
+    """
+    text = get_strategy("medium", None)
+    # DISAMBIGUATION секция присутствует
+    assert "DISAMBIGUATION" in text
+    # BUG-5b: ключи отличаются от find_attributes
+    assert "attr_name" in text
+    assert "find_attributes" in text
+    # BUG-7: предпочтительный путь parse_object_xml — к директории
+    assert "Documents/X" in text
+    # BUG-7: для ролей — find_roles, не parse_object_xml
+    assert "find_roles" in text
+
+
 def test_strategy_contains_effort_guidance():
     for effort in ["low", "medium", "high", "max"]:
         text = get_strategy(effort, None)

@@ -326,6 +326,16 @@ class Sandbox:
         if "NameError" in error:
             hints.append("HINT: Call help() to see available functions. Variables persist between rlm_execute calls.")
 
+        if "KeyError" in error and "get_object_full_structure" in code:
+            bad_keys = ("'attr_name'", "'attr_synonym'", "'attr_type'", "'attr_kind'")
+            if any(k in error for k in bad_keys):
+                hints.append(
+                    "HINT: get_object_full_structure возвращает ключи name/synonym/type "
+                    "(НЕ attr_name/attr_synonym/attr_type — это контракт find_attributes). "
+                    "Итерируй: for a in result['attributes']: print(a['name'], a['type']). "
+                    "Для регистров — result['dimensions'] и result['resources']."
+                )
+
         if "import" in error.lower() and "restricted" in error.lower():
             hints.append(
                 "HINT: Only standard library modules are allowed. Use built-in helpers instead of external libraries."

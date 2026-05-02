@@ -7096,7 +7096,7 @@ class IndexReader:
         self,
         object_name: str = "",
         custom_only: bool = False,
-        event_filter: list[str] | None = None,
+        event_filter: list[str] | str | None = None,
     ) -> list[dict] | None:
         """Get event subscriptions from the index, optionally filtered.
 
@@ -7106,11 +7106,17 @@ class IndexReader:
             event_filter: List of event substrings (case-insensitive) — match on
                           event column. Server-side SQL filter, applied in addition
                           to object_name filter (which runs on JSON source_types).
+                          Accepts a single string too — it will be wrapped in a
+                          one-element list. Без этого Python итерирует строку
+                          по символам и каждый символ становится substring-матчем.
 
         Returns:
             List of dicts matching find_event_subscriptions format, or None
             if the table is empty / missing.
         """
+        # Normalize a bare string to a one-element list (see docstring).
+        if isinstance(event_filter, str):
+            event_filter = [event_filter] if event_filter else None
         with self._lock:
             try:
                 sql = (
