@@ -10,6 +10,30 @@ from types import SimpleNamespace
 from test_bsl_helpers import _make_bsl_fixture
 
 
+def pytest_configure(config):
+    # Register custom marker so `pytest --strict-markers` does not warn.
+    config.addinivalue_line(
+        "markers",
+        "strategy_mode_slim: run test under RLM_STRATEGY_MODE=slim (default in tests is 'full' for back-compat)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _strategy_mode_default(request, monkeypatch):
+    """Pin RLM_STRATEGY_MODE for every test based on marker presence.
+
+    Default in tests is ``full`` so existing assertions ("== HELPERS ==",
+    "Step 0 — UNDERSTAND", etc.) keep matching. Tests that need slim opt-in
+    via ``@pytest.mark.strategy_mode_slim``.
+
+    The fixture sets the env explicitly in BOTH directions — without this,
+    a stray ``RLM_STRATEGY_MODE=slim`` in the developer's shell would silently
+    flip every legacy assertion to slim and hide regressions.
+    """
+    mode = "slim" if "strategy_mode_slim" in request.keywords else "full"
+    monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_real_home(tmp_path_factory, monkeypatch):
     """Default-isolation: every test writes indexes AND file-cache to tmp dirs.

@@ -1,68 +1,7 @@
 """Tests that the strategy text contains workflow, helpers table, and key sections."""
 
 from rlm_tools_bsl.bsl_knowledge import get_strategy
-
-# Minimal registry to test strategy generation
-_MOCK_REGISTRY = {
-    "find_module": {
-        "fn": None,
-        "sig": "find_module(name) -> [{path, category, object_name, module_type}]",
-        "cat": "discovery",
-        "kw": [],
-        "recipe": "",
-    },
-    "find_by_type": {
-        "fn": None,
-        "sig": "find_by_type(category, name='') -> same",
-        "cat": "discovery",
-        "kw": [],
-        "recipe": "",
-    },
-    "extract_procedures": {
-        "fn": None,
-        "sig": "extract_procedures(path) -> [{name, type, line}]",
-        "cat": "code",
-        "kw": [],
-        "recipe": "",
-    },
-    "find_exports": {"fn": None, "sig": "find_exports(path) -> [{name, line}]", "cat": "code", "kw": [], "recipe": ""},
-    "find_callers_context": {
-        "fn": None,
-        "sig": "find_callers_context(proc, hint, 0, 50) -> {callers, _meta}",
-        "cat": "code",
-        "kw": [],
-        "recipe": "",
-    },
-    "parse_object_xml": {
-        "fn": None,
-        "sig": "parse_object_xml(path) -> {name, synonym, attributes}",
-        "cat": "xml",
-        "kw": [],
-        "recipe": "",
-    },
-    "analyze_object": {
-        "fn": None,
-        "sig": "analyze_object(name) -> full profile",
-        "cat": "composite",
-        "kw": [],
-        "recipe": "",
-    },
-    "find_event_subscriptions": {
-        "fn": None,
-        "sig": "find_event_subscriptions(obj) -> [{event, handler}]",
-        "cat": "business",
-        "kw": [],
-        "recipe": "",
-    },
-    "detect_extensions": {
-        "fn": None,
-        "sig": "detect_extensions() -> {config_role, warnings}",
-        "cat": "extension",
-        "kw": [],
-        "recipe": "",
-    },
-    "help": {"fn": None, "sig": "help(task='') -> str", "cat": "navigation", "kw": [], "recipe": ""},
-}
+from _strategy_fixtures import _MOCK_REGISTRY  # noqa: F401  — shared across strategy tests
 
 
 def _get_strategy_text():

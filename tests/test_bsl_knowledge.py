@@ -181,14 +181,16 @@ def test_rlm_start_description():
 
 def test_business_recipes_structure():
     """All domains must have compact and full keys."""
-    # v1.10.0: 9 base + перечисления + ввод на основании + структура объекта = 12
-    assert len(_BUSINESS_RECIPES) == 12
+    # v1.11.0+: 12 prior + 'иерархия вызовов' + 'расширения' = 14
+    assert len(_BUSINESS_RECIPES) == 14
     short_full_allowed = {
         "тип реквизита": 3,
         "ссылки": 3,
         "перечисления": 4,
         "ввод на основании": 4,
         "структура объекта": 4,
+        "иерархия вызовов": 6,
+        "расширения": 6,
     }
     for domain, recipe in _BUSINESS_RECIPES.items():
         assert "compact" in recipe, f"{domain}: missing compact"
@@ -239,9 +241,13 @@ def test_match_recipe_bare_form_no_match():
 
 
 def test_match_recipe_not_found():
-    assert _match_recipe("Найди все HTTP-сервисы") is None
+    # v1.11.0+: 'http' is now an alias of 'интеграция', so HTTP-сервис matches integration
+    assert _match_recipe("Найди все HTTP-сервисы") == "интеграция"
+    assert _match_recipe("Опиши МЭДО") == "интеграция"
+    # Genuinely unmatched queries
     assert _match_recipe("") is None
-    assert _match_recipe("Покажи структуру модуля") is None
+    assert _match_recipe("Покажи код модуля") is None
+    assert _match_recipe("Какие константы есть") is None
 
 
 def test_match_recipe_case_insensitive():
@@ -299,7 +305,9 @@ def test_strategy_no_recipe_without_query():
 
 
 def test_strategy_no_recipe_no_match():
-    text = get_strategy("high", None, query="Найди HTTP-сервисы")
+    # v1.11.0+: queries genuinely outside the recipe domain (no HTTP/SOAP/integration
+    # keywords, no module/code/structure terms, etc.)
+    text = get_strategy("high", None, query="Покажи произвольный код")
     assert "BUSINESS RECIPE: " not in text
 
 

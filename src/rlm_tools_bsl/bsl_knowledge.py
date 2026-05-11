@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import difflib
+import os
 from dataclasses import dataclass
+
+from rlm_tools_bsl.bsl_strategy_data import (
+    DISAMBIGUATION_PAIRS,
+    STRATEGY_SECTIONS,
+)
 
 
 BSL_PATTERNS = {
@@ -477,21 +484,95 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "    print(a['object_name'], a['attr_name'], a['attr_type'])"
         ),
     },
+    "иерархия вызовов": {
+        "compact": [
+            "find_call_hierarchy('ПроцИмя', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
+            "Для одного уровня + контекст строк используй find_callers_context('ПроцИмя')",
+            "direction='callees' пока не поддерживается (возвращает error-dict с hint)",
+        ],
+        "full": [
+            "tree = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)",
+            "Дерево по уровням: tree['tree'][i]['callers'][j]['callers'][k]...",
+            "tree['truncated_targets'] — список одноимённых методов с >200 callers (популярные имена)",
+            "tree['visited'] — общее число уникальных узлов в обходе",
+            "Если name неоднозначный (омонимы в разных модулях) — раскроет всех носителей",
+            "ALT: find_callers_context('ПроцИмя') для одного уровня с контекстом строк и file:line",
+            "ALT: find_callers_context('ПроцИмя', module_hint='ОбщегоНазначения') для disambig'а омонимов",
+        ],
+        "code_hint": (
+            "tree = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)\n"
+            "print(f\"visited={tree.get('visited')} truncated={tree.get('truncated_targets', [])}\")\n"
+            "for node in tree.get('tree', []):\n"
+            "    print(f\"{node['name']} ({len(node.get('callers', []))} L1)\")\n"
+            "    for caller in node.get('callers', [])[:5]:\n"
+            "        print(f\"  ← {caller['name']} ({len(caller.get('callers', []))} L2)\")"
+        ),
+    },
+    "расширения": {
+        "compact": [
+            "get_overrides('ИмяОбъекта') → перехваты из индекса (source='index')",
+            "extract_procedures(path) → поле overridden_by у перехваченных методов",
+            "read_procedure(path, name, include_overrides=True) → оригинал + тело расширения с аннотацией",
+        ],
+        "full": [
+            "get_overrides() → все перехваты конфигурации (group by extension/annotation)",
+            "get_overrides('ИмяОбъекта') → перехваты одного объекта (метод, аннотация, файл расширения)",
+            "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
+            "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
+            "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
+            "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — должно совпасть с index по количеству",
+            "get_index_info() → has_extension_overrides, extension_overrides — статистика индекса",
+        ],
+        "code_hint": (
+            "all_ov = get_overrides()\n"
+            "print(f\"total={len(all_ov)} from {len({o['extension'] for o in all_ov})} extensions\")\n"
+            "# Группировка по аннотациям:\n"
+            "from collections import Counter\n"
+            "print(Counter(o['annotation'] for o in all_ov))\n"
+            "# Топ-объект:\n"
+            "top = Counter(o['object_name'] for o in all_ov).most_common(1)[0]\n"
+            'print(f"top object: {top[0]} ({top[1]} overrides)")\n'
+            "obj_ov = get_overrides(top[0])\n"
+            "for o in obj_ov[:5]:\n"
+            "    print(f\"  {o['annotation']} {o['target_method']} ← {o['extension']}\")"
+        ),
+    },
 }
 
 _RECIPE_ALIASES: dict[str, str] = {
     "обмен": "интеграция",
     "синхрониз": "интеграция",
     "exchange": "интеграция",
+    # «интеграция» — http/soap/xdto/rest/мэдо
+    "http": "интеграция",
+    "http-сервис": "интеграция",
+    "http-сервисы": "интеграция",
+    "http services": "интеграция",
+    "веб-сервис": "интеграция",
+    "веб-сервисы": "интеграция",
+    "web service": "интеграция",
+    "soap": "интеграция",
+    "rest": "интеграция",
+    "rest api": "интеграция",
+    "xdto": "интеграция",
+    "планы обмена": "интеграция",
+    "мэдо": "интеграция",
+    "межведомственный": "интеграция",
     "обработчики формы": "события формы",
     "элементы формы": "события формы",
     "кнопки формы": "события формы",
     "формы": "события формы",
     "form events": "события формы",
     "form handlers": "события формы",
+    "события документа": "проведение",
+    "обработчики событий": "проведение",
+    "передзаписью": "проведение",
+    "призаписи": "проведение",
+    "document events": "проведение",
     "субконто": "тип реквизита",
     "тип субконто": "тип реквизита",
     "предопределённ": "тип реквизита",
+    "предопределенн": "тип реквизита",
     "attribute type": "тип реквизита",
     "references": "ссылки",
     "where used": "ссылки",
@@ -507,6 +588,11 @@ _RECIPE_ALIASES: dict[str, str] = {
     "posting": "проведение",
     "register movements": "проведение",
     "как проводится документ": "проведение",
+    "движения по регистрам": "проведение",
+    "регистры": "проведение",
+    "регистры накопления": "проведение",
+    "регистры сведений": "проведение",
+    "movements": "проведение",
     # «печать»
     "макеты": "печать",
     "печатные формы": "печать",
@@ -516,6 +602,13 @@ _RECIPE_ALIASES: dict[str, str] = {
     "role": "права",
     "rights": "права",
     "access": "права",
+    "rls": "права",
+    "restriction": "права",
+    "ограничение доступа": "права",
+    "access restriction": "права",
+    "права доступа": "права",
+    "функциональные опции": "права",
+    "functional options": "права",
     # «перечисления»
     "enum": "перечисления",
     "значения перечисления": "перечисления",
@@ -525,11 +618,35 @@ _RECIPE_ALIASES: dict[str, str] = {
     "based on": "ввод на основании",
     "основание": "ввод на основании",
     "can_create_from": "ввод на основании",
+    "ввод документов на основании": "ввод на основании",
     # «структура объекта»
     "карточка объекта": "структура объекта",
     "полная структура": "структура объекта",
     "реквизиты документа": "структура объекта",
     "object structure": "структура объекта",
+    "структура справочника": "структура объекта",
+    "структура регистра": "структура объекта",
+    "табличные части": "структура объекта",
+    "реквизиты": "структура объекта",
+    # «иерархия вызовов»
+    "иерархия": "иерархия вызовов",
+    "call hierarchy": "иерархия вызовов",
+    "callers": "иерархия вызовов",
+    "вызывающие": "иерархия вызовов",
+    "кто вызывает": "иерархия вызовов",
+    "цепочка вызовов": "иерархия вызовов",
+    # «расширения»
+    "перехват": "расширения",
+    "перехваты": "расширения",
+    "override": "расширения",
+    "overrides": "расширения",
+    "extension": "расширения",
+    "extensions": "расширения",
+    "ext_overrides": "расширения",
+    "аннотации": "расширения",
+    "&перед": "расширения",
+    "&после": "расширения",
+    "&вместо": "расширения",
 }
 
 _STRATEGY_IO_SECTION = """\
@@ -581,6 +698,51 @@ def get_strategy(
     idx_warnings: list[str] | None = None,
     query: str = "",
 ) -> str:
+    """Public strategy builder. Routes to slim or full mode based on
+    ``RLM_STRATEGY_MODE`` env var.
+
+    Modes:
+      - ``slim`` (default, production): condensed strategy + ``rlm_help`` MCP tool.
+      - ``full``: byte-for-byte legacy strategy (safe fallback for weak models
+        and a regression baseline).
+
+    Unknown values fall back to ``slim``.
+    """
+    mode = os.environ.get("RLM_STRATEGY_MODE", "slim").lower()
+    if mode not in ("slim", "full"):
+        mode = "slim"
+    builder = _build_full_strategy if mode == "full" else _build_slim_strategy
+    return builder(
+        effort,
+        format_info,
+        detected_prefixes,
+        extension_context,
+        ext_overrides,
+        registry,
+        idx_stats,
+        idx_warnings,
+        query,
+    )
+
+
+def get_strategy_mode() -> str:
+    """Resolved strategy mode for the current environment ('slim' or 'full')."""
+    mode = os.environ.get("RLM_STRATEGY_MODE", "slim").lower()
+    return mode if mode in ("slim", "full") else "slim"
+
+
+def _build_full_strategy(
+    effort: str,
+    format_info,
+    detected_prefixes: list[str] | None = None,
+    extension_context=None,
+    ext_overrides: dict | None = None,
+    registry: dict | None = None,
+    idx_stats: dict | None = None,
+    idx_warnings: list[str] | None = None,
+    query: str = "",
+) -> str:
+    """Legacy ("full") strategy — kept byte-for-byte as a safe fallback."""
     config = EFFORT_LEVELS.get(effort, EFFORT_LEVELS["medium"])
 
     has_extensions = (
@@ -772,6 +934,391 @@ def get_strategy(
         )
 
     return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#                        SLIM STRATEGY (v1.10.x)
+# ─────────────────────────────────────────────────────────────────────
+
+_SLIM_HELP_BLOCK = """\
+== HELP ==
+This is a slim strategy. For detailed recipes, examples and helper-comparison rules
+you MUST call rlm_help(...) BEFORE running rlm_execute on non-trivial queries.
+  rlm_help(topic='проведение'|'печать'|'права'|'ссылки'|...)  → готовый план для домена
+  rlm_help(category='discovery'|'code'|'xml'|'composite'|'business'|'extension'|'navigation')  → группа хелперов
+  rlm_help(helpers=['name1','name2'])  → детальные рецепты для конкретных хелперов
+  rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io')  → справочные секции
+  rlm_help()  → меню всех topic/category/section
+NOTE: in-sandbox help('keyword') (the BSL helper) still works inside rlm_execute for
+quick recipe lookup at code-time — that is separate from the rlm_help MCP tool above."""
+
+_SLIM_WORKFLOW_OVERVIEW = """\
+== WORKFLOW (overview) ==
+Step 0 UNDERSTAND → Step 1 DISCOVER → Step 2 READ → Step 3 TRACE → Step 4 ANALYZE → Step 5 EXTENSIONS.
+Full Step 0..5 with helper menu per step → rlm_help(section='workflow').
+INSTANT/HYBRID/LIVE breakdown for Step 4 perf → rlm_help(section='performance')."""
+
+_SLIM_DISAMBIGUATION_POINTER = """\
+== DISAMBIGUATION (pointer) ==
+8 overlapping helper pairs are documented separately. Examples:
+  get_object_full_structure vs analyze_object | find_call_hierarchy vs find_callers_context
+  find_callers vs find_callers_context | find_register_movements vs analyze_document_flow
+  parse_object_xml vs find_attributes | parse_object_xml vs find_roles
+  find_register_movements vs find_register_writers | search vs search_methods/search_objects
+Get rules, when_a/when_b for any pair → rlm_help(section='disambiguation')
+or rlm_help(helpers=['name_a','name_b'], section='disambiguation') for one pair."""
+
+
+def build_slim_helpers_index(registry: dict) -> str:
+    """One line per category with up to 6 helper names, no signatures or descriptions.
+
+    Detailed signatures live in `available_functions` of `rlm_start` and full
+    recipes/tags via `rlm_help(category=..., helpers=[...])`.
+    """
+    if not registry:
+        return ""
+    lines = ["== HELPERS (compact index — call rlm_help for sigs/recipes) =="]
+    for cat_key, cat_label in _CATEGORY_ORDER:
+        names = [name for name, entry in registry.items() if entry.get("cat") == cat_key]
+        if not names:
+            continue
+        head = ", ".join(names[:6])
+        suffix = f", … ({len(names)} total)" if len(names) > 6 else ""
+        lines.append(f"  {cat_label} ({len(names)}): {head}{suffix}")
+    return "\n".join(lines)
+
+
+def _build_slim_strategy(
+    effort: str,
+    format_info,
+    detected_prefixes: list[str] | None = None,
+    extension_context=None,
+    ext_overrides: dict | None = None,
+    registry: dict | None = None,
+    idx_stats: dict | None = None,
+    idx_warnings: list[str] | None = None,
+    query: str = "",
+) -> str:
+    """Slim strategy — replaces the static workflow/disambiguation/perf walls
+    with one-line pointers to the `rlm_help(...)` MCP tool. Token target ~1500-1800.
+    """
+    config = EFFORT_LEVELS.get(effort, EFFORT_LEVELS["medium"])
+
+    has_extensions = (
+        extension_context is not None
+        and extension_context.current.role.value != "unknown"
+        and (extension_context.current.role.value == "extension" or extension_context.nearby_extensions)
+    )
+
+    parts: list[str] = []
+
+    # --- Extension alert (BEFORE everything else if present) ---
+    if has_extensions:
+        parts.append(_extension_strategy(extension_context, ext_overrides or {}))
+
+    # --- Sandbox preamble + critical block ---
+    parts.append(
+        "You are exploring a 1C BSL codebase via Python sandbox.\n"
+        "Write Python code in rlm_execute. Use print() to output results.\n\n" + STRATEGY_SECTIONS["critical"]
+    )
+
+    # --- HELP pointer (slim-only marker) ---
+    parts.append(_SLIM_HELP_BLOCK)
+
+    # --- Top-level workflow + perf pointers ---
+    parts.append(_SLIM_WORKFLOW_OVERVIEW)
+
+    # --- Auto-routed compact recipe (always 'compact', regardless of effort) ---
+    if query:
+        domain = _match_recipe(query)
+        if domain:
+            recipe = _BUSINESS_RECIPES[domain]
+            steps = recipe.get("compact") or []
+            recipe_lines = [f"\n== BUSINESS RECIPE: {domain} =="]
+            for i, step in enumerate(steps, 1):
+                recipe_lines.append(f"  {i}. {step}")
+            recipe_lines.append(f"Full version + code_hint (if any): rlm_help(topic='{domain}', format='full')")
+            parts.append("\n".join(recipe_lines))
+
+    # --- Compact helpers index (categories + names, no signatures) ---
+    if registry:
+        parts.append(build_slim_helpers_index(registry))
+
+    # --- DISAMBIGUATION + STEP 4 perf pointers ---
+    parts.append(_SLIM_DISAMBIGUATION_POINTER)
+
+    # --- BATCHING & OUTPUT (kept verbatim — small, contains anti-duplicate rule) ---
+    parts.append(STRATEGY_SECTIONS["batching"])
+
+    # --- INDEX (full dynamic block — same as legacy) ---
+    parts.append(_render_index_block(idx_stats, idx_warnings))
+
+    # --- Effort & limits ---
+    parts.append(f"\n== EFFORT: {effort} ==")
+    parts.append(config.guidance)
+    parts.append(
+        f"Limits: max_execute_calls={config.max_execute_calls}, "
+        f"max_llm_calls={config.max_llm_calls}, "
+        f"safe_grep_max_files={config.safe_grep_max_files}"
+    )
+
+    # --- Format & paths ---
+    if format_info is not None:
+        fmt = getattr(format_info, "format_label", None)
+        if fmt == "cf":
+            parts.append(
+                "\n== FORMAT: CF ==\nPaths: CommonModules/Name/Ext/Module.bsl, Documents/Name/Ext/ObjectModule.bsl"
+            )
+        elif fmt == "edt":
+            parts.append("\n== FORMAT: EDT ==\nPaths: CommonModules/Name/Module.bsl, Documents/Name/ObjectModule.bsl")
+
+    # --- Custom prefixes ---
+    if detected_prefixes:
+        parts.append(
+            f"\n== CUSTOM PREFIXES: {detected_prefixes} ==\n"
+            "Use these to filter custom objects/subscriptions/roles. "
+            "find_custom_modifications() uses them automatically."
+        )
+
+    return "\n".join(parts)
+
+
+def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) -> str:
+    """Render the dynamic INDEX block. Reused by both full and slim builders.
+
+    Behavior matches the original inline block in `_build_full_strategy` so
+    legacy output stays byte-identical when reached via the router.
+    """
+    if idx_stats is None:
+        return (
+            "\n== INDEX ==\n"
+            "No pre-built index. All helpers work via filesystem fallback (slower on large configs).\n"
+            "NEVER call rlm_index(action='build') yourself — only the USER decides when to build indexes. "
+            "Build runs in background (returns immediately), but requires the project password. Work with what you have.\n"
+            "WITHOUT INDEX:\n"
+            "  - find_attributes(object_name='X') — WORKS (auto-resolves category via find_module, parses XML live)\n"
+            "  - find_predefined(object_name='X') — WORKS (parses Predefined.xml live)\n"
+            "  - find_attributes('name') without object_name — EMPTY (cannot scan all files)\n"
+            "  - find_predefined('name') without object_name — EMPTY (cannot scan all files)\n"
+            "  - search_methods, search_objects, search_regions — EMPTY (require index)\n"
+            "  - parse_object_xml(path) — WORKS (always, direct XML read)\n"
+            "  - All other helpers — WORK via filesystem (slower but functional)"
+        )
+
+    methods_count = idx_stats.get("methods", 0)
+    calls_count = idx_stats.get("calls", 0)
+    config_name = idx_stats.get("config_name") or ""
+    config_version = idx_stats.get("config_version") or ""
+    has_fts = bool(idx_stats.get("has_fts"))
+
+    builder_version = idx_stats.get("builder_version") or "?"
+    synonyms_count = idx_stats.get("object_synonyms", 0)
+
+    idx_lines = ["\n== INDEX =="]
+    label = f"Index v{builder_version} ({methods_count} methods, {calls_count} call edges"
+    if synonyms_count:
+        label += f", {synonyms_count} synonyms"
+    oa_count = idx_stats.get("object_attributes", 0)
+    pi_count = idx_stats.get("predefined_items", 0)
+    if oa_count:
+        label += f", {oa_count} attributes"
+    if pi_count:
+        label += f", {pi_count} predefined"
+    if config_name:
+        label += f", config: {config_name}"
+        if config_version:
+            label += f" v{config_version}"
+    label += ")."
+    idx_lines.append(label)
+
+    instant_helpers = ["extract_procedures()", "find_exports()"]
+    if calls_count:
+        instant_helpers.append("find_callers_context()")
+        instant_helpers.append("find_call_hierarchy()")
+    instant_helpers.extend(
+        [
+            "find_event_subscriptions()",
+            "find_scheduled_jobs()",
+            "find_functional_options()",
+        ]
+    )
+    role_rights_count = idx_stats.get("role_rights", 0)
+    if role_rights_count:
+        instant_helpers.append("find_roles()")
+    register_movements_count = idx_stats.get("register_movements", 0)
+    if register_movements_count:
+        instant_helpers.extend(["find_register_movements()", "find_register_writers()"])
+    file_paths_count = idx_stats.get("file_paths", 0)
+    if file_paths_count:
+        instant_helpers.extend(["glob_files(indexed)", "tree(indexed)", "find_files(indexed)"])
+    if synonyms_count:
+        instant_helpers.append("search_objects()")
+    form_elements_count = idx_stats.get("form_elements", 0)
+    if form_elements_count:
+        instant_helpers.append("parse_form()")
+    bver = int(idx_stats.get("builder_version") or 0)
+    if bver >= 8:
+        instant_helpers.append("search_regions()")
+        instant_helpers.append("search_module_headers()")
+    if oa_count:
+        instant_helpers.append("find_attributes()")
+    if pi_count:
+        instant_helpers.append("find_predefined()")
+    if oa_count and pi_count:
+        instant_helpers.append("get_object_full_structure()")
+    instant_helpers.append("search()")
+    idx_lines.append(f"INSTANT from index: {', '.join(instant_helpers)}.")
+
+    if has_fts:
+        idx_lines.append(
+            "search_methods(query) — full-text search by method name substring. "
+            "Use in Step 1 DISCOVER to find methods across the entire codebase without knowing the module name."
+        )
+    if synonyms_count:
+        idx_lines.append(
+            f"search_objects(query) — {synonyms_count} object synonyms indexed. "
+            "Find 1C objects by Russian business name. Use in Step 1 DISCOVER."
+        )
+
+    tips = [
+        "INDEX TIPS:",
+        "  - find_callers_context() returns instantly — no need to limit scope with hint, search the whole codebase.",
+        "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
+        "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
+        "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
+    ]
+    if file_paths_count:
+        tips.extend(
+            [
+                f"  - File navigation indexed: {file_paths_count} paths (.bsl/.mdo/.xml) — "
+                "glob_files(), tree(), find_files() are instant for supported patterns.",
+                "  - FAST: glob_files('**/*.mdo'), glob_files('Subsystems/**/*.mdo'), glob_files('Documents/**'), tree('Documents'), find_files('name')",
+                "  - SLOW (FS fallback): complex globs with multiple wildcards, glob_files('**/Dir*/*.xml')",
+                "  - For BSL modules: ALWAYS prefer find_module()/find_by_type() over glob_files() — faster and more precise.",
+                "  - NEVER use tree('.') on root of large configs — too much data. Use tree('SubDir') instead.",
+            ]
+        )
+    idx_lines.append("\n".join(tips))
+
+    idx_lines.append(
+        "NOTE: Index freshness uses quick check (age + content sampling). "
+        "Structural validation (files added/removed) is approximate — "
+        "run 'rlm-bsl-index index info' for full check."
+    )
+
+    for w in idx_warnings or []:
+        idx_lines.append(f"WARNING: {w}")
+    return "\n".join(idx_lines)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#               rlm_help dispatcher helpers (read-only)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _get_section(name: str) -> str:
+    """Return the verbatim text of a strategy section.
+
+    `disambiguation` is intentionally NOT a key here — it is structured data,
+    fetched via `_get_disambiguation()` instead. Other unknown names raise.
+    """
+    if name == "disambiguation":
+        raise ValueError("section='disambiguation' is structured data — use _get_disambiguation() instead")
+    if name not in STRATEGY_SECTIONS:
+        raise KeyError(name)
+    return STRATEGY_SECTIONS[name]
+
+
+def _get_disambiguation(filter_helpers: list[str] | None = None) -> list[dict]:
+    """Return DISAMBIGUATION_PAIRS, optionally narrowed by ``filter_helpers``.
+
+    Filter semantics (case-insensitive):
+      - 1 helper given  → pairs where at least one leg matches.
+      - 2+ helpers given → pairs where BOTH legs are in the filter (lets agents
+        pinpoint a single pair via ``helpers=['a','b']`` even when 'a' or 'b'
+        appears in several pairs).
+    """
+    if not filter_helpers:
+        return list(DISAMBIGUATION_PAIRS)
+    targets = {h.lower() for h in filter_helpers if h}
+    out: list[dict] = []
+    for entry in DISAMBIGUATION_PAIRS:
+        a, b = entry["pair"]
+        a_l, b_l = a.lower(), b.lower()
+        if len(targets) >= 2:
+            if a_l in targets and b_l in targets:
+                out.append(entry)
+        else:
+            if a_l in targets or b_l in targets:
+                out.append(entry)
+    return out
+
+
+def _get_category_helpers(category: str, registry: dict) -> list[dict]:
+    """Return [{name, sig}] for helpers in the given category. Empty list if
+    category is unknown or registry missing."""
+    if not registry:
+        return []
+    return [
+        {"name": name, "sig": entry.get("sig", "")} for name, entry in registry.items() if entry.get("cat") == category
+    ]
+
+
+def _get_topic_recipe(topic: str, format: str = "compact", include_code: bool = True) -> dict | None:
+    """Resolve `topic` (domain key or alias) to a recipe dict.
+
+    Returns ``{topic, format, steps, code_hint?}`` or None if no match.
+    """
+    if not topic:
+        return None
+    domain = _match_recipe(topic)
+    if domain is None or domain not in _BUSINESS_RECIPES:
+        return None
+    recipe = _BUSINESS_RECIPES[domain]
+    fmt = format if format in ("compact", "full") else "compact"
+    steps = list(recipe.get(fmt) or recipe.get("compact") or [])
+    out: dict = {"topic": domain, "format": fmt, "steps": steps}
+    if include_code and recipe.get("code_hint"):
+        out["code_hint"] = recipe["code_hint"]
+    return out
+
+
+def _get_helper_details(name: str, registry: dict) -> dict | None:
+    """Return ``{name, sig, category, kw, recipe}`` or None if not registered."""
+    if not registry or name not in registry:
+        return None
+    entry = registry[name]
+    return {
+        "name": name,
+        "sig": entry.get("sig", ""),
+        "category": entry.get("cat", ""),
+        "kw": list(entry.get("kw") or []),
+        "recipe": entry.get("recipe", ""),
+    }
+
+
+def _fuzzy_suggest(query: str, candidates: list[str], top_n: int = 3) -> list[str]:
+    """Return up to `top_n` close matches from `candidates` using difflib."""
+    if not query or not candidates:
+        return []
+    return difflib.get_close_matches(query, candidates, n=top_n, cutoff=0.5)
+
+
+def list_topics() -> list[str]:
+    """All resolvable topic keys (domain keys + aliases). For menu output."""
+    return list(_BUSINESS_RECIPES.keys()) + list(_RECIPE_ALIASES.keys())
+
+
+def list_sections() -> list[str]:
+    """Section names valid for `rlm_help(section=...)` (excluding 'disambiguation',
+    which is fetched separately as structured data — but listed here so the
+    enum and the menu agree)."""
+    return ["workflow", "performance", "batching", "io", "critical", "disambiguation"]
+
+
+def list_categories() -> list[str]:
+    """Helper category keys, in display order."""
+    return [k for k, _ in _CATEGORY_ORDER]
 
 
 def _extension_strategy(ext_context, ext_overrides: dict) -> str:

@@ -27,7 +27,17 @@ from rlm_tools_bsl.extension_detector import (
 )
 from rlm_tools_bsl.bsl_knowledge import (
     EFFORT_LEVELS,
+    _fuzzy_suggest,
+    _get_category_helpers,
+    _get_disambiguation,
+    _get_helper_details,
+    _get_section,
+    _get_topic_recipe,
     get_strategy,
+    get_strategy_mode,
+    list_categories,
+    list_sections,
+    list_topics,
 )
 from rlm_tools_bsl.bsl_index import (
     BUILDER_VERSION,
@@ -642,8 +652,10 @@ def _rlm_start(
     out_chars = len(result_json)
     session.total_out_chars += out_chars
     logger.info(
-        "rlm_start: session=%s completed in %.2fs out_chars=%d out_tokens~%d",
+        "rlm_start: session=%s mode=%s strategy_chars=%d completed in %.2fs out_chars=%d out_tokens~%d",
         session_id,
+        get_strategy_mode(),
+        len(strategy),
         time.monotonic() - t0,
         out_chars,
         int(out_chars / 1.75),
@@ -851,6 +863,10 @@ async def rlm_start(
     If the user mentions a project by name -- always try project parameter first.
     If the path is not registered, the response will include a project_hint suggesting to register it.
     Then call rlm_execute(session_id, code) where code is Python that calls helper functions and uses print() to output results.
+    In the default 'slim' strategy mode the returned strategy is condensed; for detailed recipes,
+    helper-comparison rules and per-step menus you MUST call rlm_help(...) BEFORE running rlm_execute
+    on non-trivial queries. (In legacy 'full' mode (RLM_STRATEGY_MODE=full) rlm_help is not exposed
+    and the strategy contains everything inline.)
     IMPORTANT: For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first."""
     return await anyio.to_thread.run_sync(
         lambda: _rlm_start(
@@ -895,7 +911,11 @@ async def rlm_execute(
         ),
     ] = 20,
 ) -> str:
-    """Execute Python code in the BSL sandbox. Variables persist between calls. Use print() to see results. The full helper list is returned by rlm_start in the `strategy` field. CRITICAL: grep on path='.' ALWAYS times out on large 1C configs — use find_module() first."""
+    """Execute Python code in the BSL sandbox. Variables persist between calls. Use print() to see results.
+    The full helper list with signatures is returned by rlm_start in the `available_functions` array.
+    In the default 'slim' strategy mode call rlm_help(...) for detailed recipes, helper-comparison rules
+    and per-step menus; in 'full' mode the strategy contains everything inline.
+    CRITICAL: grep on path='.' ALWAYS times out on large 1C configs — use find_module() first."""
     return await anyio.to_thread.run_sync(lambda: _rlm_execute(session_id, code, detail_level, max_new_variables))
 
 
@@ -905,6 +925,262 @@ async def rlm_end(
 ) -> str:
     """End an RLM exploration session and free resources."""
     return await anyio.to_thread.run_sync(lambda: _rlm_end(session_id))
+
+
+# ─────────────────────────────────────────────────────────────────────
+#                          rlm_help (slim mode)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _rlm_help_dispatch(
+    topic: str | None = None,
+    helpers: list[str] | None = None,
+    category: str | None = None,
+    section: str | None = None,
+    format: str = "compact",
+    include_code: bool = True,
+) -> str:
+    """Dispatch ``rlm_help`` arguments to one of six modes (see table below)
+    and return a JSON string. Pure function: does not touch the active session
+    and uses the cached static helper-metadata snapshot.
+
+    Mode priority (top-down — first match wins, later args ignored with a
+    warning attached to the JSON response):
+
+    1. all-empty            → menu        (topics/categories/sections/helper count)
+    2. topic given          → topic       (recipe via _match_recipe; alias-aware)
+    3. section=='disambiguation' → disambiguation (filtered by `helpers` if given)
+    4. section given        → section     (raw text)
+    5. helpers given        → helpers     (per-helper details, optional category filter)
+    6. category given       → category    (one-line per helper in that category)
+    """
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    snapshot = build_helper_metadata_snapshot()
+    warnings: list[str] = []
+
+    def _emit(other_args: dict, kept: str) -> None:
+        for arg_name, arg_val in other_args.items():
+            if arg_val:
+                warnings.append(f"argument '{arg_name}' ignored when '{kept}' is given")
+
+    # Mode 1: menu
+    if not (topic or helpers or category or section):
+        result = {
+            "available_topics": list_topics(),
+            "available_categories": list_categories(),
+            "available_sections": list_sections(),
+            "helpers_count": len(snapshot),
+            "hint": (
+                "rlm_help(topic='проведение'|'печать'|'обмен'|...) → recipe for a domain. "
+                "rlm_help(category='discovery'|'code'|...) → list helpers in a category. "
+                "rlm_help(helpers=['name1','name2']) → details. "
+                "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical')."
+            ),
+        }
+        return json.dumps({"mode": "menu", "result": result, "warnings": warnings}, ensure_ascii=False)
+
+    # Mode 2: topic
+    if topic:
+        _emit({"helpers": helpers, "category": category, "section": section}, "topic")
+        recipe = _get_topic_recipe(topic, format=format, include_code=include_code)
+        if recipe is None:
+            suggestions = _fuzzy_suggest(topic, list_topics(), top_n=3)
+            return json.dumps(
+                {
+                    "mode": "topic",
+                    "result": {"topic": topic, "error": "unknown", "suggestions": suggestions},
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"mode": "topic", "result": recipe, "warnings": warnings}, ensure_ascii=False)
+
+    # Mode 3: section=='disambiguation' (structured array)
+    if section == "disambiguation":
+        _emit({"category": category}, "section='disambiguation'")
+        pairs = _get_disambiguation(filter_helpers=helpers)
+        return json.dumps(
+            {"mode": "disambiguation", "result": pairs, "warnings": warnings},
+            ensure_ascii=False,
+        )
+
+    # Mode 4: section
+    if section:
+        _emit({"helpers": helpers, "category": category}, f"section='{section}'")
+        try:
+            text = _get_section(section)
+        except (KeyError, ValueError):
+            return json.dumps(
+                {
+                    "mode": "section",
+                    "result": {
+                        "section": section,
+                        "error": "unknown",
+                        "available": list_sections(),
+                    },
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {"mode": "section", "result": {"section": section, "text": text}, "warnings": warnings},
+            ensure_ascii=False,
+        )
+
+    # Mode 5: helpers (optional category filter — AND, drops mismatches silently from result)
+    if helpers:
+        items: list[dict] = []
+        dropped_by_category: list[tuple[str, str]] = []
+        for name in helpers:
+            details = _get_helper_details(name, snapshot)
+            if details is None:
+                items.append(
+                    {
+                        "name": name,
+                        "error": "unknown",
+                        "suggestions": _fuzzy_suggest(name, list(snapshot.keys()), top_n=3),
+                    }
+                )
+                continue
+            if category and details["category"] != category:
+                dropped_by_category.append((name, details["category"]))
+                continue
+            items.append(details)
+        if dropped_by_category:
+            names_part = ", ".join(f"{n} (category='{c}')" for n, c in dropped_by_category)
+            warnings.append(f"helpers dropped — not in requested category '{category}': {names_part}")
+        return json.dumps({"mode": "helpers", "result": items, "warnings": warnings}, ensure_ascii=False)
+
+    # Mode 6: category
+    if category:
+        cats = list_categories()
+        if category not in cats:
+            return json.dumps(
+                {
+                    "mode": "category",
+                    "result": {
+                        "category": category,
+                        "error": "unknown",
+                        "available": cats,
+                    },
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+            )
+        cat_helpers = _get_category_helpers(category, snapshot)
+        return json.dumps(
+            {
+                "mode": "category",
+                "result": {"category": category, "helpers": cat_helpers},
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+        )
+
+    # Should be unreachable — keep a defensive return for type-checkers.
+    return json.dumps({"mode": "menu", "result": {"hint": "no input"}, "warnings": warnings}, ensure_ascii=False)
+
+
+# Registered as an MCP tool only in slim mode. In RLM_STRATEGY_MODE=full the
+# tool list does not include rlm_help — agents see the legacy strategy with
+# all rules inlined and no extra tool to call. Mode is read once at module
+# import time; FastMCP caches the tool list, so changing the env later
+# requires a server restart.
+if get_strategy_mode() == "slim":
+
+    @mcp.tool()
+    async def rlm_help(
+        topic: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Business domain or alias to fetch a recipe for. "
+                    "Supported domains include: 'проведение', 'печать', 'права', 'интеграция' "
+                    "(aliases: 'обмен', 'синхронизация', 'exchange'), 'события формы' "
+                    "(aliases: 'формы', 'обработчики формы', 'элементы формы'), 'ссылки' "
+                    "(aliases: 'найти ссылки', 'where used'), 'перечисления' (alias: 'enum'), "
+                    "'ввод на основании', 'структура объекта' (alias: 'карточка объекта'), "
+                    "'тип реквизита' (alias: 'субконто'), 'себестоимость', 'распределение'. "
+                    "Use rlm_help() with no args to see the full menu."
+                )
+            ),
+        ] = None,
+        helpers: Annotated[
+            list[str] | None,
+            Field(
+                description="Helper names to fetch full sigs+kw+recipes for (e.g. ['find_callers_context','parse_form'])"
+            ),
+        ] = None,
+        category: Annotated[
+            Literal["discovery", "code", "xml", "composite", "business", "extension", "navigation"] | None,
+            Field(description="Helper category to list (one-line entries: name+sig, no recipes)"),
+        ] = None,
+        section: Annotated[
+            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical"] | None,
+            Field(
+                description=(
+                    "Strategy section to fetch. 'disambiguation' returns a structured array of "
+                    "overlapping-helper pairs (use with helpers=[a,b] to narrow to one pair). "
+                    "Other values return raw text."
+                )
+            ),
+        ] = None,
+        format: Annotated[
+            Literal["compact", "full"],
+            Field(description="For topics: 'compact' = 3-4 quick steps, 'full' = 7-9 steps + code_hint"),
+        ] = "compact",
+        include_code: Annotated[
+            bool,
+            Field(description="Include code_hint Python snippet for topics that have it (default true)"),
+        ] = True,
+    ) -> str:
+        """Slim-mode helper companion to rlm_start. Returns details about helpers, business
+        recipes and strategy sections that were intentionally omitted from the slim
+        rlm_start strategy. Call this BEFORE rlm_execute on any non-trivial query.
+
+        Six dispatch modes (priority order):
+          - menu       — no args → list of topics/categories/sections + helper count.
+          - topic      — domain/alias → 3-4 (compact) or 7-9 (full) steps + optional code_hint.
+          - disambiguation — section='disambiguation' → array of overlapping-helper pairs;
+                             pass helpers=[a,b] to narrow to one pair.
+          - section    — section='workflow'|'performance'|'batching'|'io'|'critical' → raw text.
+          - helpers    — list[str] of names → details with category+kw+recipe.
+          - category   — single category → list of helpers in it (name+sig, no recipes).
+
+        Output is JSON: {mode, result, warnings: list[str]}. `warnings` is always a list
+        (empty if no argument conflicts) — when arguments overlap, the higher-priority
+        mode wins and lower-priority args are recorded in `warnings`."""
+        out = await anyio.to_thread.run_sync(
+            lambda: _rlm_help_dispatch(
+                topic=topic,
+                helpers=helpers,
+                category=category,
+                section=section,
+                format=format,
+                include_code=include_code,
+            )
+        )
+        try:
+            parsed = json.loads(out)
+            mode = parsed.get("mode", "?")
+            warnings_count = len(parsed.get("warnings", []) or [])
+        except Exception:
+            mode = "?"
+            warnings_count = 0
+        helpers_count = len(helpers) if helpers else 0
+        logger.info(
+            "rlm_help: mode=%s topic=%s category=%s section=%s helpers=%d format=%s out_chars=%d warnings=%d",
+            mode,
+            topic,
+            category,
+            section,
+            helpers_count,
+            format,
+            len(out),
+            warnings_count,
+        )
+        return out
 
 
 @mcp.tool()

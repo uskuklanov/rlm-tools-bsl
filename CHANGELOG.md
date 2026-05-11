@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.11.0] — 2026-05-11
+
+### Добавлено
+- **Slim-стратегия `rlm_start` + новый MCP-tool `rlm_help`** — стратегия по умолчанию (`RLM_STRATEGY_MODE=slim`) сжата до маршрутной карты ~1500–1800 токенов: блоки `== HELP ==`, `== WORKFLOW (overview) ==`, `== DISAMBIGUATION (pointer) ==`, компактный `== HELPERS (compact index) ==` (имена по категориям, без сигнатур), auto-routed compact recipe (всегда `compact`-уровень, full + code_hint доступны через `rlm_help(topic=…, format='full')`). Детальные рецепты, описания пар DISAMBIGUATION и тексты секций (workflow / performance / batching / io / critical) выдаёт новый MCP-tool `rlm_help(topic=…, helpers=[…], category=…, section=…, format=…, include_code=…)` — 6 режимов диспетчера с приоритетом сверху вниз и `warnings: list[str]` при конфликтах аргументов. Lazy + thread-safe `build_helper_metadata_snapshot()` в `bsl_helpers.py` строит статический срез реестра без активной сессии (через stub-callbacks `make_bsl_helpers`). На реальных проектах ожидается экономия `out_chars` rlm_start с ~30K до ~13–15K. Внутрипесочничный `help('keyword')` остаётся доступен в обоих режимах — это отдельный канал code-time-справки.
+- **Env-переключатель `RLM_STRATEGY_MODE`** — `slim` (default, production) или `full` (legacy fallback, byte-for-byte старый формат). Невалидное значение трактуется как `slim`. В режиме `full` MCP-tool `rlm_help` **не регистрируется на сервере и не виден агенту** — вся справка inline в стратегии. Документировано в `docs/ENV_REFERENCE.md`.
+- **`src/rlm_tools_bsl/bsl_strategy_data.py`** — leaf-модуль (только stdlib): `DISAMBIGUATION_PAIRS` (8 пар в структурированной форме `{pair, summary, when_a, when_b, rule, tags}`) и `STRATEGY_SECTIONS` (5 ключей: `workflow`/`performance`/`batching`/`io`/`critical`). `disambiguation` — отдельный канал диспетчера на `_get_disambiguation()`, не ключ `STRATEGY_SECTIONS`.
+- **Render-хелперы в `bsl_knowledge.py`**: `get_strategy_mode()`, `_build_slim_strategy()`, `build_slim_helpers_index(registry)`, `_render_index_block()`, `_get_section/_get_disambiguation/_get_category_helpers/_get_topic_recipe/_get_helper_details`, `_fuzzy_suggest`, `list_topics/list_sections/list_categories`. Существующие `_STRATEGY_HEADER`, `_STRATEGY_IO_SECTION`, `_BUSINESS_RECIPES`, `_RECIPE_ALIASES`, `_match_recipe`, `_CATEGORY_ORDER`, `build_helpers_table`, `RLM_START_DESCRIPTION`, `_extension_strategy`, `_format_overrides_summary` — **остались на месте**, ни одна константа не переносилась.
+- **`tests/_strategy_fixtures.py`** — общие константы `_MOCK_REGISTRY` + `_REALISTIC_IDX_STATS` для `test_strategy_examples.py`, `test_strategy_slim.py`, `test_strategy_mode_env.py`, чтобы избежать межтестовых импортов из `test_*` модулей.
+- **`tests/conftest.py` расширен**: autouse-фикстура `_strategy_mode_default` (по маркеру `strategy_mode_slim` → slim, иначе → full — pin в обе стороны, чтобы внешние значения env не загрязнили тесты).
+- **Новые тесты**: `test_strategy_slim.py` (бюджет ≤9000 символов на 3 кейсах + slim-only маркеры), `test_strategy_mode_env.py` (env-резолвер + router ≡ legacy через прямое сравнение с `_build_full_strategy`), `test_rlm_help.py` (6 режимов диспетчера + warnings + suggestions), `test_strategy_data.py` (sanity на `STRATEGY_SECTIONS` + регрессия дрейфа от `_STRATEGY_HEADER`).
+
+### Изменено
+- **`get_strategy(...)` стал тонким роутером** по `RLM_STRATEGY_MODE`. Старая реализация переименована в `_build_full_strategy(...)` без изменений тела — legacy-режим byte-for-byte эквивалентен старому поведению (защищено тестом `test_router_full_matches_legacy_builder`: прямое сравнение `get_strategy(...)` с `_build_full_strategy(...)` под `RLM_STRATEGY_MODE=full`). Сигнатура публичной `get_strategy` сохранена явно типизированной (без `*args/**kwargs`) — IDE-introspection и контракт не сломались.
+- **`server.py`**: docstring `rlm_start` упоминает slim/full и обязательность `rlm_help` для нетривиальных запросов; docstring `rlm_execute` обновлён под фактическое расположение сигнатур хелперов (полный список в `available_functions` rlm_start, детали через `rlm_help` в slim); info-лог `_rlm_start` дополнен полями `mode=slim/full` и `strategy_chars=N` для пост-релизного мониторинга. `@mcp.tool() rlm_help` регистрируется условно — только когда `get_strategy_mode() == 'slim'` (читается один раз при импорте модуля; смена режима требует рестарта сервера).
+- **`tests/test_strategy_examples.py`** переключён на импорт `_MOCK_REGISTRY` из `tests/_strategy_fixtures.py`. Существующие тесты строят strategy через autouse-fixture в режиме `full`, ассерты остались как есть.
+
+### Обратная совместимость
+- Установка `RLM_STRATEGY_MODE=full` в окружении (`.env` / реестр Windows-службы / MCP `env`) возвращает старое поведение целиком: тот же текст strategy + отсутствие `rlm_help` в манифесте сервера.
+- Sandbox-helper `bsl_help(task)` (`help('exports')`/`help('movements')`/`help('flow')` внутри песочницы) — **без изменений**, работает и в slim, и в full.
+- Контракт `get_strategy(...)` не сломан: сигнатура и порядок аргументов прежние, существующие callsites (`_rlm_start` в `server.py`) подхватывают новый роутер без правок.
+
+### Пост-e2e расширения (2026-05-11)
+- **Новые бизнес-домены в `_BUSINESS_RECIPES`** (compact + full + code_hint):
+  - `иерархия вызовов` — рецепт `find_call_hierarchy(direction='callers', depth=N)` + альтернативы `find_callers_context` с module_hint.
+  - `расширения` — рецепт `get_overrides()` + `extract_procedures().overridden_by` + `read_procedure(include_overrides=True)` + live-fallback `detect_extensions + find_ext_overrides`.
+- **~40 новых алиасов в `_RECIPE_ALIASES`** (агенты часто пишут темы по-разному):
+  - Интеграция: `http`, `http-сервис(ы)`, `веб-сервис(ы)`, `soap`, `rest`, `rest api`, `xdto`, `планы обмена`, `мэдо`, `межведомственный`.
+  - Проведение: `движения по регистрам`, `регистры`, `регистры накопления`, `регистры сведений`, `movements`, `события документа`, `обработчики событий`, `ПередЗаписью`, `ПриЗаписи`, `document events`.
+  - Права: `rls`, `restriction`, `ограничение доступа`, `права доступа`, `функциональные опции`, `functional options`.
+  - Структура объекта: `структура справочника`, `структура регистра`, `табличные части`, `реквизиты`.
+  - Иерархия вызовов: `иерархия`, `call hierarchy`, `callers`, `вызывающие`, `кто вызывает`, `цепочка вызовов`.
+  - Расширения: `перехват(ы)`, `override(s)`, `extension(s)`, `ext_overrides`, `аннотации`, `&Перед`/`&После`/`&Вместо`.
+- **Info-лог `rlm_help`** в `server.py` — каждый вызов пишет `mode=…`, `topic=…`, `category=…`, `section=…`, `helpers=N`, `format=…`, `out_chars=N`, `warnings=N` для observability в производстве.
+
 ## [1.10.0] — 2026-05-01
 
 ### Добавлено

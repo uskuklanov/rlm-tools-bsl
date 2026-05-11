@@ -61,6 +61,65 @@ class LazyDict:
         return self.data[key]
 
 
+# --- Static helper-metadata snapshot for `rlm_help` -------------------------
+# `make_bsl_helpers` registers every helper into its closure-local `_registry`
+# even before any helper function is called: registration only writes
+# {sig, cat, kw, recipe} via `_reg(...)`. We exploit that to build a static
+# snapshot of helper metadata without an active sandbox or filesystem — the
+# stub callbacks below are wired only because `make_bsl_helpers` requires
+# them; their behaviour is irrelevant because no helper body is executed.
+
+_HELPER_METADATA_SNAPSHOT: dict[str, dict] | None = None
+_HELPER_METADATA_SNAPSHOT_LOCK = threading.Lock()
+
+
+def build_helper_metadata_snapshot() -> dict[str, dict]:
+    """Return a frozen ``{name: {sig, cat, kw, recipe}}`` map of every helper.
+
+    Module-level cache; first call pays the registration cost (no I/O), every
+    subsequent call returns the same dict instance. Used by the ``rlm_help``
+    MCP tool to answer ``category=`` / ``helpers=`` / menu queries without
+    holding an open session.
+    """
+    global _HELPER_METADATA_SNAPSHOT
+    if _HELPER_METADATA_SNAPSHOT is not None:
+        return _HELPER_METADATA_SNAPSHOT
+    with _HELPER_METADATA_SNAPSHOT_LOCK:
+        if _HELPER_METADATA_SNAPSHOT is not None:
+            return _HELPER_METADATA_SNAPSHOT
+
+        def _stub_resolve_safe(p):
+            return Path(p)
+
+        def _stub_read(_p):
+            return ""
+
+        def _stub_grep(_pat, _p="."):
+            return []
+
+        def _stub_glob(_pat):
+            return []
+
+        helpers = make_bsl_helpers(
+            base_path=".",
+            resolve_safe=_stub_resolve_safe,
+            read_file_fn=_stub_read,
+            grep_fn=_stub_grep,
+            glob_files_fn=_stub_glob,
+        )
+        registry = helpers.get("_registry") or {}
+        snapshot: dict[str, dict] = {}
+        for name, entry in registry.items():
+            snapshot[name] = {
+                "sig": entry.get("sig", ""),
+                "cat": entry.get("cat", ""),
+                "kw": list(entry.get("kw") or []),
+                "recipe": entry.get("recipe", ""),
+            }
+        _HELPER_METADATA_SNAPSHOT = snapshot
+        return snapshot
+
+
 def make_bsl_helpers(
     base_path: str,
     resolve_safe,  # callable: str -> pathlib.Path

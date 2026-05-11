@@ -938,12 +938,15 @@ class TestRecipesSearchObjects:
         # Some recipes use specialized helpers instead of search_objects.
         # v1.10.0 adds: перечисления (find_enum_values), ввод на основании (find_based_on_documents),
         # структура объекта (get_object_full_structure).
+        # v1.11.0+ adds: иерархия вызовов (find_call_hierarchy), расширения (get_overrides).
         _NO_SEARCH_OBJECTS = {
             "тип реквизита",
             "ссылки",
             "перечисления",
             "ввод на основании",
             "структура объекта",
+            "иерархия вызовов",
+            "расширения",
         }
         for domain, recipe in _BUSINESS_RECIPES.items():
             if domain in _NO_SEARCH_OBJECTS:

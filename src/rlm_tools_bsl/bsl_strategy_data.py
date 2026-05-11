@@ -1,0 +1,192 @@
+"""Structured strategy data for the slim-mode `rlm_help` MCP tool.
+
+Leaf module — imports only stdlib. Holds the canonical text of strategy
+sections plus a structured form of the disambiguation block. The slim
+strategy header points the agent at `rlm_help(section=...)` /
+`rlm_help(helpers=[...], section='disambiguation')`; the dispatcher reads
+from the dictionaries below.
+
+The legacy ("full") strategy in `bsl_knowledge._build_full_strategy`
+continues to produce its own copies of the same content directly from
+`_STRATEGY_HEADER` / `_STRATEGY_IO_SECTION`. A regression test in
+`tests/test_strategy_data.py` verifies the data here did not drift away
+from those literals.
+"""
+
+from __future__ import annotations
+
+
+STRATEGY_SECTIONS: dict[str, str] = {
+    "critical": """\
+== CRITICAL ==
+Large configs have 23,000+ files. grep on broad paths WILL timeout. ALWAYS:
+  1. find_module('name') → get file paths first
+  2. Then read_file(path) or grep(pattern, path=specific_file)
+If a helper returns an error, read the HINT at the end — it tells you what to do next.""",
+    "workflow": """\
+== WORKFLOW ==
+BEFORE YOU START: check rlm_start response — warnings, extension_context, detected_custom_prefixes.
+
+Step 0 — UNDERSTAND: decode the business question
+  If a "BUSINESS RECIPE" section appears below — follow it. It was auto-selected by your query.
+  No recipe? → analyze_subsystem('ПодсистемаИмя') for domain overview, then proceed to Step 1.
+
+Step 1 — DISCOVER: find what you need
+  search(query)                          → BROAD first pass: methods + objects + regions + headers + attributes + predefined
+  find_module('name') or find_by_type('Documents', 'name') → get file paths
+  search_objects('бизнес-имя')           → precise: find 1C OBJECTS by Russian synonym
+  search_methods('substring')            → precise: find METHODS by code name (FTS)
+  search_regions('имя')                  → precise: find code regions
+  search_module_headers('текст')         → precise: find modules by header
+  NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
+  parse_object_xml(path) → attributes, tabular sections, dimensions, resources
+  find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
+  find_predefined('ИмяПредопределённого') → INSTANT: predefined item → type(s)
+  find_references_to_object('Справочник.Имя') → все места использования объекта (analogue of "Найти ссылки → В свойствах")
+  find_defined_types('Имя')              → раскрытие ОпределяемогоТипа в список реальных типов
+  parse_form(object_name) → form handlers, commands, attributes (for UI/form analysis tasks)
+
+Step 2 — READ: understand the code
+  extract_procedures(path) → list all procedures with lines
+  read_procedure(path, 'ProcName') → str | None. None = имя неточное или у объекта только XML — звони extract_procedures(path).
+  find_exports(path) → exported API of a module
+
+Step 3 — TRACE: follow the call chains
+  find_callers_context(proc, hint) → who calls this procedure (1 уровень + контекст вызова)
+  find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
+  safe_grep(pattern, hint) → search code patterns
+  find_event_subscriptions(object_name) → what fires on write/post
+
+Step 4 — ANALYZE: get the full picture
+  get_object_full_structure(name) → INSTANT: метаданные + ТЧ + реквизиты + предопределённые + раскрытые перечисления + список форм. Используй ВМЕСТО parse_object_xml + find_attributes + find_predefined.
+  analyze_object(name) → metadata + all modules + procedures
+  analyze_document_flow(doc_name) → subscriptions + register movements + jobs
+  find_custom_modifications(object_name) → find non-standard code by prefix
+  find_register_movements(doc_name) → which registers a document writes to (is_postable hint при пустом результате)
+  CAUTION: analyze_document_flow and analyze_object scan many files — on large configs (10K+)
+  they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
+
+Step 5 — EXTENSIONS: check if behavior is modified
+  get_overrides('ObjectName') → indexed overrides (instant)
+  read_procedure(path, name, include_overrides=True) → original + extension body
+  extract_procedures includes overridden_by field
+  NOTE: extension files are OUTSIDE the sandbox. Do NOT read them via read_file/glob_files.
+  Use ONLY the helpers above — they read extension code internally.""",
+    "performance": """\
+== STEP 4 EXTENDED (по перформансу) ==
+
+INSTANT (индексный путь, OK для batch 5-10 в одном rlm_execute):
+  find_register_writers(reg_name)        → документы-писатели регистра
+  find_register_movements(doc_name)      → регистры, в которые пишет документ
+  find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
+  find_scheduled_jobs(name='')           → регламентные задания
+  find_roles(obj_name)                   → роли с правами на объект
+  find_defined_types(name)               → раскрытие ОпределяемогоТипа
+  find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
+  get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
+
+HYBRID (часть из индекса, часть live — ОДИН вызов в batch, не больше 2-3):
+  find_functional_options(obj_name)      → xml_options из индекса; code_options через safe_grep (live, всегда)
+
+LIVE (читают тела процедур / parse XML — медленно, особенно без индекса):
+  find_based_on_documents(doc_name)      → read_procedure(ОбработкаЗаполнения, ДобавитьКомандыСозданияНаОсновании) — НЕ batch массово
+  find_print_forms(obj_name)             → read_procedure(ДобавитьКомандыПечати) — медленно на CommonModules
+  analyze_object(name)                   → читает ВСЕ модули объекта
+  analyze_document_flow(doc)             → объединяет subscriptions + registers + jobs + based_on + print
+
+CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.""",
+    "batching": """\
+== BATCHING & OUTPUT ==
+Batch 3-5 related helpers per rlm_execute call — this is more efficient than one-at-a-time.
+If output is truncated (ends with '... [truncated]'), split into smaller calls.
+Print only summaries (counts, first N items) — never dump raw data.
+If response contains 'duplicates' section — you've called the same helper with identical args twice
+(possibly across rlm_execute calls). If you assigned the previous result to a variable, reuse it —
+variables persist across rlm_execute calls. Otherwise the second call is wasted work; restructure
+your batches. Note: helper return values are NOT cached automatically — only variables you assigned.
+
+Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')""",
+    "io": """\
+File I/O:
+  read_file(path), read_files(paths)       → str / dict (numbered in MCP session)
+  grep(pattern, path), grep_summary(pattern), grep_read(pattern, path)
+  glob_files(pattern), tree(path, max_depth=3), find_files(name)
+  NOTE: For BSL modules prefer find_module()/find_by_type() over glob_files()
+  NOTE: tree('.') on large configs produces too much output — use tree('SubDir') or find_files()
+LLM (if available):
+  llm_query(prompt, context='')            → str (keep context <3000 chars, split if empty response)
+  llm_query_batched(prompts, context)      → [str]""",
+}
+
+
+# Disambiguation pairs in structured form — projected from the
+# "== DISAMBIGUATION ==" block of `_STRATEGY_HEADER`. The slim builder
+# does NOT inline these; agents fetch them via
+# `rlm_help(section='disambiguation')`, optionally narrowing with
+# `rlm_help(helpers=['name1','name2'], section='disambiguation')`.
+DISAMBIGUATION_PAIRS: list[dict] = [
+    {
+        "pair": ("get_object_full_structure", "analyze_object"),
+        "summary": "structure-only vs structure+modules",
+        "when_a": "ТОЛЬКО metadata (attrs, ТЧ, predefined, enums, forms list). INSTANT с индексом.",
+        "when_b": "metadata + modules + procedures_count + exports. Тяжелее, читает все модули.",
+        "rule": "Сначала get_object_full_structure; analyze_object — только если нужны процедуры.",
+        "tags": ["structure", "metadata", "composite"],
+    },
+    {
+        "pair": ("find_call_hierarchy", "find_callers_context"),
+        "summary": "multi-level tree vs single level + context",
+        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.",
+        "when_b": "1 уровень callers + контекст вызова (line/text). Быстрее.",
+        "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy.",
+        "tags": ["callers", "trace"],
+    },
+    {
+        "pair": ("find_callers", "find_callers_context"),
+        "summary": "compact first page vs full API with pagination",
+        "when_a": "COMPACT FIRST PAGE: тонкая обёртка, default limit=20, без _meta/has_more, плоский [{file, line, text}]. Quick view; если callers > max_files — остаток молча отбрасывается.",
+        "when_b": "ПОЛНЫЙ API: caller_name, object_name, category, is_export + _meta с total_callers/has_more и пагинация (offset/limit).",
+        "rule": "Под капотом — один и тот же поиск (find_callers вызывает find_callers_context). Бери find_callers для быстрого «где зовётся»; для аудита/полного списка — find_callers_context.",
+        "tags": ["callers", "trace"],
+    },
+    {
+        "pair": ("find_register_movements", "analyze_document_flow"),
+        "summary": "registers only vs registers+subscriptions+jobs+based_on",
+        "when_a": "только регистры, признак is_postable.",
+        "when_b": "подписки + регистры + задания + ввод на основании.",
+        "rule": "Если документ непроводимый (is_postable=False) — analyze_document_flow всё равно даёт подписки.",
+        "tags": ["posting", "registers", "document"],
+    },
+    {
+        "pair": ("parse_object_xml", "find_attributes"),
+        "summary": "live XML (slow, full) vs index (instant, flat)",
+        "when_a": "читает XML напрямую, видит синонимы ТЧ и подробные типы. SLOW без индекса.",
+        "when_b": "flat-список из индекса, INSTANT, но синонимов ТЧ нет.",
+        "rule": "Для «карточки объекта» используй get_object_full_structure (выбирает оптимальный путь). Контракт ключей различается: find_attributes → r['attr_name'], get_object_full_structure → for a in s['attributes']: a['name'].",
+        "tags": ["metadata", "xml", "attributes"],
+    },
+    {
+        "pair": ("parse_object_xml", "find_roles"),
+        "summary": "raw Roles XML vs normalized rights-per-object",
+        "when_a": "parse_object_xml('Roles/X') — не подходит для анализа прав: отдаёт сырую XML без нормализации право→объект.",
+        "when_b": "find_roles(object_name) — нормализованный список ролей с правами на объект.",
+        "rule": "Для прав доступа к объекту → ВСЕГДА find_roles, не parse_object_xml.",
+        "tags": ["roles", "rights"],
+    },
+    {
+        "pair": ("find_register_movements", "find_register_writers"),
+        "summary": "document → registers vs register → documents",
+        "when_a": "документ → какие регистры пишет (есть is_postable).",
+        "when_b": "регистр → какие документы пишут.",
+        "rule": "Двунаправленный поиск; запрашивай оба только если нужны обе стороны.",
+        "tags": ["registers", "document"],
+    },
+    {
+        "pair": ("search", "search_methods"),
+        "summary": "broad first pass vs typed precise follow-up",
+        "when_a": "search() — broad-first, отдаёт unified [{source_type, text, path, path_kind, detail}].",
+        "when_b": "search_X() — точная типизация: поля специфичны (для search_methods → is_export, rank; для search_objects → category, synonym).",
+        "rule": "Используй search для discovery; search_X — когда нужны типизированные поля для batch обработки. (Тэги покрывают и search_objects, и search_regions, и search_module_headers — фильтр rlm_help(helpers=['search_objects']) даст эту же запись.)",
+        "tags": ["search", "discovery"],
+    },
+]

@@ -1553,9 +1553,10 @@ def test_recipe_aliases_all_point_to_existing_domains():
 def test_business_recipes_v1_10_count():
     from rlm_tools_bsl.bsl_knowledge import _BUSINESS_RECIPES
 
-    # 9 base + перечисления + ввод на основании + структура объекта = 12
-    assert len(_BUSINESS_RECIPES) == 12
-    for new in ("перечисления", "ввод на основании", "структура объекта"):
+    # v1.10.0: 9 base + перечисления + ввод на основании + структура объекта = 12
+    # v1.11.0+ adds 'иерархия вызовов' + 'расширения' → 14
+    assert len(_BUSINESS_RECIPES) == 14
+    for new in ("перечисления", "ввод на основании", "структура объекта", "иерархия вызовов", "расширения"):
         assert new in _BUSINESS_RECIPES
 
 
