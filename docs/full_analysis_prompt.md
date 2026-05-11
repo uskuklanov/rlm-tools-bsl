@@ -1135,3 +1135,200 @@ On a fresh v12 index, all 8 verifications should PASS. Common observations:
 
 Real metrics from v1.10.0 e2e on Тест ЕРП (EDT, 2026-05-01): 8/8 verifications passed in 45 rlm_execute calls. EDT-specific note: documents that have **only** `<realTimePosting>Deny</realTimePosting>` without `<posting>` are still proper postable documents — `is_postable=False` triggers strictly on `<posting>Deny</posting>` (the operational-posting flag is orthogonal).
 
+---
+
+# Extension Visibility Blind Audit Prompt — E2E Test for v1.12.0 Helpers
+
+Use this prompt to verify the v1.12.0 extension visibility surface on a main
+configuration that has one or more **CFE-расширений в соседнем каталоге**
+(`src/cf/` + `src/cfe/<имя расширения>/`). The agent is NOT told that there
+are extensions — discovery is part of the test. The prompt also exercises the
+multi-line signature parser, `_ext_resolve_safe` sandbox contract, and the
+ranked merge of indexed + extension results in `search_*` / `find_attributes` /
+`find_predefined`.
+
+Replace `<path>` with the path to a main 1C source root that has at least one
+extension directory next to it. Index v12 recommended (`rlm-bsl-index index build <path>`),
+но не обязателен — фикс работает и без индекса (медленнее).
+
+## Prompt
+
+```
+Мне нужно провести разведывательный анализ незнакомой 1С-конфигурации.
+Путь: <путь к каталогу исходников основной 1С-конфигурации>
+
+Используй ТОЛЬКО MCP-сервер rlm-tools-bsl (rlm_start / rlm_execute / rlm_end).
+Не используй встроенные инструменты чтения файлов — всё делай через песочницу.
+
+Никаких внешних сведений о структуре конфигурации, её доработках, перехватах
+или соседних компонентах тебе НЕ дано. Всё, что попадает в отчёт, должно
+быть получено через хелперы. Если чего-то в конфигурации нет — так и
+напиши, не выдумывай.
+
+Сценарий:
+
+1. **Стартовая разведка**:
+   - Открой сессию rlm_start(project=..., effort='high').
+   - Из ответа зафиксируй: формат (CF / EDT), число BSL-файлов, что отдало
+     поле extension_context (роль текущей конфигурации, перечень соседних
+     компонентов с их именами/префиксами/путями, если они есть).
+   - Если стратегия упомянула какие-либо предупреждения индексатора —
+     перечисли их.
+
+2. **Карта объектов и доработок**:
+   - С помощью find_by_type('Catalogs') / find_by_type('Documents') /
+     find_by_type('CommonModules') / find_by_type('Subsystems') собери общее
+     представление о категориях и их размере (count по каждой).
+   - Через search_objects('') (без query, alphabetical listing, limit=50)
+     получи срез по объектам конфигурации. Покажи распределение по
+     категориям. Если в результате встречаются записи с `file`, начинающимся
+     на `../` — отдельно перечисли такие записи (это и есть «нестандартные»
+     пути; интерпретируй их сам по содержимому ответа).
+   - С помощью search_module_headers('') получи 10-20 модулей с непустыми
+     заголовочными комментариями. Если у каких-то заголовок указывает на
+     доработку (упоминание заказчика, ТЗ, проекта, темы доработки) —
+     выпиши их в отдельный список.
+
+3. **Перехваты типового поведения**:
+   - get_overrides() без фильтров. Если результат непустой:
+     - сгруппируй по object_name и по annotation;
+     - выбери ОДИН наиболее «нагруженный» объект (с максимальным числом
+       перехватов) и:
+       - найди оригинальный модуль через find_module(object_name);
+       - возьми один перехваченный метод и сравни 3 вызова на одном пути:
+         - extract_procedures(path) → найди этот метод и покажи
+           поле overridden_by (если есть);
+         - read_procedure(path, name) → только оригинальное тело;
+         - read_procedure(path, name, include_overrides=True) → оригинал +
+           секции «=== Перехвачен ... ===». Подтверди что вторая строка
+           секции содержит правильное имя расширения и аннотацию.
+   - Если перехватов нет — так и напиши, ничего не придумывай.
+
+4. **Многострочные сигнатуры**:
+   - Через search_methods('') (или, если индекса FTS нет — find_by_type +
+     extract_procedures на нескольких CommonModules) найди 3 процедуры или
+     функции, у которых поле `params` содержит несколько строк / запятых
+     (это процедуры с многострочной шапкой).
+   - Для каждой из них:
+     - убедись, что extract_procedures(path) показывает запись с этим
+       именем; line указывает на строку с ключевым словом
+       Процедура/Функция; end_line указывает на строку
+       КонецПроцедуры/КонецФункции;
+     - вызови read_procedure(path, name) и подтверди, что первая строка
+       возврата — сигнатура целиком (со всеми параметрами), последняя —
+       КонецПроцедуры/КонецФункции.
+
+5. **Reverse-lookup по русскому синониму**:
+   - Возьми один из объектов с предыдущих шагов (любой — типовой или нет)
+     и через parse_object_xml(path) получи синоним любого его реквизита.
+   - Сделай find_attributes(name='<кириллический фрагмент-2-3 слова из
+     синонима>') БЕЗ указания object_name. Реквизит должен найтись —
+     даже если на этом фрагменте в основной поставке много совпадений.
+   - Сделай search('<тот же фрагмент>', scope='attributes'). Для каждого
+     элемента результата поле `path` НЕ должно быть пустым (агент должен
+     иметь возможность открыть найденный XML).
+   - Если у выбранного объекта есть предопределённые значения — повтори
+     то же через find_predefined(name=...) и
+     search(..., scope='predefined').
+
+6. **Контракт чтения «нестандартных» путей**:
+   - Если в шагах 2-3 нашлись пути, начинающиеся с `../` — выбери один из
+     них (например путь к модулю или XML из find_module / search). На
+     этом пути попробуй ДВА варианта чтения и зафиксируй разницу:
+     - through high-level helper: read_procedure(path, имя_процедуры) или
+       parse_object_xml(path) — должны успешно вернуть содержимое;
+     - through generic IO: read_file(path) — должен бросить ошибку.
+   - Если путей с `../` нет — так и напиши.
+
+7. **Сводка**:
+   - Числа: BSL-файлов всего; если есть соседние компоненты — отдельно
+     по каждому (по числу записей в _index_state с `../`-префиксом или
+     по подсчёту в search_methods/find_by_type). Перехватов:
+     общее число + по аннотациям + по расширениям. Многострочных
+     сигнатур из п.4: сколько проверено успешно.
+   - Текстом 5-10 строк: что это за конфигурация (по синонимам подсистем
+     и заголовкам модулей), какие доработки заметны (по результатам
+     п.2-3), и хорошо ли отработал контракт `../`-путей и многострочных
+     процедур из п.4 и п.6.
+
+Дай итоговый отчёт. Сохрани его в текущий рабочий каталог СВОИМИ
+инструментами (НЕ через rlm_execute).
+
+## ВАЖНЫЕ ПРАВИЛА
+
+1. Каждый rlm_execute должен батчить несколько связанных операций. Плохо: один вызов на один хелпер. Хорошо: несколько хелперов + print() в одном вызове.
+2. Переменные сохраняются между вызовами rlm_execute — переиспользуй ранее полученные пути / имена модулей.
+3. Используй print() для вывода результатов.
+4. Если хелпер вернул ошибку или пустой результат — НЕ зацикливайся: зафиксируй наблюдение и иди дальше. Цель — пройти все 7 пунктов, а не получить «успех» по каждому.
+5. В конце ОБЯЗАТЕЛЬНО вызови rlm_end для освобождения ресурсов.
+```
+
+## What it covers
+
+This prompt validates the v1.12.0 extension visibility surface end-to-end on a
+real CF/EDT main configuration with one or more nearby extensions. The agent
+must blind-discover the presence and content of the extensions through
+helpers — no out-of-band hints. The prompt exercises every documented v1.12.0
+contract change:
+
+| # | Verification | Helpers / behaviours |
+|---|---|---|
+| 1 | Stand-up reveals extensions | `rlm_start` → `extension_context.nearby_extensions`; `Sandbox(extension_paths=[...])` is wired by `server._rlm_start` only when `current.role == MAIN` |
+| 2 | Ext objects + modules surface in discovery | `find_by_type` and `search_objects("")` return entries with `path`/`file` prefixed by `../` (paths to ext config); `_extension_paths_set` is populated by `_load_extensions_into_index_state` |
+| 2 | Ext synonyms in alphabetical listing | `search_objects("")` merge+sort: ext rows alphabetically interleaved with main, not starved when main saturates `limit` (codex round 2/3) |
+| 2 | Ext module headers via reservation | `search_module_headers("")` returns ext headers thanks to `_reserve_merge_ext_into_main` (codex round 5) |
+| 3 | Overrides table populated | `get_overrides()` returns rows for nearby ext; `extract_procedures(path)` enriches matching methods with `overridden_by`; `read_procedure(path, name, include_overrides=True)` appends `=== Перехвачен ... ===` sections |
+| 4 | Multi-line signatures | `_merge_proc_continuations` collapses split `Процедура X(a,\n b,\n c)` headers into a single logical line for `BSL_PATTERNS["procedure_def"]`; `extract_procedures` reports `line` on the `Процедура`/`Функция` row and `end_line` on `КонецПроцедуры`/`КонецФункции`; `read_procedure` returns the whole body including the full signature |
+| 4 | Live-fill for indexed paths | Even when the on-disk index missed a multi-line method, `extract_procedures` opportunistically appends it via `_parse_procedures(path)` and applies the same `overrides_map` (round 4 of plan) |
+| 5 | Synonym-only ranking | `find_attributes(name=...)` with `_rank_merge_ext_into_main` over `("attr_name", "attr_synonym")` — ext rows matching by Russian synonym claim rank 0/1 even when main saturates `limit` (codex round 6); `search(query, scope="attributes")` carries `source_file` so `path` is non-empty |
+| 5 | Predefined live-fallback | `find_predefined(name=...)` analogous via `("item_name", "item_synonym")`; `search(query, scope="predefined")` `path` non-empty |
+| 6 | Sandbox contract on `../` paths | `_ext_resolve_safe` accepts paths under any extension root for BSL helpers; generic `_resolve_safe` in `helpers.py` still raises `PermissionError` — the docstring of `read_file` is enforced |
+
+The prompt indirectly tests: `_iter_metadata_xml_files` (shared layout-discovery
+between indexer and live extension pass), `_extension_metadata_xml` (XML-only
+object locators incl. ones without `<Synonym>`), the rank-merge / reserve-merge
+helpers, the `_ext_read_file` propagation across `find_callers_context` /
+`find_register_writers` / `analyze_document_flow` / `find_custom_modifications`
+/ `extract_queries` / `code_metrics` / `safe_grep`, and the full-scan (no
+early break) discipline in every `_live_search_*` so that exact-name hits late
+in scan order are not lost before rank-merge.
+
+## Recommended settings
+
+- **effort**: `high` — 7 verification points need 20–30 batched `rlm_execute` calls.
+- **max_output_chars**: `30000` — overrides dump and module-header sample can be verbose.
+- **execution_timeout_seconds**: `120` — first call may build the lazy extension pass over many ext BSL files.
+- **query**: `'расширения'` — auto-injects the `расширения` business recipe into the strategy.
+- **Index**: v12 рекомендуется (быстрее `search_*`), но не обязателен — без индекса работают live-fallbacks.
+
+## Что проверяется на стороне агента
+
+Хорошая прохождение прохождения этого промпта означает, что агент, видя
+конфигурацию с соседними расширениями впервые, без подсказок:
+
+- сам обнаружил, что extensions есть (через `extension_context` в `rlm_start`);
+- увидел добавленные ими объекты в `find_by_type` / `search_objects("")` /
+  `search_module_headers("")` — и не отбросил `../`-пути как «битые»;
+- получил список перехватов из `get_overrides()` и смог развернуть один из
+  них через `read_procedure(include_overrides=True)`;
+- проверил многострочные процедуры и пришёл к корректным `line`/`end_line`;
+- нашёл реквизит расширения по русскому синониму через
+  `find_attributes(name=...)` и не получил пустой `path` в
+  `search(..., scope='attributes')`;
+- зафиксировал, что `read_file('../...')` падает с PermissionError, а
+  `read_procedure('../...')` / `parse_object_xml('../...')` работают —
+  и объяснил наблюдаемую разницу.
+
+## Expected pitfalls
+
+- Если у конфигурации нет соседних расширений — большинство пунктов
+  отдадут «пусто/нет». Это не ошибка промпта, а валидное наблюдение.
+  Подходящие фикстуры — main-конфа, у которой в `../<sibling>/` лежит
+  отдельный расширительный root с собственным `Configuration.xml`
+  (`<ObjectBelonging>Adopted</ObjectBelonging>`).
+- Без FTS5 в индексе `search_methods` отдаст `[]` — агент должен
+  опереться на `extract_procedures` после `find_by_type` для пункта 4.
+- Многострочная процедура с НЕзакрытой `)` в сигнатуре (битый/обрезанный
+  файл) не должна вешать парсер — hard-cap 20 строк / 2000 символов
+  внутри `_merge_proc_continuations` отрезает её и идёт дальше.
+

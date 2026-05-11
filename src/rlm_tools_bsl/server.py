@@ -492,6 +492,9 @@ def _rlm_start(
         _callers_authoritative = idx_status == IndexStatus.FRESH and idx_reader is not None and idx_reader.has_calls
 
         t_step = time.monotonic()
+        ext_paths_for_sandbox = (
+            [e.path for e in ext_context.nearby_extensions] if ext_context.current.role == ConfigRole.MAIN else []
+        )
         sandbox = Sandbox(
             base_path=resolved,
             max_output_chars=max_output_chars,
@@ -499,6 +502,7 @@ def _rlm_start(
             format_info=format_info,
             idx_reader=idx_reader,
             idx_zero_callers_authoritative=_callers_authoritative,
+            extension_paths=ext_paths_for_sandbox,
         )
         has_llm_tools = _install_session_llm_tools(session, sandbox)
         t_sandbox = time.monotonic() - t_step

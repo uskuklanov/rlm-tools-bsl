@@ -1,4 +1,5 @@
 from __future__ import annotations
+import collections
 import concurrent.futures
 import json
 import logging
@@ -6,10 +7,12 @@ import os
 import re
 import threading
 import time as _time_mod
+from dataclasses import replace
 from pathlib import Path
 from rlm_tools_bsl.format_detector import parse_bsl_path, BslFileInfo, FormatInfo
-from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS
+from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
 from rlm_tools_bsl.cache import load_index, save_index
+from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
 
 logger = logging.getLogger(__name__)
 from rlm_tools_bsl.bsl_xml_parsers import (
@@ -129,15 +132,211 @@ def make_bsl_helpers(
     format_info: FormatInfo | None = None,
     idx_reader=None,  # optional IndexReader for SQLite index acceleration
     idx_zero_callers_authoritative: bool = False,
+    extension_paths: list[str] | None = None,
 ) -> dict:
     """Creates BSL helper functions for sandbox namespace.
     Internal _bsl_index is built lazily on first find_module() call.
-    If idx_reader is provided, helpers use it as a fast path with fallback."""
+    If idx_reader is provided, helpers use it as a fast path with fallback.
+
+    ``extension_paths`` — absolute paths to nearby extension roots (only when
+    sandbox base is a MAIN config). When non-empty, the lazy index pass also
+    scans BSL + metadata XML/MDO under each extension root so that find_module,
+    find_attributes, parse_object_xml, find_predefined and search() see the
+    extension objects. The generic sandbox resolver (helpers.make_helpers) is
+    NOT touched — extension files stay invisible to read_file/grep/glob_files.
+    """
+
+    _base_path_resolved = Path(base_path).resolve()
+    _ext_paths_raw: list[str] = list(extension_paths or [])
+    _ext_roots_resolved: list[Path] = []
+    for ext in _ext_paths_raw:
+        try:
+            _ext_roots_resolved.append(Path(ext).resolve())
+        except OSError:
+            continue
+
+    # Caches/structures filled during _ensure_index extension pass.
+    _extension_paths_set: set[str] = set()
+    _extension_root_for: dict[str, str] = {}
+    _extension_metadata_xml: list[tuple[str, str, str]] = []  # (category, object_name, rel_xml_to_base)
+    _extension_synonyms: list[tuple[str, str, str, str]] = []  # (obj_name, category, prefixed_synonym, rel_to_base)
+
+    # Small OrderedDict cache for files outside the sandbox base (extension reads).
+    _ext_file_cache: "collections.OrderedDict[str, str]" = collections.OrderedDict()
+    _ext_file_cache_lock = threading.Lock()
+    _EXT_FILE_CACHE_MAX = 200
+
+    # Per-session parsed-attribute / parsed-predefined caches for extensions.
+    # Built lazily on first name-only find_attributes / find_predefined call —
+    # subsequent calls filter the cache in memory instead of re-parsing XML
+    # for every ext object. Critical for large extensions (~150+ objects) where
+    # parsing all metadata XMLs takes 5-15s on cold cache.
+    _ext_attrs_cache: dict[tuple[str, str], list[dict]] = {}
+    _ext_attrs_cache_built: list[bool] = [False]
+    _ext_attrs_cache_lock = threading.Lock()
+    _ext_predefined_cache: dict[tuple[str, str], list[dict]] = {}
+    _ext_predefined_cache_built: list[bool] = [False]
+    _ext_predefined_cache_lock = threading.Lock()
+
+    def _ext_resolve_safe(path: str) -> Path:
+        """Multi-root path resolver: accept any path resolving under base OR any
+        configured extension root. Raises PermissionError when outside all roots.
+
+        Generic sandbox-base-only invariants in ``read_file``/``grep``/``glob_files``
+        are NOT affected — this resolver is internal to BSL-helpers that already
+        receive `../`-relative paths from ``_index_state``.
+        """
+        candidate = (_base_path_resolved / path).resolve()
+        # Cheap path: inside base.
+        try:
+            candidate.relative_to(_base_path_resolved)
+            return candidate
+        except ValueError:
+            pass
+        # Try each extension root.
+        for ext_root in _ext_roots_resolved:
+            try:
+                candidate.relative_to(ext_root)
+                return candidate
+            except ValueError:
+                continue
+        raise PermissionError(f"Access denied: path '{path}' escapes sandbox and extension roots")
+
+    def _ext_read_file(path: str) -> str:
+        """Reader that delegates to the sandbox cache for base files and reads
+        extension-root files directly (with a small OrderedDict cache).
+        """
+        resolved = _ext_resolve_safe(path)
+        try:
+            resolved.relative_to(_base_path_resolved)
+            in_base = True
+        except ValueError:
+            in_base = False
+
+        if in_base:
+            # Delegate to the sandbox cache via the wrapped read_file_fn.
+            return read_file_fn(path)
+
+        key = str(resolved)
+        with _ext_file_cache_lock:
+            if key in _ext_file_cache:
+                _ext_file_cache.move_to_end(key)
+                return _ext_file_cache[key]
+        content = resolved.read_text(encoding="utf-8-sig", errors="replace")
+        with _ext_file_cache_lock:
+            _ext_file_cache[key] = content
+            if len(_ext_file_cache) > _EXT_FILE_CACHE_MAX:
+                _ext_file_cache.popitem(last=False)
+        return content
 
     # Mutable closure state for lazy index
     _index_state: list = []  # list of tuples (relative_path, BslFileInfo)
     _index_built: list[bool] = [False]
     _index_lock = threading.Lock()
+
+    def _load_main_into_index_state() -> None:
+        """Load main config modules into _index_state (idx_reader or glob+cache)."""
+        # Fast path: load from SQLite index (instant, <1s)
+        if idx_reader is not None:
+            try:
+                rows = idx_reader.get_all_modules()
+                for r in rows:
+                    info = BslFileInfo(
+                        relative_path=r["rel_path"],
+                        category=r["category"],
+                        object_name=r["object_name"],
+                        module_type=r["module_type"],
+                        form_name=r["form_name"],
+                        command_name=None,
+                        is_form_module=bool(r["form_name"]),
+                    )
+                    _index_state.append((r["rel_path"], info))
+                return
+            except Exception:
+                pass  # fallback to glob
+
+        # Fallback: glob + disk cache
+        all_bsl = glob_files_fn("**/*.bsl")
+        bsl_count = len(all_bsl)
+
+        cached = load_index(base_path, bsl_count, bsl_paths=all_bsl)
+        if cached is not None:
+            _index_state.extend(cached)
+        else:
+            for file_path in all_bsl:
+                info = parse_bsl_path(file_path, base_path)
+                _index_state.append((info.relative_path, info))
+            save_index(base_path, bsl_count, _index_state)
+
+    def _load_extensions_into_index_state() -> None:
+        """Scan each extension root for BSL + metadata XML/MDO and side-load
+        into _index_state with paths relative to the main base.
+        """
+        if not _ext_roots_resolved:
+            return
+
+        # Lazy import — avoids a cycle since bsl_index imports from bsl_knowledge.
+        try:
+            from rlm_tools_bsl.bsl_index import _collect_object_synonyms, _iter_metadata_xml_files
+        except Exception:  # pragma: no cover - defensive
+            _iter_metadata_xml_files = None  # type: ignore[assignment]
+            _collect_object_synonyms = None  # type: ignore[assignment]
+
+        total_ext_files = 0
+        for ext_root in _ext_roots_resolved:
+            if not ext_root.is_dir():
+                continue
+            ext_root_str = str(ext_root)
+
+            # --- BSL pass ---
+            for dirpath, dirnames, filenames in os.walk(ext_root):
+                dirnames[:] = [d for d in dirnames if d not in _GENERIC_SKIP_DIRS and not d.startswith(".")]
+                for fname in filenames:
+                    if not fname.lower().endswith(".bsl"):
+                        continue
+                    full = Path(dirpath) / fname
+                    try:
+                        rel = os.path.relpath(str(full), base_path).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    info_ext = parse_bsl_path(str(full), ext_root_str)
+                    info_bound = replace(info_ext, relative_path=rel)
+                    _index_state.append((rel, info_bound))
+                    _extension_paths_set.add(rel)
+                    _extension_root_for[rel] = ext_root_str
+                    total_ext_files += 1
+
+            # --- Metadata-XML pass: locators for all ext objects (incl. XML-only) ---
+            if _iter_metadata_xml_files is not None:
+                try:
+                    locators = _iter_metadata_xml_files(ext_root_str)
+                except Exception:
+                    locators = []
+                for cat, obj_name, rel_to_ext in locators:
+                    try:
+                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), base_path).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    _extension_metadata_xml.append((cat, obj_name, rel_to_base))
+
+            # --- Synonyms pass: parity with index for search_objects ---
+            if _collect_object_synonyms is not None:
+                try:
+                    syn_rows = _collect_object_synonyms(ext_root_str)
+                except Exception:
+                    syn_rows = []
+                for obj_name, cat, prefixed_synonym, rel_to_ext in syn_rows:
+                    try:
+                        rel_to_base = os.path.relpath(str(ext_root / rel_to_ext), base_path).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    _extension_synonyms.append((obj_name, cat, prefixed_synonym, rel_to_base))
+
+        if total_ext_files > 5000:
+            logger.warning(
+                "extension pass scanned %d BSL files — consider RLM_EXTENSION_MAX_FILES env or check ext layout",
+                total_ext_files,
+            )
 
     def _ensure_index() -> None:
         if _index_built[0]:
@@ -145,40 +344,8 @@ def make_bsl_helpers(
         with _index_lock:
             if _index_built[0]:
                 return
-
-            # Fast path: load from SQLite index (instant, <1s)
-            if idx_reader is not None:
-                try:
-                    rows = idx_reader.get_all_modules()
-                    for r in rows:
-                        info = BslFileInfo(
-                            relative_path=r["rel_path"],
-                            category=r["category"],
-                            object_name=r["object_name"],
-                            module_type=r["module_type"],
-                            form_name=r["form_name"],
-                            command_name=None,
-                            is_form_module=bool(r["form_name"]),
-                        )
-                        _index_state.append((r["rel_path"], info))
-                    _index_built[0] = True
-                    return
-                except Exception:
-                    pass  # fallback to glob
-
-            # Fallback: glob + disk cache
-            all_bsl = glob_files_fn("**/*.bsl")
-            bsl_count = len(all_bsl)
-
-            cached = load_index(base_path, bsl_count, bsl_paths=all_bsl)
-            if cached is not None:
-                _index_state.extend(cached)
-            else:
-                for file_path in all_bsl:
-                    info = parse_bsl_path(file_path, base_path)
-                    _index_state.append((info.relative_path, info))
-                save_index(base_path, bsl_count, _index_state)
-
+            _load_main_into_index_state()
+            _load_extensions_into_index_state()
             _index_built[0] = True
 
     # --- Auto-detect custom prefixes from object names ---
@@ -362,83 +529,149 @@ def make_bsl_helpers(
     _prefilter_lazy = LazyDict()
 
     def _parse_procedures(path: str) -> list[dict]:
-        """Parse BSL file — internal, result gets cached by LazyDict."""
-        content = read_file_fn(path)
+        """Parse BSL file — internal, result gets cached by LazyDict.
+
+        Handles multi-line procedure signatures (``Процедура X(a,\n  b)``) by
+        merging continuation lines before matching ``BSL_PATTERNS['procedure_def']``.
+        ``end_line`` is taken from the original line list.
+        """
+        content = _ext_read_file(path)
         lines = content.splitlines()
+        merged_lines, line_map = _merge_proc_continuations(lines)
+        total_orig = len(lines)
+        total_merged = len(merged_lines)
 
         proc_def_re = re.compile(BSL_PATTERNS["procedure_def"], re.IGNORECASE)
         proc_end_re = re.compile(BSL_PATTERNS["procedure_end"], re.IGNORECASE)
 
-        procedures = []
-        current: dict | None = None
+        procedures: list[dict] = []
+        m_idx = 0
+        while m_idx < total_merged:
+            merged = merged_lines[m_idx]
+            m = proc_def_re.search(merged)
+            if not m:
+                m_idx += 1
+                continue
 
-        for line_idx, line in enumerate(lines):
-            line_number = line_idx + 1  # 1-based
+            proc_type = m.group(1)
+            proc_name = m.group(2)
+            params = m.group(3).strip() if m.group(3) else ""
+            is_export = m.group(4) is not None and m.group(4).strip() != ""
+            line_number = line_map[m_idx]  # 1-based
 
-            if current is None:
-                m = proc_def_re.search(line)
-                if m:
-                    proc_type = m.group(1)
-                    proc_name = m.group(2)
-                    params = m.group(3).strip() if m.group(3) else ""
-                    is_export = m.group(4) is not None and m.group(4).strip() != ""
-                    current = {
+            next_start = line_map[m_idx + 1] if m_idx + 1 < total_merged else total_orig + 1
+            scan_from = next_start - 1
+
+            end_line: int | None = None
+            for orig_idx in range(scan_from, total_orig):
+                if proc_end_re.search(lines[orig_idx]):
+                    end_line = orig_idx + 1
+                    break
+
+            if end_line is None:
+                procedures.append(
+                    {
                         "name": proc_name,
                         "type": proc_type,
                         "line": line_number,
                         "is_export": is_export,
-                        "end_line": None,
+                        "end_line": total_orig,
                         "params": params,
                     }
-            else:
-                m_end = proc_end_re.search(line)
-                if m_end:
-                    current["end_line"] = line_number
-                    procedures.append(current)
-                    current = None
+                )
+                break
 
-        # Handle unclosed procedure at EOF
-        if current is not None:
-            current["end_line"] = len(lines)
-            procedures.append(current)
+            procedures.append(
+                {
+                    "name": proc_name,
+                    "type": proc_type,
+                    "line": line_number,
+                    "is_export": is_export,
+                    "end_line": end_line,
+                    "params": params,
+                }
+            )
+
+            new_m = m_idx + 1
+            while new_m < total_merged and line_map[new_m] <= end_line:
+                new_m += 1
+            m_idx = new_m
 
         return procedures
+
+    def _attach_overrides(result: list[dict], overrides_map: dict | None) -> None:
+        """Mutate ``result`` in place: attach ``overridden_by`` from a
+        case-insensitive (Cyrillic) ``{name -> [override_dicts]}`` map.
+        """
+        if not overrides_map:
+            return
+        ov_lower = {k.lower(): v for k, v in overrides_map.items()}
+        for proc in result:
+            method_overrides = ov_lower.get(proc["name"].lower())
+            if method_overrides:
+                proc["overridden_by"] = [
+                    {
+                        "annotation": ov.get("annotation", ""),
+                        "extension_name": ov.get("extension_name", ""),
+                        "extension_method": ov.get("extension_method", ""),
+                        "extension_root": ov.get("extension_root", ""),
+                        "ext_module_path": ov.get("ext_module_path", ""),
+                        "ext_line": ov.get("ext_line"),
+                    }
+                    for ov in method_overrides
+                ]
 
     def extract_procedures(path: str) -> list[dict]:
         """Parse BSL file and return list of procedures/functions with metadata.
         Results are memoized per file path within the session.
         Uses SQLite index when available (instant), falls back to regex parsing.
 
+        For indexed paths, also performs an opportunistic live-fill: if the
+        live regex parser finds a procedure NOT present in the index (typically
+        a multi-line signature that older indexes missed), it is appended to
+        the result with the same shape, including ``overridden_by`` enrichment
+        from ``idx_reader.get_overrides_for_path``. This makes the helper
+        self-healing — multi-line procedures appear immediately, without
+        requiring ``rlm-bsl-index index update``.
+
         Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}."""
 
         def _extract_with_index():
+            overrides_map: dict | None = None
             if idx_reader is not None:
-                result = idx_reader.get_methods_by_path(path)
-                if result is not None:
-                    # Enrich with override data from index
-                    try:
-                        overrides_map = idx_reader.get_overrides_for_path(path)
-                        if overrides_map:
-                            # Build case-insensitive lookup (Cyrillic)
-                            ov_lower = {k.lower(): v for k, v in overrides_map.items()}
-                            for proc in result:
-                                method_overrides = ov_lower.get(proc["name"].lower())
-                                if method_overrides:
-                                    proc["overridden_by"] = [
-                                        {
-                                            "annotation": ov.get("annotation", ""),
-                                            "extension_name": ov.get("extension_name", ""),
-                                            "extension_method": ov.get("extension_method", ""),
-                                            "extension_root": ov.get("extension_root", ""),
-                                            "ext_module_path": ov.get("ext_module_path", ""),
-                                            "ext_line": ov.get("ext_line"),
-                                        }
-                                        for ov in method_overrides
-                                    ]
-                    except Exception:
-                        pass  # opportunistic enrichment
-                    return result
-            return _parse_procedures(path)
+                try:
+                    overrides_map = idx_reader.get_overrides_for_path(path)
+                except Exception:
+                    overrides_map = None
+
+            result: list[dict] | None = None
+            if idx_reader is not None:
+                idx_result = idx_reader.get_methods_by_path(path)
+                if idx_result is not None:
+                    result = idx_result
+                    _attach_overrides(result, overrides_map)
+
+            if result is None:
+                # No index — fall through to live parsing.
+                live = _parse_procedures(path)
+                _attach_overrides(live, overrides_map)
+                return live
+
+            # Opportunistic live-fill: add procedures missing from the index.
+            try:
+                live = _parse_procedures(path)
+            except Exception:
+                return result
+            existing_names = {p["name"].lower() for p in result}
+            additions: list[dict] = []
+            for proc in live:
+                if proc["name"].lower() in existing_names:
+                    continue
+                additions.append(proc)
+            if additions:
+                _attach_overrides(additions, overrides_map)
+                result.extend(additions)
+            return result
 
         return _proc_lazy.get_or_set(path, _extract_with_index)
 
@@ -458,7 +691,22 @@ def make_bsl_helpers(
         else:
             paths = [relative_path for relative_path, _ in _index_state[:max_files]]
 
+        compiled = re.compile(pattern)
+
         def _grep_one(path: str) -> list[dict]:
+            # Base paths: delegate to generic grep (cached, sandbox-checked).
+            # Extension paths: read via _ext_read_file (sandbox base-only grep
+            # would raise PermissionError) and apply the same regex contract.
+            if path in _extension_paths_set:
+                try:
+                    content = _ext_read_file(path)
+                except Exception:
+                    return []
+                out: list[dict] = []
+                for i, line in enumerate(content.splitlines(), 1):
+                    if compiled.search(line):
+                        out.append({"file": path, "line": i, "text": line.strip()})
+                return out
             try:
                 return grep_fn(pattern, path) or []
             except Exception:
@@ -493,7 +741,7 @@ def make_bsl_helpers(
         if target is None:
             return None
 
-        content = read_file_fn(path)
+        content = _ext_read_file(path)
         lines = content.splitlines()
 
         start = target["line"] - 1  # convert to 0-based
@@ -750,7 +998,7 @@ def make_bsl_helpers(
             filtered_files: list[tuple[str, BslFileInfo]] = []
             for rel, info in candidate_files:
                 try:
-                    content = read_file_fn(rel)
+                    content = _ext_read_file(rel)
                     if proc_lower in content.lower():
                         filtered_files.append((rel, info))
                 except Exception:
@@ -772,7 +1020,7 @@ def make_bsl_helpers(
 
         for rel, info in page_files:
             try:
-                content = read_file_fn(rel)
+                content = _ext_read_file(rel)
                 lines = content.splitlines()
                 procs = extract_procedures(rel)
 
@@ -954,6 +1202,67 @@ def make_bsl_helpers(
         "constants": "Constant",
     }
 
+    def _xml_candidates_named(object_name: str) -> list[str]:
+        """Fast-path XML/MDO candidates: structural patterns + ext-metadata
+        entries. No filesystem globs — keeps bulk ext scans (e.g.
+        ``_live_attributes_in_extensions`` on 100+ ext objects) cheap.
+        """
+        parts = object_name.split("/")
+        category = parts[0].lower() if parts else ""
+        xml_name = _CATEGORY_XML_NAMES.get(category)
+        last_segment = parts[-1] if parts else ""
+
+        out: list[str] = []
+        if last_segment:
+            out.append(f"{object_name}/{last_segment}.mdo")
+        if xml_name:
+            out.append(f"{object_name}/Ext/{xml_name}.xml")
+        out.append(f"{object_name}.xml")
+        out.append(f"{object_name}.mdo")
+
+        # Extension candidates from the metadata-XML pass — picks up XML-only
+        # objects (Subsystems, EventSubscriptions) without a .bsl module.
+        if _extension_metadata_xml and category and last_segment:
+            target_cat = category.lower()
+            target_name = last_segment.lower()
+            for cat, obj_name, rel in _extension_metadata_xml:
+                if cat.lower() == target_cat and obj_name.lower() == target_name:
+                    out.append(rel)
+        return out
+
+    def _xml_candidates_glob_fallback(object_name: str) -> list[str]:
+        """Slow-path glob fallback for non-standard layouts.
+
+        Invoked ONLY when every named candidate from ``_xml_candidates_named``
+        missed. Prior to this split the glob was unconditional, which on
+        configs with many extensions (e.g. 197 ext objects on a 24K-BSL ERP)
+        triggered 2× ``glob_files_fn`` calls per ext object inside
+        ``_live_attributes_in_extensions`` — a runaway FS scan that could
+        stall the session for tens of minutes. Now the glob fires only when
+        a non-standard layout actually requires it.
+        """
+        out: list[str] = []
+        try:
+            ext_match = glob_files_fn(f"{object_name}/Ext/*.xml")
+        except Exception:
+            ext_match = []
+        if ext_match:
+            out.append(ext_match[0])
+        try:
+            mdo_match = glob_files_fn(f"{object_name}/*.mdo")
+        except Exception:
+            mdo_match = []
+        if mdo_match:
+            out.append(mdo_match[0])
+        return out
+
+    def _xml_candidates(object_name: str) -> list[str]:
+        """Backwards-compatible wrapper combining named + glob fallback.
+        Kept for any external callers; ``_resolve_object_xml`` now uses the
+        two-tier helpers directly to avoid eager glob.
+        """
+        return _xml_candidates_named(object_name) + _xml_candidates_glob_fallback(object_name)
+
     def _resolve_object_xml(path: str) -> str:
         """Resolve path to the actual XML file.
 
@@ -966,6 +1275,8 @@ def make_bsl_helpers(
 
         Raises FileNotFoundError with an explicit hint when nothing resolves.
         """
+        _ensure_index()  # ensure _extension_metadata_xml is populated
+
         normalized = path.replace("\\", "/")
         path_lower = normalized.lower()
         ends_with_xml = path_lower.endswith(".xml")
@@ -973,7 +1284,7 @@ def make_bsl_helpers(
 
         if ends_with_xml or ends_with_mdo:
             try:
-                if resolve_safe(normalized).exists():
+                if _ext_resolve_safe(normalized).exists():
                     return normalized
             except Exception:
                 pass
@@ -986,40 +1297,44 @@ def make_bsl_helpers(
             raise FileNotFoundError(f"Path not found: {path!r}")
 
         parts = base.split("/")
-        category = parts[0].lower() if parts else ""
-        xml_name = _CATEGORY_XML_NAMES.get(category)
+        xml_name = _CATEGORY_XML_NAMES.get(parts[0].lower() if parts else "")
         last_segment = parts[-1] if parts else ""
 
-        candidates: list[str] = []
-        # EDT format: Documents/Name/Name.mdo
-        if last_segment:
-            candidates.append(f"{base}/{last_segment}.mdo")
-        # CF format: Documents/Name/Ext/<Type>.xml
-        if xml_name:
-            candidates.append(f"{base}/Ext/{xml_name}.xml")
-        # Generic fallbacks for degenerate paths
-        candidates.append(f"{base}.xml")
-        candidates.append(f"{base}.mdo")
-        # Glob fallbacks: any XML in Ext/ (CF) or any .mdo at base (EDT)
-        try:
-            candidates_glob = glob_files_fn(f"{base}/Ext/*.xml")
-        except Exception:
-            candidates_glob = []
-        if candidates_glob:
-            candidates.extend(candidates_glob[:1])
-        try:
-            candidates_mdo = glob_files_fn(f"{base}/*.mdo")
-        except Exception:
-            candidates_mdo = []
-        if candidates_mdo:
-            candidates.extend(candidates_mdo[:1])
+        any_resolvable = False
 
-        for candidate in candidates:
+        # Try named candidates first (no glob — fast path).
+        for candidate in _xml_candidates_named(base):
             try:
-                if resolve_safe(candidate).exists():
-                    return candidate
+                resolved = _ext_resolve_safe(candidate)
+            except PermissionError:
+                continue
             except Exception:
                 continue
+            any_resolvable = True
+            try:
+                if resolved.exists():
+                    return candidate
+            except OSError:
+                continue
+
+        # Slow path: glob fallback only when nothing named resolved. Critical
+        # for bulk ext scans — see _xml_candidates_glob_fallback docstring.
+        for candidate in _xml_candidates_glob_fallback(base):
+            try:
+                resolved = _ext_resolve_safe(candidate)
+            except PermissionError:
+                continue
+            except Exception:
+                continue
+            any_resolvable = True
+            try:
+                if resolved.exists():
+                    return candidate
+            except OSError:
+                continue
+
+        if not any_resolvable:
+            raise PermissionError(f"Access denied: path {path!r} escapes sandbox and extension roots")
 
         if ends_with_xml or ends_with_mdo:
             raise FileNotFoundError(
@@ -1045,7 +1360,7 @@ def make_bsl_helpers(
         Returns: dict with keys like name, synonym, attributes, tabular_sections,
         dimensions, resources (depends on metadata type)."""
         resolved = _resolve_object_xml(path)
-        content = read_file_fn(resolved)
+        content = _ext_read_file(resolved)
         return parse_metadata_xml(content)
 
     # ── Composite helpers (wrappers over existing functions) ────────
@@ -1175,7 +1490,7 @@ def make_bsl_helpers(
 
             custom_regions: list[dict] = []
             try:
-                content = read_file_fn(path)
+                content = _ext_read_file(path)
                 for i, line in enumerate(content.splitlines(), 1):
                     stripped = line.strip()
                     if stripped.startswith("#") and "Область" in stripped:
@@ -2314,7 +2629,7 @@ def make_bsl_helpers(
             path = mod["path"]
             modules_scanned.append(path)
             try:
-                content = read_file_fn(path)
+                content = _ext_read_file(path)
             except Exception:
                 continue
             for i, line in enumerate(content.splitlines(), 1):
@@ -2345,7 +2660,7 @@ def make_bsl_helpers(
         for mod in mgr_modules:
             mgr_path = mod["path"]
             try:
-                mgr_content = read_file_fn(mgr_path)
+                mgr_content = _ext_read_file(mgr_path)
             except Exception:
                 continue
 
@@ -2444,7 +2759,7 @@ def make_bsl_helpers(
         writers: list[dict] = []
         for rel, info in matched:
             try:
-                content = read_file_fn(rel)
+                content = _ext_read_file(rel)
             except Exception:
                 continue
             lines: list[int] = []
@@ -2940,6 +3255,246 @@ def make_bsl_helpers(
 
         return {"error": f"Перечисление '{enum_name}' не найдено"}
 
+    # Predefined items only exist for these categories (CF + EDT).
+    _PREDEFINED_CATS = frozenset(
+        ("Catalogs", "ChartsOfCharacteristicTypes", "ChartsOfAccounts", "ChartsOfCalculationTypes")
+    )
+
+    def _build_ext_attrs_cache() -> None:
+        """Parse all attribute-bearing ext objects once per session.
+
+        Builds ``_ext_attrs_cache`` keyed by ``(cat_lower, obj_lower)`` with
+        rows of the same shape ``find_attributes`` returns (with ``source_file``).
+        Subsequent ``find_attributes(name=…)`` calls then filter the cache
+        in-memory — no XML re-parsing per ext object. Critical for large
+        extensions (~150+ objects) where the cold scan takes 5-15s.
+        """
+        if _ext_attrs_cache_built[0]:
+            return
+        with _ext_attrs_cache_lock:
+            if _ext_attrs_cache_built[0]:
+                return
+            if not _extension_metadata_xml:
+                _ext_attrs_cache_built[0] = True
+                return
+
+            from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string as _nts
+
+            def _make_type(raw: str) -> list[str]:
+                try:
+                    return json.loads(_nts(raw))
+                except Exception:
+                    return []
+
+            seen: set[tuple[str, str]] = set()
+            for cat, obj_name, _rel in _extension_metadata_xml:
+                if cat.lower() not in _CATEGORY_XML_NAMES:
+                    continue
+                key = (cat.lower(), obj_name.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                object_path = f"{cat}/{obj_name}"
+                try:
+                    resolved = _resolve_object_xml(object_path)
+                    content = _ext_read_file(resolved)
+                    parsed = parse_metadata_xml(content)
+                except Exception:
+                    continue
+                if not parsed:
+                    continue
+
+                rows: list[dict] = []
+                for attr in parsed.get("attributes", []):
+                    rows.append(
+                        {
+                            "object_name": obj_name,
+                            "category": cat,
+                            "attr_name": attr.get("name", ""),
+                            "attr_synonym": attr.get("synonym", ""),
+                            "attr_type": _make_type(attr.get("type", "")),
+                            "attr_kind": "attribute",
+                            "ts_name": None,
+                            "source_file": resolved,
+                        }
+                    )
+                for dim in parsed.get("dimensions", []):
+                    rows.append(
+                        {
+                            "object_name": obj_name,
+                            "category": cat,
+                            "attr_name": dim.get("name", ""),
+                            "attr_synonym": dim.get("synonym", ""),
+                            "attr_type": _make_type(dim.get("type", "")),
+                            "attr_kind": "dimension",
+                            "ts_name": None,
+                            "source_file": resolved,
+                        }
+                    )
+                for res in parsed.get("resources", []):
+                    rows.append(
+                        {
+                            "object_name": obj_name,
+                            "category": cat,
+                            "attr_name": res.get("name", ""),
+                            "attr_synonym": res.get("synonym", ""),
+                            "attr_type": _make_type(res.get("type", "")),
+                            "attr_kind": "resource",
+                            "ts_name": None,
+                            "source_file": resolved,
+                        }
+                    )
+                for ts in parsed.get("tabular_sections", []):
+                    ts_name = ts.get("name", "")
+                    for ta in ts.get("attributes", []):
+                        rows.append(
+                            {
+                                "object_name": obj_name,
+                                "category": cat,
+                                "attr_name": ta.get("name", ""),
+                                "attr_synonym": ta.get("synonym", ""),
+                                "attr_type": _make_type(ta.get("type", "")),
+                                "attr_kind": "ts_attribute",
+                                "ts_name": ts_name,
+                                "source_file": resolved,
+                            }
+                        )
+
+                if rows:
+                    _ext_attrs_cache[key] = rows
+
+            _ext_attrs_cache_built[0] = True
+
+    def _build_ext_predefined_cache() -> None:
+        """Parse predefined items from ext objects once per session — mirror
+        of ``_build_ext_attrs_cache`` for predefined data.
+        """
+        if _ext_predefined_cache_built[0]:
+            return
+        with _ext_predefined_cache_lock:
+            if _ext_predefined_cache_built[0]:
+                return
+            if not _extension_metadata_xml:
+                _ext_predefined_cache_built[0] = True
+                return
+
+            from rlm_tools_bsl.bsl_xml_parsers import parse_predefined_items as _ppi
+
+            seen: set[tuple[str, str]] = set()
+            for cat, obj_name, _rel in _extension_metadata_xml:
+                if cat not in _PREDEFINED_CATS:
+                    continue
+                key = (cat.lower(), obj_name.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                object_path = f"{cat}/{obj_name}"
+                # Use _predefined_candidates to find the predefined.xml/mdo path.
+                candidates = _predefined_candidates(object_path)
+                content: str | None = None
+                source_path: str | None = None
+                for p in candidates:
+                    try:
+                        if not _ext_resolve_safe(p).exists():
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        content = _ext_read_file(p)
+                        source_path = p
+                        break
+                    except Exception:
+                        continue
+                if not content:
+                    continue
+                items = _ppi(content)
+                if not items:
+                    continue
+
+                rows: list[dict] = []
+                for item in items:
+                    rows.append(
+                        {
+                            "object_name": obj_name,
+                            "category": cat,
+                            "item_name": item.get("name", ""),
+                            "item_synonym": item.get("synonym", ""),
+                            "types": item.get("types", []),
+                            "item_code": item.get("code", ""),
+                            "is_folder": item.get("is_folder", False),
+                            "source_file": source_path,
+                        }
+                    )
+                if rows:
+                    _ext_predefined_cache[key] = rows
+
+            _ext_predefined_cache_built[0] = True
+
+    def _live_attributes_in_extensions(name: str, category: str, kind: str, limit: int) -> list[dict]:
+        """Return ext-side attribute rows matching the name-only query.
+
+        Reads from the per-session ``_ext_attrs_cache`` (built lazily on first
+        call). Cold call parses every attribute-bearing ext object's XML once;
+        subsequent calls filter the cache in memory. ``limit`` is a soft hint —
+        full result returned, caller rank-merges and slices.
+        """
+        if not _extension_metadata_xml:
+            return []
+        _build_ext_attrs_cache()
+
+        name_lower = name.lower() if name else ""
+        category_lower = category.lower() if category else ""
+        kind_lower = kind.lower() if kind else ""
+        out: list[dict] = []
+        for (cat_lower, _obj_lower), rows in _ext_attrs_cache.items():
+            if category_lower and category_lower != cat_lower:
+                continue
+            for row in rows:
+                if kind_lower and kind_lower != row["attr_kind"]:
+                    continue
+                if name_lower:
+                    if name_lower not in row["attr_name"].lower() and name_lower not in row["attr_synonym"].lower():
+                        continue
+                out.append(row)
+        return out
+
+    def _live_predefined_in_extensions(name: str, limit: int) -> list[dict]:
+        """Return ext-side predefined items matching the name-only query.
+
+        Mirrors ``_live_attributes_in_extensions`` — reads from per-session
+        ``_ext_predefined_cache`` (built lazily on first call).
+        """
+        if not _extension_metadata_xml:
+            return []
+        _build_ext_predefined_cache()
+
+        name_lower = name.lower() if name else ""
+        out: list[dict] = []
+        for rows in _ext_predefined_cache.values():
+            for row in rows:
+                if name_lower:
+                    if name_lower not in row["item_name"].lower() and name_lower not in row["item_synonym"].lower():
+                        continue
+                out.append(row)
+        return out
+
+    def _resolve_object_name_from_extension_metadata(object_name: str) -> tuple[str, str] | None:
+        """For bare ``object_name`` (no category prefix, not present as a .bsl
+        module), look up an XML-only extension object via
+        ``_extension_metadata_xml``. Returns ``(category, "Category/Name")``
+        using the CANONICAL ``object_name`` from the metadata entry — so that
+        case-mismatch between the user argument and ext-metadata still produces
+        a path that matches ``_xml_candidates`` later. Returns ``None`` if no
+        ext object matches.
+        """
+        if not _extension_metadata_xml or not object_name:
+            return None
+        target = object_name.lower()
+        for cat, obj_name, _rel in _extension_metadata_xml:
+            if obj_name.lower() == target:
+                return cat, f"{cat}/{obj_name}"
+        return None
+
     def find_attributes(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
     ) -> list[dict]:
@@ -2948,6 +3503,11 @@ def make_bsl_helpers(
             kind = kind.lower()
         if object_name:
             object_name = _strip_meta_prefix(object_name)
+
+        # Build extension state lazily when extensions are configured — the
+        # ext attribute/predefined live-fallbacks depend on _extension_metadata_xml.
+        if _ext_roots_resolved:
+            _ensure_index()
 
         has_path = object_name and "/" in object_name
 
@@ -2961,9 +3521,35 @@ def make_bsl_helpers(
                 limit=limit,
             )
             if results is not None:
-                if results:  # non-empty — authoritative
-                    return results
-                if not object_name:  # name-only search, [] is authoritative
+                if results:  # non-empty — authoritative for main config
+                    # Merge ext-side rows for name-only queries BEFORE truncation
+                    # (codex round 5): rank-merge by attr_name so ext exact hits
+                    # are not starved when main saturates `limit`.
+                    if not object_name and _extension_metadata_xml:
+                        ext_rows = _live_attributes_in_extensions(name, category, kind, limit)
+                        return _rank_merge_ext_into_main(
+                            results,
+                            ext_rows,
+                            name,
+                            name_keys=("attr_name", "attr_synonym"),
+                            dedup_keys=("category", "object_name", "attr_name", "attr_kind"),
+                            limit=limit,
+                        )
+                    return results[:limit]
+                if not object_name:
+                    # Name-only search: index returned []. Before declaring authoritative,
+                    # let extensions (which are NEVER in the main index) contribute.
+                    if _extension_metadata_xml:
+                        ext_rows = _live_attributes_in_extensions(name, category, kind, limit)
+                        if ext_rows:
+                            return _rank_merge_ext_into_main(
+                                [],
+                                ext_rows,
+                                name,
+                                name_keys=("attr_name", "attr_synonym"),
+                                dedup_keys=("category", "object_name", "attr_name", "attr_kind"),
+                                limit=limit,
+                            )
                     return results
                 # object_name given but empty result — try auto-resolve below
 
@@ -2977,13 +3563,20 @@ def make_bsl_helpers(
                     object_name = f"{cat}/{object_name}"
                     has_path = True
 
+        # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
+        if object_name and not has_path:
+            ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
+            if ext_resolved is not None:
+                object_name = ext_resolved[1]
+                has_path = True
+
         # Fallback: live XML parse via _resolve_object_xml (same as parse_object_xml)
         if has_path:
             from rlm_tools_bsl.bsl_xml_parsers import normalize_type_string as _nts
 
             try:
                 resolved = _resolve_object_xml(object_name)
-                content = read_file_fn(resolved)
+                content = _ext_read_file(resolved)
                 parsed = parse_metadata_xml(content)
             except Exception:
                 return []
@@ -3020,6 +3613,7 @@ def make_bsl_helpers(
                         "attr_type": _make_type(attr.get("type", "")),
                         "attr_kind": "attribute",
                         "ts_name": None,
+                        "source_file": resolved,
                     }
                 )
             for dim in parsed.get("dimensions", []):
@@ -3039,6 +3633,7 @@ def make_bsl_helpers(
                         "attr_type": _make_type(dim.get("type", "")),
                         "attr_kind": "dimension",
                         "ts_name": None,
+                        "source_file": resolved,
                     }
                 )
             for res in parsed.get("resources", []):
@@ -3058,6 +3653,7 @@ def make_bsl_helpers(
                         "attr_type": _make_type(res.get("type", "")),
                         "attr_kind": "resource",
                         "ts_name": None,
+                        "source_file": resolved,
                     }
                 )
             for ts in parsed.get("tabular_sections", []):
@@ -3078,30 +3674,111 @@ def make_bsl_helpers(
                             "attr_type": _make_type(ta.get("type", "")),
                             "attr_kind": "ts_attribute",
                             "ts_name": ts.get("name", ""),
+                            "source_file": resolved,
                         }
                     )
             return results[:limit]
 
+        # No idx_reader, no object_name → scan extension metadata as the only live source.
+        if _extension_metadata_xml and not object_name:
+            ext_rows = _live_attributes_in_extensions(name, category, kind, limit)
+            return _rank_merge_ext_into_main(
+                [],
+                ext_rows,
+                name,
+                name_keys=("attr_name", "attr_synonym"),
+                dedup_keys=("category", "object_name", "attr_name", "attr_kind"),
+                limit=limit,
+            )
         return []
+
+    def _predefined_candidates(object_name: str) -> list[str]:
+        """Predefined.xml/MDO path candidates for ``Category/Name``.
+
+        EDT keeps predefined items inside the object's ``.mdo`` file; CF uses a
+        separate ``Ext/Predefined.xml``. Extension layouts mirror these.
+        """
+        parts = object_name.split("/")
+        category = parts[0].lower() if parts else ""
+        obj_short = parts[-1] if parts else ""
+
+        candidates: list[str] = []
+        if obj_short:
+            candidates.append(f"{object_name}/Ext/Predefined.xml")
+            candidates.append(f"{object_name}/{obj_short}.mdo")
+
+        # Extension candidates from the metadata-XML pass.
+        if _extension_metadata_xml and category and obj_short:
+            target_cat = category.lower()
+            target_name = obj_short.lower()
+            for cat, ent_name, rel in _extension_metadata_xml:
+                if cat.lower() != target_cat or ent_name.lower() != target_name:
+                    continue
+                if rel.endswith(".mdo"):
+                    candidates.append(rel)
+                else:
+                    ext_obj_dir = os.path.dirname(rel).replace("\\", "/")
+                    if ext_obj_dir.endswith("/Ext"):
+                        ext_obj_dir = ext_obj_dir[: -len("/Ext")]
+                    if ext_obj_dir:
+                        candidates.append(f"{ext_obj_dir}/Ext/Predefined.xml")
+        return candidates
 
     def find_predefined(name: str = "", object_name: str = "", limit: int = 500) -> list[dict]:
         """Find predefined items of ChartsOfCharacteristicTypes, Catalogs, ChartsOfAccounts."""
         if object_name:
             object_name = _strip_meta_prefix(object_name)
+        if _ext_roots_resolved:
+            _ensure_index()
         has_path = object_name and "/" in object_name
 
         # Fast path: index (None = table missing, [] = authoritative for name-only)
         if idx_reader is not None:
             results = idx_reader.get_predefined_items(item_name=name, object_name=object_name, limit=limit)
             if results is not None:
-                if results:  # non-empty — authoritative
-                    return results
-                if not object_name:  # name-only search, [] is authoritative
+                if results:  # non-empty — authoritative for main config
+                    # Merge ext rows BEFORE truncation (codex round 5).
+                    if not object_name and _extension_metadata_xml:
+                        ext_rows = _live_predefined_in_extensions(name, limit)
+                        return _rank_merge_ext_into_main(
+                            results,
+                            ext_rows,
+                            name,
+                            name_keys=("item_name", "item_synonym"),
+                            dedup_keys=("category", "object_name", "item_name"),
+                            limit=limit,
+                        )
+                    return results[:limit]
+                if not object_name:
+                    # Name-only search: index returned []. Let extensions contribute.
+                    if _extension_metadata_xml:
+                        ext_rows = _live_predefined_in_extensions(name, limit)
+                        if ext_rows:
+                            return _rank_merge_ext_into_main(
+                                [],
+                                ext_rows,
+                                name,
+                                name_keys=("item_name", "item_synonym"),
+                                dedup_keys=("category", "object_name", "item_name"),
+                                limit=limit,
+                            )
                     return results
                 # object_name given but empty result — try auto-resolve below
 
-        # Index-authoritative for name-only search (no live XML scan across 6820+ files)
+        # Index-authoritative for name-only search (no live XML scan across 6820+ files);
+        # extensions are NEVER in the main index, so let them contribute live (v1.12.0).
         if not object_name:
+            if _extension_metadata_xml:
+                ext_rows = _live_predefined_in_extensions(name, limit)
+                if ext_rows:
+                    return _rank_merge_ext_into_main(
+                        [],
+                        ext_rows,
+                        name,
+                        name_keys=("item_name", "item_synonym"),
+                        dedup_keys=("category", "object_name", "item_name"),
+                        limit=limit,
+                    )
             return []
 
         # Auto-resolve category via find_module (same pattern as analyze_object)
@@ -3114,23 +3791,29 @@ def make_bsl_helpers(
                     object_name = f"{cat}/{object_name}"
                     has_path = True
 
+        # Auto-resolve via extension metadata for XML-only ext objects (no .bsl).
+        if not has_path:
+            ext_resolved = _resolve_object_name_from_extension_metadata(object_name)
+            if ext_resolved is not None:
+                object_name = ext_resolved[1]
+                has_path = True
+
         if not has_path:
             return []
 
         from rlm_tools_bsl.bsl_xml_parsers import parse_predefined_items as _ppi
 
         obj_short = object_name.split("/")[-1]
-        patterns = [
-            f"{object_name}/Ext/Predefined.xml",
-            f"{object_name}/{obj_short}.mdo",
-        ]
+        candidates = _predefined_candidates(object_name)
 
-        for p in patterns:
-            found = glob_files_fn(p)
-            if not found:
+        for p in candidates:
+            try:
+                if not _ext_resolve_safe(p).exists():
+                    continue
+            except Exception:
                 continue
             try:
-                content = read_file_fn(found[0])
+                content = _ext_read_file(p)
             except Exception:
                 continue
             items = _ppi(content)
@@ -3153,6 +3836,7 @@ def make_bsl_helpers(
                         "types": item.get("types", []),
                         "item_code": item.get("code", ""),
                         "is_folder": item.get("is_folder", False),
+                        "source_file": p,
                     }
                 )
             return results[:limit]
@@ -3302,6 +3986,246 @@ def make_bsl_helpers(
 
     # ── FTS search (requires SQLite index with FTS5) ────────────
 
+    def _iter_extension_bsl() -> list[tuple[str, BslFileInfo]]:
+        """Return only the extension-side rows from ``_index_state``."""
+        if not _extension_paths_set:
+            return []
+        return [(rel, info) for rel, info in _index_state if rel in _extension_paths_set]
+
+    def _rank_merge_ext_into_main(
+        main_rows: list[dict],
+        ext_rows: list[dict],
+        query: str,
+        name_keys: tuple[str, ...],
+        dedup_keys: tuple[str, ...],
+        limit: int,
+    ) -> list[dict]:
+        """Merge main+ext rows with 3-level rank applied to ext, dedup by
+        ``dedup_keys``, slice to ``limit``.
+
+        ``name_keys`` is a tuple of fields to rank against — the row's rank is
+        the BEST (lowest) rank found across all listed fields. This mirrors
+        ``IndexReader.get_object_attributes`` / ``get_predefined_items`` which
+        match against ``attr_name OR attr_synonym`` (resp. ``item_name OR
+        item_synonym``), so passing both keys lets a row matching by Russian
+        synonym ALSO claim rank 0/1 instead of being silently rank 2 and
+        sliced away by a saturated main result (codex round 6).
+
+        Strategy: ext rows with rank 0 (exact match on any key) or 1 (prefix
+        on any key) go BEFORE all main rows. Main rows keep their original
+        ordering (FTS or index-native). Ext rows with rank 2 (substring only)
+        go AFTER main rows.
+        """
+        if not ext_rows:
+            return list(main_rows)[:limit]
+        seen = {tuple((r.get(k) or "") for k in dedup_keys) for r in main_rows}
+        ext_dedup = [r for r in ext_rows if tuple((r.get(k) or "") for k in dedup_keys) not in seen]
+        if not ext_dedup:
+            return list(main_rows)[:limit]
+        q_lower = (query or "").lower()
+        if not q_lower:
+            return (list(main_rows) + ext_dedup)[:limit]
+
+        def _rank(row: dict) -> int:
+            best = 2
+            for key in name_keys:
+                n = (row.get(key) or "").lower()
+                if n == q_lower:
+                    return 0
+                if n.startswith(q_lower):
+                    if best > 1:
+                        best = 1
+            return best
+
+        primary_key = name_keys[0]
+        ext_top = sorted(
+            (r for r in ext_dedup if _rank(r) < 2),
+            key=lambda r: (_rank(r), (r.get(primary_key) or "").lower()),
+        )
+        ext_bottom = [r for r in ext_dedup if _rank(r) >= 2]
+        merged = ext_top + list(main_rows) + ext_bottom
+        return merged[:limit]
+
+    def _reserve_merge_ext_into_main(
+        main_rows: list[dict],
+        ext_rows: list[dict],
+        dedup_keys: tuple[str, ...],
+        limit: int,
+        quota_ratio: int = 5,
+    ) -> list[dict]:
+        """Merge for helpers without a meaningful name-based rank
+        (e.g. search_module_headers). Reserves up to
+        ``min(len(ext), max(1, limit // quota_ratio))`` slots for ext rows by
+        clipping the main tail, so a saturated main result still surfaces
+        extension hits.
+        """
+        if not ext_rows:
+            return list(main_rows)[:limit]
+        seen = {tuple((r.get(k) or "") for k in dedup_keys) for r in main_rows}
+        ext_dedup = [r for r in ext_rows if tuple((r.get(k) or "") for k in dedup_keys) not in seen]
+        if not ext_dedup:
+            return list(main_rows)[:limit]
+        quota = min(len(ext_dedup), max(1, limit // quota_ratio))
+        main_keep = max(0, limit - quota)
+        return (list(main_rows)[:main_keep] + ext_dedup[:quota])[:limit]
+
+    def _live_search_methods(query: str, limit: int) -> list[dict]:
+        """Substring search in extension .bsl procedures.
+
+        Result shape matches ``IndexReader.search_methods`` exactly, including
+        ``rank=None`` (FTS-bm25 cannot be reproduced live). Full scan with no
+        early break — the caller (``search_methods``) rank-merges and slices
+        last so a high-quality ext hit (exact name) is not lost when main FTS
+        already returned `limit` rows.
+        """
+        if not _extension_paths_set or not query:
+            return []
+        needle = query.lower()
+        out: list[dict] = []
+        for rel, info in _iter_extension_bsl():
+            try:
+                procs = _parse_procedures(rel)
+            except Exception:
+                continue
+            for proc in procs:
+                if needle not in proc["name"].lower():
+                    continue
+                out.append(
+                    {
+                        "name": proc["name"],
+                        "type": proc["type"],
+                        "is_export": proc["is_export"],
+                        "line": proc["line"],
+                        "end_line": proc["end_line"],
+                        "params": proc["params"],
+                        "module_path": rel,
+                        "object_name": info.object_name,
+                        "rank": None,
+                    }
+                )
+        return out
+
+    def _live_search_objects(query: str, limit: int) -> list[dict]:
+        """Substring search in extension object synonyms / object names.
+
+        Empty/whitespace ``query`` → alphabetical listing sorted by
+        ``(category, object_name)``, sliced to ``limit`` (mirrors
+        ``IndexReader.search_objects("")``).
+
+        Non-empty query → **full scan**, no early slice. Mirrors the indexer's
+        contract: ``IndexReader.search_objects`` explicitly does NOT apply a
+        SQL LIMIT for substring queries because Python-side 4-level ranking
+        needs all matches to guarantee an exact-name hit is never lost. The
+        caller (``search_objects``) re-ranks the merged list and slices last.
+        """
+        if not _extension_synonyms:
+            return []
+        _ensure_index()
+
+        if not query or not query.strip():
+            rows = [
+                {
+                    "object_name": obj_name,
+                    "category": cat,
+                    "synonym": prefixed_synonym,
+                    "file": rel,
+                }
+                for obj_name, cat, prefixed_synonym, rel in _extension_synonyms
+            ]
+            rows.sort(key=lambda r: (r["category"], r["object_name"]))
+            return rows[:limit]
+
+        needle = query.lower()
+        out: list[dict] = []
+        for obj_name, cat, prefixed_synonym, rel in _extension_synonyms:
+            if needle in prefixed_synonym.lower() or needle in obj_name.lower():
+                out.append(
+                    {
+                        "object_name": obj_name,
+                        "category": cat,
+                        "synonym": prefixed_synonym,
+                        "file": rel,
+                    }
+                )
+        return out
+
+    def _live_search_regions(query: str, limit: int) -> list[dict]:
+        """Substring search over #Область / #Region declarations in extension .bsl.
+
+        Full scan, no early break — caller rank-merges and slices last.
+        """
+        if not _extension_paths_set or not query:
+            return []
+        needle = query.lower()
+        region_start = re.compile(BSL_PATTERNS["region_start"], re.IGNORECASE)
+        region_end = re.compile(BSL_PATTERNS["region_end"], re.IGNORECASE)
+        out: list[dict] = []
+        for rel, info in _iter_extension_bsl():
+            try:
+                content = _ext_read_file(rel)
+            except Exception:
+                continue
+            lines = content.splitlines()
+            open_stack: list[tuple[str, int]] = []
+            for line_idx, line in enumerate(lines, 1):
+                m_start = region_start.search(line)
+                if m_start:
+                    open_stack.append((m_start.group(1), line_idx))
+                    continue
+                if region_end.search(line) and open_stack:
+                    name, start = open_stack.pop()
+                    if needle in name.lower():
+                        out.append(
+                            {
+                                "name": name,
+                                "line": start,
+                                "end_line": line_idx,
+                                "module_path": rel,
+                                "object_name": info.object_name,
+                                "category": info.category,
+                            }
+                        )
+            # Unclosed regions at EOF: skip — same behavior as indexer.
+        return out
+
+    def _live_search_module_headers(query: str, limit: int) -> list[dict]:
+        """Substring search over leading-comment blocks in extension .bsl.
+
+        Full scan, no early break — caller reserves a quota and slices last.
+        """
+        if not _extension_paths_set or not query:
+            return []
+        needle = query.lower()
+        out: list[dict] = []
+        for rel, info in _iter_extension_bsl():
+            try:
+                content = _ext_read_file(rel)
+            except Exception:
+                continue
+            lines = content.splitlines()[:30]
+            header_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("//"):
+                    header_lines.append(stripped[2:].strip())
+                elif stripped == "":
+                    if header_lines:
+                        continue
+                else:
+                    break
+            header_comment = "\n".join(header_lines).strip()
+            if not header_comment or needle not in header_comment.lower():
+                continue
+            out.append(
+                {
+                    "module_path": rel,
+                    "object_name": info.object_name,
+                    "category": info.category,
+                    "header_comment": header_comment,
+                }
+            )
+        return out
+
     def search_methods(query: str, limit: int = 30) -> list[dict]:
         """Full-text search for methods by name substring (FTS5 trigram).
         Requires a pre-built SQLite index with FTS enabled.
@@ -3313,9 +4237,21 @@ def make_bsl_helpers(
         Returns: list of dicts {name, type, is_export, line, end_line, params,
                  module_path, object_name, rank} ordered by relevance.
                  Empty list if index/FTS not available."""
+        result: list[dict] = []
         if idx_reader is not None and idx_reader.has_fts:
-            return idx_reader.search_methods(query, limit)
-        return []
+            result = list(idx_reader.search_methods(query, limit))
+        _ensure_index()
+        # Merge BEFORE truncation: even when main FTS fills `limit`, an ext
+        # method with exact-name match must be visible. Rank-merge with 3-level
+        # scheme on `name`: rank 0 (exact) and 1 (prefix) ext rows go BEFORE
+        # main; rank 2 (substring) ext rows go AFTER main, sliced last (codex
+        # round 5).
+        if _extension_paths_set and query:
+            ext_rows = _live_search_methods(query, limit)
+            result = _rank_merge_ext_into_main(
+                result, ext_rows, query, name_keys=("name",), dedup_keys=("module_path", "name"), limit=limit
+            )
+        return result[:limit]
 
     def search_objects(query: str = "", limit: int = 50) -> list[dict]:
         """Search 1C objects by business name (Russian synonym) or technical name.
@@ -3327,11 +4263,54 @@ def make_bsl_helpers(
 
         Returns: list of dicts {object_name, category, synonym, file}.
                  Empty list if index not available or no synonyms built."""
+        result: list[dict] = []
         if idx_reader is not None:
-            result = idx_reader.search_objects(query, limit)
-            if result is not None:
-                return result
-        return []
+            indexed = idx_reader.search_objects(query, limit)
+            if indexed is not None:
+                result = list(indexed)
+        _ensure_index()
+        # Extension synonyms are never in the main index; merge BEFORE truncation
+        # so a saturated main result does not starve ext rows. Empty query →
+        # re-sort the merged list alphabetically by (category, object_name) to
+        # honour IndexReader.search_objects("") contract. Non-empty query →
+        # re-rank using the same 4-level scheme IndexReader uses (exact name >
+        # prefix > synonym substring > category), so a matching ext object wins
+        # a slot from a low-rank main row instead of being sliced away at
+        # position 51+ (v1.12.0; codex round 3).
+        if _extension_synonyms:
+            seen = {(r.get("file", ""), r.get("object_name", "")) for r in result}
+            ext_rows = [
+                row for row in _live_search_objects(query, limit) if (row["file"], row["object_name"]) not in seen
+            ]
+            if ext_rows:
+                is_empty_query = not query or not query.strip()
+                if is_empty_query:
+                    merged = result + ext_rows
+                    merged.sort(key=lambda r: (r.get("category", ""), r.get("object_name", "")))
+                    result = merged
+                else:
+                    q_lower = query.strip().lower()
+
+                    def _rank_for_query(row: dict) -> int:
+                        # Mirrors IndexReader.search_objects ranking exactly.
+                        name_lower = (row.get("object_name") or "").lower()
+                        synonym_lower = (row.get("synonym") or "").lower()
+                        if name_lower == q_lower:
+                            return 0
+                        if name_lower.startswith(q_lower):
+                            return 1
+                        synonym_tail = synonym_lower.split(": ", 1)[-1] if ": " in synonym_lower else synonym_lower
+                        if q_lower in synonym_tail:
+                            return 2
+                        return 3
+
+                    ranked = [
+                        (_rank_for_query(r), r.get("category", ""), r.get("object_name", ""), r)
+                        for r in result + ext_rows
+                    ]
+                    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+                    result = [item[3] for item in ranked]
+        return result[:limit]
 
     def search_regions(query: str = "", limit: int = 200) -> list[dict]:
         """Search code regions (#Область/#Region) by name substring.
@@ -3342,11 +4321,19 @@ def make_bsl_helpers(
 
         Returns: list of dicts {name, line, end_line, module_path, object_name, category}.
                  Empty list if index not available or no regions built."""
+        result: list[dict] = []
         if idx_reader is not None:
-            result = idx_reader.search_regions(query, limit)
-            if result is not None:
-                return result
-        return []
+            indexed = idx_reader.search_regions(query, limit)
+            if indexed is not None:
+                result = list(indexed)
+        _ensure_index()
+        # Same rank-merge as search_methods — see _rank_merge_ext_into_main.
+        if _extension_paths_set and query:
+            ext_rows = _live_search_regions(query, limit)
+            result = _rank_merge_ext_into_main(
+                result, ext_rows, query, name_keys=("name",), dedup_keys=("module_path", "name"), limit=limit
+            )
+        return result[:limit]
 
     def search_module_headers(query: str = "", limit: int = 200) -> list[dict]:
         """Search module header comments by substring.
@@ -3357,11 +4344,20 @@ def make_bsl_helpers(
 
         Returns: list of dicts {module_path, object_name, category, header_comment}.
                  Empty list if index not available or no headers built."""
+        result: list[dict] = []
         if idx_reader is not None:
-            result = idx_reader.search_module_headers(query, limit)
-            if result is not None:
-                return result
-        return []
+            indexed = idx_reader.search_module_headers(query, limit)
+            if indexed is not None:
+                result = list(indexed)
+        _ensure_index()
+        # No clear name field for rank → reserve a quota for ext rows so a
+        # saturated main index does not starve them (codex round 5).
+        if _extension_paths_set and query:
+            ext_rows = _live_search_module_headers(query, limit)
+            result = _reserve_merge_ext_into_main(
+                result, ext_rows, dedup_keys=("module_path", "header_comment"), limit=limit
+            )
+        return result[:limit]
 
     _VALID_SCOPES = frozenset({"all", "methods", "objects", "regions", "headers", "attributes", "predefined"})
 
@@ -3485,9 +4481,10 @@ def make_bsl_helpers(
         if idx_reader is None:
             return {"status": "no_index"}
         stats = idx_reader.get_statistics()
+        builder = int(stats.get("builder_version") or 0)
         return {
             "status": "ok",
-            "builder_version": int(stats.get("builder_version") or 0),
+            "builder_version": builder,
             "config_name": stats.get("config_name", ""),
             "config_version": stats.get("config_version", ""),
             "modules": stats.get("modules", 0),
@@ -3495,16 +4492,25 @@ def make_bsl_helpers(
             "has_fts": stats.get("has_fts", False),
             "has_synonyms": bool(stats.get("object_synonyms", 0)),
             "object_synonyms": stats.get("object_synonyms", 0),
-            "has_regions": int(stats.get("builder_version") or 0) >= 8,
-            "has_module_headers": int(stats.get("builder_version") or 0) >= 8,
-            "has_extension_overrides": int(stats.get("builder_version") or 0) >= 9,
+            "has_regions": builder >= 8,
+            "has_module_headers": builder >= 8,
+            "has_extension_overrides": builder >= 9,
             "extension_overrides": stats.get("extension_overrides", 0),
-            "has_form_elements": int(stats.get("builder_version") or 0) >= 10 and stats.get("has_metadata", False),
+            "has_form_elements": builder >= 10 and stats.get("has_metadata", False),
             "form_elements_count": stats.get("form_elements", 0),
-            "has_object_attributes": int(stats.get("builder_version") or 0) >= 11 and stats.get("has_metadata", False),
+            "has_object_attributes": builder >= 11 and stats.get("has_metadata", False),
             "object_attributes_count": stats.get("object_attributes", 0),
-            "has_predefined_items": int(stats.get("builder_version") or 0) >= 11 and stats.get("has_metadata", False),
+            "has_predefined_items": builder >= 11 and stats.get("has_metadata", False),
             "predefined_items_count": stats.get("predefined_items", 0),
+            # v12 reverse-index (v1.9.0+): metadata_references + 3 specialised tables
+            "has_metadata_references": builder >= 12 and (stats.get("metadata_references") or 0) > 0,
+            "metadata_references_count": stats.get("metadata_references", 0),
+            "exchange_plan_content_count": stats.get("exchange_plan_content", 0),
+            "defined_types_count": stats.get("defined_types", 0),
+            "characteristic_types_count": stats.get("characteristic_types", 0),
+            # Git fast-path acceleration availability for incremental update (v1.8.0+)
+            "git_accelerated": bool(stats.get("git_accelerated")),
+            "git_head_commit": stats.get("git_head_commit"),
             "built_at": stats.get("built_at"),
         }
 
@@ -3595,7 +4601,7 @@ def make_bsl_helpers(
         extracts table names from query text.
 
         Returns: list of dicts {procedure, line, tables: [str], text_preview}."""
-        content = read_file_fn(path)
+        content = _ext_read_file(path)
         lines = content.splitlines()
         procs = extract_procedures(path)
 
@@ -3660,7 +4666,7 @@ def make_bsl_helpers(
 
         Returns: dict {total_lines, code_lines, comment_lines, empty_lines,
                  procedures_count, exports_count, avg_proc_size, max_nesting}."""
-        content = read_file_fn(path)
+        content = _ext_read_file(path)
         lines = content.splitlines()
 
         # Single-pass: empty, comment, nesting depth
@@ -5052,7 +6058,10 @@ def make_bsl_helpers(
         "      print(f\"  {ov['target_method']} <- {ov['annotation']} {ov.get('extension_name', '')}\")\n"
         "  # To read extension method body:\n"
         "  body = read_procedure(path, 'MethodName', include_overrides=True)\n"
-        "  # NOTE: extension files are outside sandbox — do NOT read them via read_file/glob_files",
+        "  # NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths\n"
+        "  # raise PermissionError. BUT: high-level BSL helpers (read_procedure, extract_procedures,\n"
+        "  # parse_object_xml, find_attributes, find_predefined, search) accept '../' paths returned by\n"
+        "  # find_module and read extensions internally.",
     )
 
     _reg(

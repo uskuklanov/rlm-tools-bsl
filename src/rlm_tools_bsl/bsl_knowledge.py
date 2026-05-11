@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 from dataclasses import dataclass
 
 from rlm_tools_bsl.bsl_strategy_data import (
@@ -22,6 +23,82 @@ BSL_PATTERNS = {
     "new_structure": r"(?:Новый|New)\s+(?:Структура|Structure)\(",
     "structure_insert": r'\.(?:Вставить|Insert)\(\s*"(\w+)"',
 }
+
+
+# Lightweight prefix detector for multi-line procedure signatures.
+# Note: matches the START of a Procedure/Function declaration that opens a
+# paren-list. The actual `procedure_def` regex (above) requires a balanced
+# `([^)]*)` — too strict for multi-line cases where `)` lives on a later row.
+_PROC_DEF_PREFIX_RE = re.compile(
+    r"^\s*(?:Процедура|Функция|Procedure|Function)\s+\w+\s*\(",
+    re.IGNORECASE,
+)
+_PROC_STRING_LITERAL_RE = re.compile(r'"[^"\r\n]*"')
+
+_MULTILINE_HARD_CAP_LINES = 20
+_MULTILINE_HARD_CAP_CHARS = 2000
+
+
+def _count_unquoted_parens(line: str) -> tuple[int, int]:
+    """Count `(` and `)` in a line, skipping string-literal contents.
+
+    Matches the trick used by ``bsl_index._strip_code_line`` so that
+    `Знач X = "(не скобка)"` does not unbalance signature merging.
+    """
+    sanitized = _PROC_STRING_LITERAL_RE.sub("", line)
+    return sanitized.count("("), sanitized.count(")")
+
+
+def _merge_proc_continuations(lines: list[str]) -> tuple[list[str], list[int]]:
+    """Merge multi-line BSL procedure signatures into single logical lines.
+
+    Args:
+        lines: Original file lines (no trailing newline).
+
+    Returns:
+        (merged_lines, line_map) where ``line_map[i]`` is the **1-based** number
+        of the original line that begins ``merged_lines[i]``. For non-merged
+        lines the map is identity.
+
+    Hard caps: 20 lines / 2000 chars per signature — guards against runaway
+    merges on truncated/garbage files with unbalanced `(`.
+    """
+    merged_lines: list[str] = []
+    line_map: list[int] = []
+
+    total = len(lines)
+    i = 0
+    while i < total:
+        line = lines[i]
+        if _PROC_DEF_PREFIX_RE.match(line):
+            open_count, close_count = _count_unquoted_parens(line)
+            balance = open_count - close_count
+            if balance > 0:
+                combined = line
+                start_original = i + 1
+                last_index = i
+                for j in range(i + 1, min(i + _MULTILINE_HARD_CAP_LINES, total)):
+                    nxt = lines[j]
+                    combined = combined + " " + nxt
+                    o, c = _count_unquoted_parens(nxt)
+                    balance += o - c
+                    last_index = j
+                    if balance <= 0:
+                        break
+                    if len(combined) > _MULTILINE_HARD_CAP_CHARS:
+                        break
+                # Treat the whole span as one logical line regardless of whether
+                # we reached balance (hard-cap exits also collapse to single
+                # logical row so callers don't get duplicate signature matches).
+                merged_lines.append(combined)
+                line_map.append(start_original)
+                i = last_index + 1
+                continue
+        merged_lines.append(line)
+        line_map.append(i + 1)
+        i += 1
+
+    return merged_lines, line_map
 
 
 @dataclass
@@ -132,8 +209,10 @@ Step 5 — EXTENSIONS: check if behavior is modified
   get_overrides('ObjectName') → indexed overrides (instant)
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
-  NOTE: extension files are OUTSIDE the sandbox. Do NOT read them via read_file/glob_files.
-  Use ONLY the helpers above — they read extension code internally.
+  NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
+  BUT: if find_module returned a path starting with '../' — it is an extension file; pass it directly
+  to high-level BSL helpers (read_procedure, extract_procedures, parse_object_xml, find_attributes,
+  find_predefined, search). They read extensions internally. For overrides use get_overrides/find_ext_overrides.
 
 == DISAMBIGUATION ==
 get_object_full_structure(name) vs analyze_object(name):
@@ -513,6 +592,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "get_overrides('ИмяОбъекта') → перехваты из индекса (source='index')",
             "extract_procedures(path) → поле overridden_by у перехваченных методов",
             "read_procedure(path, name, include_overrides=True) → оригинал + тело расширения с аннотацией",
+            "find_module/find_attributes/parse_object_xml/search видят объекты ext конфигов; пути начинаются на '../' — передавай их в read_procedure/extract_procedures напрямую",
         ],
         "full": [
             "get_overrides() → все перехваты конфигурации (group by extension/annotation)",
@@ -522,6 +602,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
             "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — должно совпасть с index по количеству",
             "get_index_info() → has_extension_overrides, extension_overrides — статистика индекса",
+            "Объекты и модули расширения видны из main-сессии: find_module/find_by_type/find_attributes/find_predefined/parse_object_xml/search возвращают пути с префиксом '../'. Передавай эти пути напрямую в read_procedure/extract_procedures — они читают расширение внутренне.",
+            "read_file/grep/glob_files на путях с '../' дадут PermissionError (sandbox base-only)",
         ],
         "code_hint": (
             "all_ov = get_overrides()\n"
@@ -1337,8 +1419,10 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             "Extensions OVERRIDE methods in this config via annotations:\n"
             "  &Перед (Before), &После (After), &Вместо (Instead), &ИзменениеИКонтроль (ChangeAndValidate)\n"
             "YOU MUST mention overridden methods in your response.\n"
-            "Extension files are OUTSIDE sandbox — do NOT use read_file/glob_files on extension paths.\n"
-            "Use: get_overrides(), read_procedure(include_overrides=True), extract_procedures().overridden_by"
+            "Extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.\n"
+            "BUT: if find_module returned a path starting with '../' — it is an extension file; pass it directly\n"
+            "to high-level BSL helpers (read_procedure, extract_procedures, parse_object_xml, find_attributes,\n"
+            "find_predefined, search). They read extensions internally. For overrides use get_overrides/find_ext_overrides."
         )
         # Include auto-scanned overrides per extension
         for e in ext_context.nearby_extensions:

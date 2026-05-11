@@ -70,8 +70,10 @@ Step 5 — EXTENSIONS: check if behavior is modified
   get_overrides('ObjectName') → indexed overrides (instant)
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
-  NOTE: extension files are OUTSIDE the sandbox. Do NOT read them via read_file/glob_files.
-  Use ONLY the helpers above — they read extension code internally.""",
+  NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
+  BUT: if find_module returned a path starting with '../' — it is an extension file; pass it directly
+  to high-level BSL helpers (read_procedure, extract_procedures, parse_object_xml, find_attributes,
+  find_predefined, search). They read extensions internally. For overrides use get_overrides/find_ext_overrides.""",
     "performance": """\
 == STEP 4 EXTENDED (по перформансу) ==
 

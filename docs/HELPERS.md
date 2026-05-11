@@ -123,11 +123,31 @@ BSL-функционал добавлен поверх, не ломая исхо
 
 ## Расширения (CFE)
 
+### Обнаружение и перехваты
+
 - `detect_extensions()` — обнаружить расширения рядом с анализируемой конфигурацией (имена, пути, префиксы, назначения). Детектирование по XML-маркерам (Configuration.xml / Configuration.mdo), без хардкода имён каталогов
 - `find_ext_overrides(extension_path, object_name='')` — найти перехваченные методы в расширении: аннотации `&Перед`, `&После`, `&Вместо`, `&ИзменениеИКонтроль`. Прицельный поиск по имени объекта или полный скан всех модулей расширения
 - `get_overrides(object_name='', method_name='')` — мгновенный запрос перехватов из индекса (v9+). Live fallback на v8/без индекса. Возвращает `{overrides: [...], total, source: "index"|"live"|"unavailable"}`
 - `extract_procedures(path)` — при наличии индекса v9+ каждый перехваченный метод содержит поле `overridden_by` со списком перехватов (аннотация, расширение, метод, путь, строка)
 - `read_procedure(path, proc_name, include_overrides=False)` — с `include_overrides=True` дописывает тело расширенного метода с аннотацией и файловой ссылкой (override-тела тоже нумеруются в MCP-сессии). Без параметра — обратная совместимость, чистое тело
+
+### Видимость объектов и модулей расширений из main-сессии (v1.12.0)
+
+При открытии сессии на основной конфигурации с соседними CFE-расширениями (`src/cf/` + `src/cfe/<name>/`) высокоуровневые BSL-хелперы видят и объекты, и модули расширений — без переоткрытия сессии в каталоге самого расширения. Пути таких объектов возвращаются с префиксом `../cfe/...` относительно sandbox base.
+
+- `find_module(name)` / `find_by_type(category, name='')` — возвращают модули из соседних расширений вместе с main-модулями
+- `find_attributes(name=...)` (без `object_name`) / `find_predefined(name=...)` (без `object_name`) — name-only поиск дополняется live-сканом ext-объектов; результаты ext-стороны участвуют в общем 3-уровневом ранкинге (exact > prefix > substring) по `attr_name`/`attr_synonym` (для предопределённых — `item_name`/`item_synonym`). Поле `source_file` в каждой row содержит путь к XML расширения, чтобы `search(query, scope='attributes'|'predefined')` отдавал непустой `path`
+- `find_attributes(object_name="Catalogs/ExtOnly")` / `find_predefined(object_name=...)` / `parse_object_xml("Catalogs/ExtOnly")` — резолвят XML-only объекты расширений (Subsystems, EventSubscriptions без `<Synonym>`)
+- `search_methods(query)` / `search_objects(query)` / `search_regions(query)` / `search_module_headers(query)` — индексные результаты дополняются live-данными из расширений; shape (`rank=None` для методов, prefixed `Категория: Синоним` для объектов) точно зеркалит `IndexReader`. Merge выполняется **до** truncation: ext-объект с exact-name match занимает слот в топе, даже когда main-индекс уже вернул `limit` rank-2 совпадений
+- `search_objects("")` (alphabetical listing) — ext-синонимы тоже включаются в общую alphabetical-сортировку, не отбрасываются на saturated main
+- `read_procedure(ext_path, name)` / `extract_procedures(ext_path)` — принимают пути с префиксом `../cfe/...` напрямую и читают содержимое расширения через `_ext_read_file` (multi-root резолвер с собственным кэшем чтения)
+
+**Sandbox-инвариант сохраняется:** пользовательский `read_file('../cfe/...')`, `grep`, `glob_files` на `../`-пути по-прежнему возвращают `PermissionError`. Видимость расширений добавлена только в высокоуровневые BSL-хелперы. Если `find_module` вернул путь с `../` — передавай его именно в `read_procedure`/`extract_procedures`/`parse_object_xml`/`find_attributes`/`find_predefined`/`search`, а не в generic I/O.
+
+### Multi-line сигнатуры и opportunistic live-fill (v1.12.0)
+
+- Многострочные `Процедура X(a,\n  b,\n  c)` и `Функция` корректно парсятся индексером и live-хелпером через общий util `bsl_knowledge._merge_proc_continuations` — склейка продолжений с учётом строковых литералов и hard-cap (20 строк / 2000 символов на сигнатуру)
+- `extract_procedures(path)` для индексированных путей делает **opportunistic live-fill**: если индекс пропустил multi-line процедуру (старый builder), live-парсер дополняет результат с тем же shape, включая enrichment `overridden_by` из индекса. Поведение self-healing — multi-line процедуры видны сразу после обновления пакета, без обязательного `rlm-bsl-index index update`
 
 ## Оптимизации для совместимости с разными AI-моделями
 

@@ -83,6 +83,7 @@ class Sandbox:
         format_info=None,
         idx_reader=None,
         idx_zero_callers_authoritative: bool = False,
+        extension_paths: list[str] | None = None,
     ):
         self._base_path = base_path
         self._max_output_chars = max_output_chars
@@ -90,6 +91,7 @@ class Sandbox:
         self._format_info = format_info
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
+        self._extension_paths = list(extension_paths or [])
         self._namespace: dict = {}
         self._resolve_safe = None
         self._helper_calls: list[HelperCall] = []
@@ -135,6 +137,7 @@ class Sandbox:
                 format_info=self._format_info,
                 idx_reader=self._idx_reader,
                 idx_zero_callers_authoritative=self._idx_zero_callers_authoritative,
+                extension_paths=self._extension_paths,
             )
             self._namespace.update(self._wrap_helpers(bsl_helpers))
 

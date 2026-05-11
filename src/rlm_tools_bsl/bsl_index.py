@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
-from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS
+from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
 
@@ -1374,42 +1374,72 @@ def _strip_code_line(line: str) -> str:
 def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     """Parse procedure/function definitions from a list of lines.
 
+    Multi-line signatures (``Процедура X(a, b,\n    c, d)``) are folded into a
+    single logical line before the BSL_PATTERNS["procedure_def"] regex runs.
+    ``end_line`` is computed from the ORIGINAL line list — ``КонецПроцедуры``
+    always sits alone on its own row.
+
     Returns list of dicts: {name, type, line, end_line, is_export, params, loc}.
     """
+    merged_lines, line_map = _merge_proc_continuations(lines)
+    total_merged = len(merged_lines)
+    total_orig = len(lines)
+
     procedures: list[dict] = []
-    current: dict | None = None
+    m_idx = 0
+    while m_idx < total_merged:
+        merged = merged_lines[m_idx]
+        m = _PROC_DEF_RE.search(merged)
+        if not m:
+            m_idx += 1
+            continue
 
-    for line_idx, line in enumerate(lines):
-        line_number = line_idx + 1  # 1-based
+        proc_type = m.group(1)
+        proc_name = m.group(2)
+        params = m.group(3).strip() if m.group(3) else ""
+        is_export = m.group(4) is not None and m.group(4).strip() != ""
+        line_number = line_map[m_idx]  # 1-based original line
 
-        if current is None:
-            m = _PROC_DEF_RE.search(line)
-            if m:
-                proc_type = m.group(1)
-                proc_name = m.group(2)
-                params = m.group(3).strip() if m.group(3) else ""
-                is_export = m.group(4) is not None and m.group(4).strip() != ""
-                current = {
-                    "name": proc_name,
-                    "type": proc_type,
-                    "line": line_number,
-                    "is_export": is_export,
-                    "end_line": None,
-                    "params": params,
-                }
-        else:
-            m_end = _PROC_END_RE.search(line)
-            if m_end:
-                current["end_line"] = line_number
-                current["loc"] = current["end_line"] - current["line"] + 1
-                procedures.append(current)
-                current = None
+        # Body starts at the original line right after the merged signature row.
+        next_start = line_map[m_idx + 1] if m_idx + 1 < total_merged else total_orig + 1
+        scan_from = next_start - 1  # 0-based
 
-    # Handle unclosed procedure at EOF
-    if current is not None:
-        current["end_line"] = len(lines)
-        current["loc"] = current["end_line"] - current["line"] + 1
+        end_line: int | None = None
+        for orig_idx in range(scan_from, total_orig):
+            if _PROC_END_RE.search(lines[orig_idx]):
+                end_line = orig_idx + 1
+                break
+
+        if end_line is None:
+            current = {
+                "name": proc_name,
+                "type": proc_type,
+                "line": line_number,
+                "is_export": is_export,
+                "end_line": total_orig,
+                "params": params,
+                "loc": total_orig - line_number + 1,
+            }
+            procedures.append(current)
+            break
+
+        current = {
+            "name": proc_name,
+            "type": proc_type,
+            "line": line_number,
+            "is_export": is_export,
+            "end_line": end_line,
+            "params": params,
+            "loc": end_line - line_number + 1,
+        }
         procedures.append(current)
+
+        # Advance m_idx past the КонецПроцедуры line.
+        # Find the merged index whose line_map start > end_line.
+        new_m = m_idx + 1
+        while new_m < total_merged and line_map[new_m] <= end_line:
+            new_m += 1
+        m_idx = new_m
 
     return procedures
 
@@ -4035,6 +4065,130 @@ def _collect_role_rights(base_path: str) -> list[tuple[str, str, str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _iter_metadata_xml_files(
+    base_path: str,
+    *,
+    categories: frozenset[str] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Discover layout-canonical metadata XML/MDO files for `_SYNONYM_CATEGORIES`.
+
+    Same layout-discovery as ``_collect_object_synonyms`` (CF
+    ``Cat/Obj/Ext/<Type>.xml`` → CF sibling ``Cat/Obj.xml`` → CF sibling-only
+    ``Cat/<Name>.xml`` for EventSubscriptions → EDT ``Cat/Obj/Obj.mdo`` →
+    Subsystems recursive), but WITHOUT parsing XML and WITHOUT the synonym
+    filter. Used both by ``_collect_object_synonyms`` (which then parses
+    synonyms) and by ``bsl_helpers`` extension-pass (which needs the raw
+    locator list for XML-only ext objects without ``<Synonym>``).
+
+    When *categories* is ``None`` (default) — all ``_SYNONYM_CATEGORIES`` are scanned.
+
+    Returns list of (category, object_name, rel_path_posix).
+    """
+    base = Path(base_path)
+    all_results: list[tuple[str, str, str]] = []
+
+    def _emit(fp: Path, cat: str, obj_name: str, results: list[tuple[str, str, str]]) -> None:
+        try:
+            rel = fp.relative_to(base).as_posix()
+        except ValueError:
+            return
+        results.append((cat, obj_name, rel))
+
+    def _collect_category(cat: str) -> list[tuple[str, str, str]]:
+        results: list[tuple[str, str, str]] = []
+        cat_dir = base / cat
+        if not cat_dir.is_dir():
+            return results
+
+        if cat == "Subsystems":
+            _collect_subsystems_recursive(cat_dir, cat, results)
+            return results
+
+        seen: set[str] = set()
+        for obj_dir in cat_dir.iterdir():
+            if not obj_dir.is_dir():
+                continue
+            mdo = obj_dir / f"{obj_dir.name}.mdo"
+            if mdo.is_file():
+                _emit(mdo, cat, obj_dir.name, results)
+                seen.add(obj_dir.name)
+                continue
+            sibling_xml = cat_dir / f"{obj_dir.name}.xml"
+            if sibling_xml.is_file():
+                _emit(sibling_xml, cat, obj_dir.name, results)
+                seen.add(obj_dir.name)
+                continue
+            ext_dir = obj_dir / "Ext"
+            if ext_dir.is_dir():
+                for xml in ext_dir.iterdir():
+                    if xml.suffix.lower() == ".xml" and xml.is_file():
+                        _emit(xml, cat, obj_dir.name, results)
+                        seen.add(obj_dir.name)
+                        break
+
+        for fp in cat_dir.iterdir():
+            if not fp.is_file() or fp.suffix.lower() != ".xml":
+                continue
+            obj_name = fp.stem
+            if obj_name in seen:
+                continue
+            _emit(fp, cat, obj_name, results)
+            seen.add(obj_name)
+
+        return results
+
+    def _collect_subsystems_recursive(
+        parent_dir: Path,
+        cat: str,
+        results: list[tuple[str, str, str]],
+    ) -> None:
+        seen: set[str] = set()
+        for obj_dir in parent_dir.iterdir():
+            if not obj_dir.is_dir():
+                continue
+            mdo = obj_dir / f"{obj_dir.name}.mdo"
+            if mdo.is_file():
+                _emit(mdo, cat, obj_dir.name, results)
+                seen.add(obj_dir.name)
+            else:
+                sibling_xml = parent_dir / f"{obj_dir.name}.xml"
+                if sibling_xml.is_file():
+                    _emit(sibling_xml, cat, obj_dir.name, results)
+                    seen.add(obj_dir.name)
+                else:
+                    ext_dir = obj_dir / "Ext"
+                    if ext_dir.is_dir():
+                        for xml in ext_dir.iterdir():
+                            if xml.suffix.lower() == ".xml" and xml.is_file():
+                                _emit(xml, cat, obj_dir.name, results)
+                                seen.add(obj_dir.name)
+                                break
+            nested = obj_dir / "Subsystems"
+            if nested.is_dir():
+                _collect_subsystems_recursive(nested, cat, results)
+
+        for fp in parent_dir.iterdir():
+            if not fp.is_file() or fp.suffix.lower() != ".xml":
+                continue
+            obj_name = fp.stem
+            if obj_name in seen:
+                continue
+            _emit(fp, cat, obj_name, results)
+            seen.add(obj_name)
+
+    target_cats = categories if categories is not None else _SYNONYM_CATEGORIES
+    cats_list = [c for c in target_cats if (base / c).is_dir()]
+    if not cats_list:
+        return all_results
+
+    workers = min(os.cpu_count() or 4, 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for batch in pool.map(_collect_category, cats_list):
+            all_results.extend(batch)
+
+    return all_results
+
+
 def _collect_object_synonyms(
     base_path: str,
     *,
@@ -4052,25 +4206,19 @@ def _collect_object_synonyms(
     base = Path(base_path)
     all_results: list[tuple[str, str, str, str]] = []
 
-    def _read_safe(fp: Path) -> str | None:
+    candidates = _iter_metadata_xml_files(base_path, categories=categories)
+    if not candidates:
+        return all_results
+
+    import xml.etree.ElementTree as _ET
+
+    def _parse_one(entry: tuple[str, str, str]) -> tuple[str, str, str, str] | None:
+        cat, obj_name, rel = entry
+        fp = base / rel
         try:
-            return fp.read_text(encoding="utf-8-sig", errors="replace")
+            content = fp.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             return None
-
-    def _parse_and_append(
-        fp: Path,
-        cat: str,
-        obj_name: str,
-        results: list[tuple[str, str, str, str]],
-    ) -> None:
-        content = _read_safe(fp)
-        if not content:
-            return
-        # Защита от битых/пустых/обрезанных XML: один файл не должен ронять
-        # всю переиндексацию категории. Логируем и пропускаем.
-        import xml.etree.ElementTree as _ET
-
         try:
             parsed = parse_metadata_xml(content)
         except _ET.ParseError as exc:
@@ -4079,7 +4227,7 @@ def _collect_object_synonyms(
                 fp,
                 exc,
             )
-            return
+            return None
         except Exception as exc:
             logger.warning(
                 "_collect_object_synonyms: skipping %s due to unexpected parse error: %s: %s",
@@ -4087,126 +4235,21 @@ def _collect_object_synonyms(
                 type(exc).__name__,
                 exc,
             )
-            return
+            return None
         if not parsed:
-            return
+            return None
         raw_synonym = parsed.get("synonym") or ""
         if not raw_synonym:
-            return
+            return None
         prefix = _CATEGORY_RU.get(cat, cat)
         synonym = f"{prefix}: {raw_synonym}"
-        rel = fp.relative_to(base).as_posix()
-        results.append((obj_name, cat, synonym, rel))
-
-    def _collect_category(cat: str) -> list[tuple[str, str, str, str]]:
-        """Collect synonyms for a single category (thread-safe)."""
-        results: list[tuple[str, str, str, str]] = []
-        cat_dir = base / cat
-        if not cat_dir.is_dir():
-            return results
-
-        if cat == "Subsystems":
-            # Subsystems can be nested: Subsystems/Parent/Subsystems/Child/...
-            _collect_subsystems_recursive(cat_dir, cat, results)
-            return results
-
-        seen: set[str] = set()
-        for obj_dir in cat_dir.iterdir():
-            if not obj_dir.is_dir():
-                continue
-            # EDT: ObjectName/ObjectName.mdo
-            mdo = obj_dir / f"{obj_dir.name}.mdo"
-            if mdo.is_file():
-                _parse_and_append(mdo, cat, obj_dir.name, results)
-                seen.add(obj_dir.name)
-                continue
-            # CF: Category/ObjectName.xml (sibling of object directory)
-            sibling_xml = cat_dir / f"{obj_dir.name}.xml"
-            if sibling_xml.is_file():
-                _parse_and_append(sibling_xml, cat, obj_dir.name, results)
-                seen.add(obj_dir.name)
-                continue
-            # CF fallback: ObjectName/Ext/*.xml (first canonical XML)
-            ext_dir = obj_dir / "Ext"
-            if ext_dir.is_dir():
-                for xml in ext_dir.iterdir():
-                    if xml.suffix.lower() == ".xml" and xml.is_file():
-                        _parse_and_append(xml, cat, obj_dir.name, results)
-                        seen.add(obj_dir.name)
-                        break
-
-        # CF sibling-only layout: Category/<Name>.xml без объектного подкаталога.
-        # Типично для EventSubscriptions в CF (Документооборот, частично ЕРП):
-        # все файлы лежат прямо в категории. Без этого прохода такие объекты
-        # пропускаются → object_synonyms не заполняется и business-name search
-        # не находит их до первого incremental update через pointwise-путь.
-        for fp in cat_dir.iterdir():
-            if not fp.is_file() or fp.suffix.lower() != ".xml":
-                continue
-            obj_name = fp.stem
-            if obj_name in seen:
-                continue
-            _parse_and_append(fp, cat, obj_name, results)
-            seen.add(obj_name)
-
-        return results
-
-    def _collect_subsystems_recursive(
-        parent_dir: Path,
-        cat: str,
-        results: list[tuple[str, str, str, str]],
-    ) -> None:
-        """Recursively collect synonyms from nested Subsystems."""
-        seen: set[str] = set()
-        for obj_dir in parent_dir.iterdir():
-            if not obj_dir.is_dir():
-                continue
-            mdo = obj_dir / f"{obj_dir.name}.mdo"
-            if mdo.is_file():
-                _parse_and_append(mdo, cat, obj_dir.name, results)
-                seen.add(obj_dir.name)
-            else:
-                # CF: sibling XML at parent level
-                sibling_xml = parent_dir / f"{obj_dir.name}.xml"
-                if sibling_xml.is_file():
-                    _parse_and_append(sibling_xml, cat, obj_dir.name, results)
-                    seen.add(obj_dir.name)
-                else:
-                    ext_dir = obj_dir / "Ext"
-                    if ext_dir.is_dir():
-                        for xml in ext_dir.iterdir():
-                            if xml.suffix.lower() == ".xml" and xml.is_file():
-                                _parse_and_append(xml, cat, obj_dir.name, results)
-                                seen.add(obj_dir.name)
-                                break
-            # Recurse into nested Subsystems
-            nested = obj_dir / "Subsystems"
-            if nested.is_dir():
-                _collect_subsystems_recursive(nested, cat, results)
-
-        # CF sibling-only layout: Subsystems/<Parent>/Subsystems/<Name>.xml без
-        # объектного подкаталога. Тот же баг, что и в _collect_category — ловим
-        # plain .xml на каждом уровне иерархии. Дедуп через `seen`, чтобы
-        # объекты, уже найденные через подкаталог + sibling, не считались дважды.
-        for fp in parent_dir.iterdir():
-            if not fp.is_file() or fp.suffix.lower() != ".xml":
-                continue
-            obj_name = fp.stem
-            if obj_name in seen:
-                continue
-            _parse_and_append(fp, cat, obj_name, results)
-            seen.add(obj_name)
-
-    # Parallel collection by category (I/O bound)
-    target_cats = categories if categories is not None else _SYNONYM_CATEGORIES
-    cats_list = [c for c in target_cats if (base / c).is_dir()]
-    if not cats_list:
-        return all_results
+        return (obj_name, cat, synonym, rel)
 
     workers = min(os.cpu_count() or 4, 8)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for batch in pool.map(_collect_category, cats_list):
-            all_results.extend(batch)
+        for parsed_row in pool.map(_parse_one, candidates):
+            if parsed_row is not None:
+                all_results.append(parsed_row)
 
     return all_results
 
