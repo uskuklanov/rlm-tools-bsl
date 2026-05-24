@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import rlm_tools_bsl.bsl_index as bsl_index_mod
 from rlm_tools_bsl.bsl_index import (
     IndexBuilder,
     IndexReader,
@@ -22,8 +23,11 @@ from rlm_tools_bsl.bsl_index import (
     _collect_object_synonyms,
     _git_available,
     _git_changed_files,
+    _git_current_dirty,
+    _git_dirty_timeout,
     _git_head_sha,
     _git_repo_info,
+    _GitDirtyResult,
     get_index_db_path,
 )
 
@@ -85,6 +89,26 @@ def _read_meta(db_path: Path, key: str) -> str | None:
     row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
     conn.close()
     return row["value"] if row else None
+
+
+def _install_worktree_timeout(monkeypatch) -> None:
+    """Force best-effort work-tree git commands to time out.
+
+    Critical commands (rev-parse, merge-base, committed diff) pass through so
+    the fast path is still *attempted* — only the staged/unstaged/untracked
+    work-tree probes (which carry ``--ignore-cr-at-eol`` or ``ls-files
+    --others``) raise ``TimeoutExpired``, marking detection unreliable.
+    """
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        is_worktree_diff = "--ignore-cr-at-eol" in args
+        is_untracked = "ls-files" in args and "--others" in args
+        if is_worktree_diff or is_untracked:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs.get("timeout", 60))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(bsl_index_mod.subprocess, "run", fake_run)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +244,8 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), initial_sha, prefix)
         assert changed is not None
-        assert "Catalogs/Тест/Ext/Module.bsl" in changed
+        assert changed.unreliable_reason is None
+        assert "Catalogs/Тест/Ext/Module.bsl" in changed.paths
 
     def test_staged(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -235,7 +260,7 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
-        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
     def test_unstaged(self, git_bsl_project):
         sha = _git_head_sha(str(git_bsl_project))
@@ -246,7 +271,7 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
-        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
     def test_untracked(self, git_bsl_project):
         sha = _git_head_sha(str(git_bsl_project))
@@ -257,7 +282,7 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
-        assert "NewFile.bsl" in changed
+        assert "NewFile.bsl" in changed.paths
 
     def test_deleted(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -271,7 +296,7 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
-        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
     def test_bad_commit(self, git_bsl_project):
         info = _git_repo_info(str(git_bsl_project))
@@ -293,7 +318,7 @@ class TestGitChangedFiles:
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
         # README.md is outside prefix "src" — should NOT be in result
-        assert "README.md" not in changed
+        assert "README.md" not in changed.paths
 
     @pytest.mark.skipif(
         sys.platform == "win32" and not os.environ.get("PYTHONUTF8"),
@@ -313,7 +338,7 @@ class TestGitChangedFiles:
         _, prefix = info
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
-        assert "Справочники/Тест.bsl" in changed
+        assert "Справочники/Тест.bsl" in changed.paths
 
     def test_overlap_committed_and_staged(self, git_bsl_project):
         root = git_bsl_project.parent
@@ -333,7 +358,7 @@ class TestGitChangedFiles:
         changed = _git_changed_files(str(git_bsl_project), sha, prefix)
         assert changed is not None
         # Should appear only once despite being in both committed and staged
-        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed
+        assert "CommonModules/МойМодуль/Ext/Module.bsl" in changed.paths
 
 
 # =====================================================================
@@ -592,6 +617,177 @@ class TestDirtySnapshot:
         # Since it's now back to original (same as HEAD), it may count as changed=1
         # because it was in the dirty set and gets reparsed
         assert result2["git_fast_path"] is True
+
+
+class TestGitDirtyTimeout:
+    """RLM_GIT_DIRTY_TIMEOUT parsing for best-effort git commands (FIX-3)."""
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv("RLM_GIT_DIRTY_TIMEOUT", raising=False)
+        assert _git_dirty_timeout() == 120
+
+    def test_custom(self, monkeypatch):
+        monkeypatch.setenv("RLM_GIT_DIRTY_TIMEOUT", "300")
+        assert _git_dirty_timeout() == 300
+
+    def test_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv("RLM_GIT_DIRTY_TIMEOUT", "not-a-number")
+        assert _git_dirty_timeout() == 120
+
+    def test_floor_at_one(self, monkeypatch):
+        monkeypatch.setenv("RLM_GIT_DIRTY_TIMEOUT", "0")
+        assert _git_dirty_timeout() == 1
+
+
+class TestGitCurrentDirtyContract:
+    """_git_current_dirty returns a _GitDirtyResult (FIX-2 contract)."""
+
+    def test_clean_is_reliable(self, git_bsl_project):
+        info = _git_repo_info(str(git_bsl_project))
+        assert info is not None
+        _, prefix = info
+        result = _git_current_dirty(str(git_bsl_project), prefix)
+        assert isinstance(result, _GitDirtyResult)
+        assert result.unreliable_reason is None
+
+    def test_timeout_marks_unreliable(self, git_bsl_project, monkeypatch):
+        info = _git_repo_info(str(git_bsl_project))
+        _, prefix = info
+        _install_worktree_timeout(monkeypatch)
+        result = _git_current_dirty(str(git_bsl_project), prefix)
+        assert isinstance(result, _GitDirtyResult)
+        assert result.unreliable_reason is not None
+
+
+class TestIgnoreCrAtEol:
+    """--ignore-cr-at-eol: CRLF-only diffs are not reported as changed (FIX-3)."""
+
+    def test_crlf_only_excluded_real_change_kept(self, tmp_path, monkeypatch):
+        root = tmp_path
+        base = root / "src"
+        da = base / "CommonModules" / "ModA" / "Ext"
+        da.mkdir(parents=True)
+        db = base / "CommonModules" / "ModB" / "Ext"
+        db.mkdir(parents=True)
+        fa = da / "Module.bsl"
+        fb = db / "Module.bsl"
+        # Commit both with LF endings, autocrlf disabled so the blob keeps LF.
+        fa.write_bytes(b"Procedure A() Export\nEndProcedure\n")
+        fb.write_bytes(b"Procedure B() Export\nEndProcedure\n")
+        _git(root, "init")
+        _git(root, "config", "user.name", "Test")
+        _git(root, "config", "user.email", "test@test.com")
+        _git(root, "config", "core.autocrlf", "false")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "initial")
+
+        sha = _git_head_sha(str(base))
+        info = _git_repo_info(str(base))
+        assert info is not None
+        _, prefix = info
+
+        # ModA: only line endings change LF -> CRLF (same logical content).
+        fa.write_bytes(b"Procedure A() Export\r\nEndProcedure\r\n")
+        # ModB: genuine content change.
+        fb.write_bytes(b"Procedure B() Export\n    Message(1);\nEndProcedure\n")
+
+        changed = _git_changed_files(str(base), sha, prefix)
+        assert changed is not None
+        assert changed.unreliable_reason is None
+        assert "CommonModules/ModA/Ext/Module.bsl" not in changed.paths
+        assert "CommonModules/ModB/Ext/Module.bsl" in changed.paths
+
+
+class TestUnreliableDirtyDetection:
+    """FIX-2: best-effort timeout must not silently drop uncommitted changes."""
+
+    def test_unreliable_forces_full_scan_and_sets_flag(self, git_bsl_project, monkeypatch):
+        # Uncommitted edit that git fast path would normally pick up via unstaged diff.
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+
+        _install_worktree_timeout(monkeypatch)
+        result = IndexBuilder().update(str(git_bsl_project))
+
+        # Fast path aborted, full scan used, reason surfaced.
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"]
+        # The uncommitted edit is still indexed (full scan via mtime+size).
+        assert result["changed"] == 1
+        # Flag persisted so the NEXT update also full-scans.
+        db_path = get_index_db_path(str(git_bsl_project))
+        assert _read_meta(db_path, "git_dirty_unreliable") == "1"
+
+    def test_flag_forces_full_scan_then_clears(self, git_bsl_project):
+        db_path = get_index_db_path(str(git_bsl_project))
+        # Simulate a prior unreliable run.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('git_dirty_unreliable', '1')")
+        conn.commit()
+        conn.close()
+
+        # Detection is reliable now → full scan once, then flag cleared.
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "prev dirty unreliable"
+        assert _read_meta(db_path, "git_dirty_unreliable") == "0"
+
+        # With the flag cleared the fast path is available again.
+        result2 = IndexBuilder().update(str(git_bsl_project))
+        assert result2["git_fast_path"] is True
+
+    def test_build_sets_flag_when_unreliable(self, tmp_path, monkeypatch):
+        root = tmp_path
+        base = root / "src"
+        cm = base / "CommonModules" / "М" / "Ext"
+        cm.mkdir(parents=True)
+        (cm / "Module.bsl").write_text(COMMON_MODULE_BSL, encoding="utf-8-sig")
+        _git_init(root)
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(base / ".index"))
+        _install_worktree_timeout(monkeypatch)
+        db_path = IndexBuilder().build(str(base), build_calls=True)
+
+        # No prior snapshot existed → the flag is the only way to force a correct
+        # full scan on the first update.
+        assert _read_meta(db_path, "git_dirty_unreliable") == "1"
+
+    def test_unreliable_preserves_previous_snapshot(self, git_bsl_project, monkeypatch):
+        db_path = get_index_db_path(str(git_bsl_project))
+        # 1. Reliable update with a dirty file → good snapshot saved, flag=0.
+        bsl = git_bsl_project / "CommonModules" / "МойМодуль" / "Ext" / "Module.bsl"
+        bsl.write_text(MODIFIED_BSL, encoding="utf-8-sig")
+        IndexBuilder().update(str(git_bsl_project))
+        before = _read_meta(db_path, "git_dirty_paths")
+        assert any("Module.bsl" in p for p in json.loads(before))
+        assert _read_meta(db_path, "git_dirty_unreliable") == "0"
+
+        # 2. Next update with unreliable detection must NOT clobber the snapshot.
+        _install_worktree_timeout(monkeypatch)
+        IndexBuilder().update(str(git_bsl_project))
+        after = _read_meta(db_path, "git_dirty_paths")
+        assert after == before
+        assert _read_meta(db_path, "git_dirty_unreliable") == "1"
+
+
+class TestFallbackReasonInDelta:
+    """FIX-2 observability: git_fallback_reason / rebuild_reason in delta."""
+
+    def test_no_stored_commit_reason(self, git_bsl_project):
+        db_path = get_index_db_path(str(git_bsl_project))
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DELETE FROM index_meta WHERE key = 'git_head_commit'")
+        conn.commit()
+        conn.close()
+
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is False
+        assert result["git_fallback_reason"] == "no stored commit"
+
+    def test_fast_path_reason_is_none(self, git_bsl_project):
+        result = IndexBuilder().update(str(git_bsl_project))
+        assert result["git_fast_path"] is True
+        assert result["git_fallback_reason"] is None
 
 
 class TestCollectMetadataTablesKwargs:

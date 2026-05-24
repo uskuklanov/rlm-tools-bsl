@@ -906,7 +906,9 @@ class TestIncrementalUpdate:
         assert "added" in result
         assert "changed" in result
         assert "removed" in result
-        assert all(isinstance(v, int) for v in result.values())
+        # Counts are ints; the delta also carries diagnostic fields
+        # (git_fast_path: bool, git_fallback_reason: str|None).
+        assert all(isinstance(result[k], int) for k in ("added", "changed", "removed"))
 
 
 # =====================================================================

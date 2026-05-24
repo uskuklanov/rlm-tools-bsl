@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.13.0] — 2026-05-24
+
+### Исправлено
+- **Незакоммиченные правки больше не теряются молча при инкрементальном обновлении (Docker Desktop / Virtiofs на Windows).** Раньше best-effort git-команды детекта (`staged`/`unstaged`/`untracked`) при таймауте по медленной ФС возвращали пустой набор → `git_fast_path=true, changed=0`, и незакоммиченная правка `.bsl` не попадала в индекс. Теперь таймаут/ошибка помечается как **unreliable**: `_git_changed_files`/`_git_current_dirty` возвращают `_GitDirtyResult(paths, unreliable_reason)`, обновление уходит в корректный полный скан (по mtime+size), а в индекс пишется meta-флаг `git_dirty_unreliable=1` — он форсит полный скан и на следующем апдейте, пока не удастся снять надёжный dirty-снапшот. Прежний хороший `git_dirty_paths` при unreliable не затирается частичным набором.
+- **CRLF vs LF (первопричина шторма re-parse).** Рабоче-древесные diff переведены с `--name-only` на `git diff --numstat --ignore-cr-at-eol`: только эта комбинация **исключает** файлы, отличающиеся лишь концом строки (индекс LF, Windows-checkout CRLF), — `--name-only` даже с флагом продолжает их перечислять (проверено на git 2.50). Это снимает ложный re-parse всех ~21000 файлов, когда команда укладывается в таймаут.
+
+### Добавлено
+- **`RLM_UPDATE_INDEX_ON_START`** (default `0`) — Docker-entrypoint по умолчанию больше **не** пересчитывает индексы при каждом старте контейнера (на Windows/Virtiofs no-op инкремент занимал минуты на проект). Значение `1` восстанавливает прежнее поведение. Индекс всегда можно обновить вручную (`rlm-bsl-index index update` / `rlm_index(action='update')`).
+- **`RLM_GIT_DIRTY_TIMEOUT`** (default `120`) — таймаут (секунды) best-effort git-команд детекта правок. Дефолт 120 выбран по натурным замерам (детект по CRLF-vs-LF дереву на Docker/Virtiofs ≈97с) — на меньшем пороге апдейт уходил бы в полный скан; для здоровых репозиториев безвреден (детект — секунды). Поднимается ещё выше для совсем крупных конфигураций на медленной ФС. **Важно:** на Windows + Docker Desktop даже 120с может не хватить (virtiofs слишком медленный) → каждый `update` идёт полным сканом (корректно, но медленно), флаг `git_dirty_unreliable` залипает в 1. Таймаут — это костыль; настоящее лечение — нормализация концов строк (`.gitattributes` с `* text=auto eol=lf`) или нативный Linux. См. [docs/INDEXING.md](docs/INDEXING.md) и [docs/INSTALL.md](docs/INSTALL.md).
+- **Наблюдаемость апдейта**: результат `index update` несёт `git_fallback_reason` (точная причина ухода в полный скан, без схлопывания в общий `"git error"`) и `rebuild_reason` (для rebuild при смене builder-версии); CLI `index update` печатает `Fast path` / `Fallback` / `Rebuild`.
+- **WARNING про возможный рассинхрон EOL** в логе полного скана, когда у git-индекса «изменилась» подозрительно большая доля модулей (>50% при ≥20 модулях) — с подсказкой про `.gitattributes` / `core.autocrlf`.
+
+### Изменено
+- Контракт `_git_changed_files` / `_git_current_dirty` → `_GitDirtyResult(paths, unreliable_reason)` (NamedTuple). Сохранение dirty-снапшота во всех 4 callsite (build пустого/обычного индекса, fallback-апдейт, git fast path) унифицировано через общий `IndexBuilder._save_dirty_snapshot(...)`.
+- `docker-entrypoint.sh`: Stage 3 (обновление индексов) обёрнут в `RLM_UPDATE_INDEX_ON_START`; Stage 2.5 (миграция legacy-индексов) не тронут.
+- Доки: `docs/ENV_REFERENCE.md` (обе новые переменные), `docs/INSTALL.md` (opt-in индексов при старте + блок-рекомендация по нормализации EOL для 1С-репозиториев под Docker), `README.md`, `docs/QUICKSTART.md`.
+
+### Тесты
+- `tests/test_git_delta.py`: контракт `_GitDirtyResult` (`.paths` / `.unreliable_reason`), `RLM_GIT_DIRTY_TIMEOUT`, схлопывание чисто-CRLF правок через `--numstat --ignore-cr-at-eol` при сохранении реальной правки, цепочка unreliable→`git_dirty_unreliable=1`→полный скан→снятие флага, выставление флага на build без прежнего снапшота, сохранение прежнего снапшота при unreliable, `git_fallback_reason` в delta.
+- `tests/test_bsl_index.py`: уточнён слишком широкий ассерт `test_update_returns_delta_stats` (числовыми остаются `added`/`changed`/`removed`; delta дополнительно несёт диагностические поля).
+
+### Обратная совместимость
+- `BUILDER_VERSION = 12` — без bump; формат индекса не менялся. Добавлен только аддитивный meta-ключ `git_dirty_unreliable`; его отсутствие в старых индексах трактуется как «надёжно» (`prev_unreliable=False`), поэтому существующие индексы продолжают использовать git fast path без изменений.
+- Без `RLM_UPDATE_INDEX_ON_START=1` Docker-контейнеры коллег перестанут тратить минуты на пересчёт индексов при старте — это намеренное изменение поведения; кому нужно прежнее — выставляют флаг.
+
 ## [1.12.0] — 2026-05-11
 
 ### Исправлено

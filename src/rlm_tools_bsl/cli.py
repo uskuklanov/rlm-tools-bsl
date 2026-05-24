@@ -195,6 +195,13 @@ def _cmd_update(args: argparse.Namespace) -> None:
     print(f"  Added:   {delta['added']}")
     print(f"  Changed: {delta['changed']}")
     print(f"  Removed: {delta['removed']}")
+    print(f"  Fast path: {delta.get('git_fast_path')}")
+    fallback_reason = delta.get("git_fallback_reason")
+    if fallback_reason:
+        print(f"  Fallback: full scan ({fallback_reason})")
+    rebuild_reason = delta.get("rebuild_reason")
+    if rebuild_reason:
+        print(f"  Rebuild: {rebuild_reason}")
     if stats.get("has_metadata"):
         print(f"  EventSubs:  {stats.get('event_subscriptions', 0)}")
         print(f"  SchedJobs:  {stats.get('scheduled_jobs', 0)}")

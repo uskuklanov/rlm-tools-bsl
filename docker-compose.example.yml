@@ -43,6 +43,14 @@ services:
       ## === Indexes ===
       # - RLM_INDEX_DIR=/home/rlm/.cache/rlm-tools-bsl
       # - RLM_INDEX_MAX_AGE_DAYS=7
+      # Update indexes of registered projects on every container start.
+      # Off by default — on Windows/Virtiofs a no-op update can take minutes.
+      # Refresh on demand instead: rlm-bsl-index index update <path>.
+      # - RLM_UPDATE_INDEX_ON_START=1
+      # Best-effort git dirty-detect timeout (seconds, default 120). Raise
+      # further for very large repos on slow filesystems so detection finishes
+      # instead of falling back to a full scan.
+      # - RLM_GIT_DIRTY_TIMEOUT=180
 
       ## === LLM for llm_query() (optional) ===
       # - RLM_LLM_BASE_URL=https://api.kilo.ai/api/gateway

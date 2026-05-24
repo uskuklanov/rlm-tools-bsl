@@ -55,10 +55,16 @@ except Exception as e:
     print(f'WARNING: legacy index migration failed: {e}', flush=True)
 " || true
 
-# --- 3. Update indexes for registered projects ---
-echo "Checking registered projects for index updates..."
+# --- 3. Update indexes for registered projects (opt-in) ---
+# Disabled by default: an unconditional update on every start is expensive on
+# Docker Desktop / Virtiofs (Windows), where a no-op incremental can take
+# several minutes per project due to slow filesystem stat/hashing. Set
+# RLM_UPDATE_INDEX_ON_START=1 to restore the previous always-update behaviour.
+# Indexes can always be refreshed on demand via `rlm-bsl-index index update`.
+if [ "${RLM_UPDATE_INDEX_ON_START:-0}" = "1" ]; then
+    echo "Checking registered projects for index updates..."
 
-PROJECTS_TO_UPDATE=$(python -c "
+    PROJECTS_TO_UPDATE=$(python -c "
 import sys
 try:
     from rlm_tools_bsl.projects import get_registry
@@ -87,11 +93,14 @@ for p in projects:
         print(f'WARNING: error checking {name}: {e}', file=sys.stderr)
 ")
 
-echo "$PROJECTS_TO_UPDATE" | while IFS=$'\t' read -r name path; do
-    [ -z "$path" ] && continue
-    echo "Updating index: $name ($path)"
-    (rlm-bsl-index index update "$path" 2>&1) || echo "WARNING: index update failed for $name"
-done
+    echo "$PROJECTS_TO_UPDATE" | while IFS=$'\t' read -r name path; do
+        [ -z "$path" ] && continue
+        echo "Updating index: $name ($path)"
+        (rlm-bsl-index index update "$path" 2>&1) || echo "WARNING: index update failed for $name"
+    done
+else
+    echo "Skipping index auto-update on start (set RLM_UPDATE_INDEX_ON_START=1 to enable)."
+fi
 
 # --- 4. Start MCP server ---
 echo "Starting rlm-tools-bsl server..."

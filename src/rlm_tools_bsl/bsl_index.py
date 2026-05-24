@@ -717,6 +717,63 @@ _GIT_SUBPROCESS_KW: dict = {
 }
 
 
+class _GitDirtyResult(NamedTuple):
+    """Result of a git dirty / changed-files detection.
+
+    *paths* — detected paths (relative to base_path). May be **incomplete**
+    when *unreliable_reason* is set.
+    *unreliable_reason* — ``None`` when the detection is trustworthy; otherwise a
+    short human-readable reason (e.g. ``"unstaged diff timeout"``) meaning a
+    best-effort command timed out / failed, so *paths* may be missing real
+    changes. Callers must then force a full scan instead of trusting the set.
+    """
+
+    paths: set[str]
+    unreliable_reason: str | None = None
+
+
+def _git_dirty_timeout() -> int:
+    """Timeout (seconds) for best-effort work-tree git commands.
+
+    Configurable via ``RLM_GIT_DIRTY_TIMEOUT``. Defaults to 120s: on slow
+    filesystems (Docker Desktop / Virtiofs on Windows) dirty detection over a
+    large CRLF-vs-LF tree was measured at ~97s, so a lower bound would push the
+    update into a full scan; 120s lets detection finish and keep the git fast
+    path. Harmless for healthy repos (detection finishes in seconds, well under
+    the ceiling). Invalid values fall back to 120.
+    """
+    try:
+        return max(1, int(os.environ.get("RLM_GIT_DIRTY_TIMEOUT", "120")))
+    except (ValueError, TypeError):
+        return 120
+
+
+def _lines_to_set(stdout: str) -> set[str]:
+    """Parse ``--name-only`` style git output (one path per line)."""
+    return {line.strip() for line in stdout.splitlines() if line.strip()}
+
+
+def _parse_numstat_paths(stdout: str) -> set[str]:
+    """Parse ``git diff --numstat`` output, returning the changed paths.
+
+    Format per line: ``<added>\\t<deleted>\\t<path>`` (binary files use ``-``).
+    Crucially, ``--numstat`` combined with ``--ignore-cr-at-eol`` **omits**
+    files whose only difference is CRLF-vs-LF, whereas ``--name-only`` still
+    lists them — so work-tree diffs use numstat to avoid re-parsing the whole
+    tree when an LF index meets a CRLF checkout.
+    """
+    paths: set[str] = set()
+    for raw in stdout.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.split("\t", 2)
+        if len(parts) == 3:
+            p = parts[2].strip()
+            if p:
+                paths.add(p)
+    return paths
+
+
 def _find_git() -> str | None:
     """Resolve git executable path (cached).
 
@@ -851,11 +908,15 @@ def _git_head_sha(base_path: str) -> str | None:
         return None
 
 
-def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> set[str] | None:
+def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDirtyResult | None:
     """Collect all files changed since *since_commit* (committed+staged+unstaged+untracked).
 
-    Paths are returned relative to *base_path* (prefix stripped).
-    Returns ``None`` on any git error (caller should fall back to full scan).
+    Returns a :class:`_GitDirtyResult` with paths relative to *base_path*
+    (prefix stripped). Returns ``None`` on a **critical** git error (caller must
+    fall back to full scan). When a best-effort work-tree command times out /
+    fails, the result's ``unreliable_reason`` is set: the path set may be
+    incomplete and the caller must force a full scan (and persist the
+    ``git_dirty_unreliable`` flag) rather than silently dropping the changes.
     """
     # Verify since_commit is an ancestor of HEAD
     cmd = _git_base_cmd(base_path)
@@ -873,27 +934,45 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> set[st
         return None
 
     base_args = [*cmd, "-c", "core.quotePath=false"]
+    best_effort_timeout = _git_dirty_timeout()
+    unreliable_reason: str | None = None
 
-    def _run_git(args: list[str], *, critical: bool = True) -> set[str] | None:
-        """Run a git command and return the set of output lines.
-
-        *critical* commands return ``None`` on failure (aborting the fast path).
-        Best-effort commands return an empty set on timeout/error — their files
-        will be picked up via the dirty snapshot on the next update.
-        """
+    def _run_critical(args: list[str]) -> set[str] | None:
+        """Run a critical git command; ``None`` on failure aborts the fast path."""
         try:
             r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=60)
             if r.returncode != 0:
-                if not critical:
-                    logger.info("_git_changed_files: best-effort cmd rc=%d, skipping", r.returncode)
-                    return set()
                 return None
-            return {line.strip() for line in r.stdout.splitlines() if line.strip()}
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            if not critical:
-                logger.info("_git_changed_files: best-effort cmd %s, skipping", type(exc).__name__)
-                return set()
+            return _lines_to_set(r.stdout)
+        except (subprocess.TimeoutExpired, OSError):
             return None
+
+    def _run_best_effort(args: list[str], label: str, parser=_lines_to_set) -> set[str]:
+        """Run a best-effort work-tree git command.
+
+        On timeout/error the failing command's files are skipped, but
+        *unreliable_reason* is set so the caller forces a full scan instead of
+        silently losing uncommitted changes.
+        """
+        nonlocal unreliable_reason
+        try:
+            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            if r.returncode != 0:
+                logger.info("_git_changed_files: %s rc=%d, marking unreliable", label, r.returncode)
+                if unreliable_reason is None:
+                    unreliable_reason = f"{label} rc={r.returncode}"
+                return set()
+            return parser(r.stdout)
+        except subprocess.TimeoutExpired:
+            logger.info("_git_changed_files: %s timeout, marking unreliable", label)
+            if unreliable_reason is None:
+                unreliable_reason = f"{label} timeout"
+            return set()
+        except OSError as exc:
+            logger.info("_git_changed_files: %s %s, marking unreliable", label, type(exc).__name__)
+            if unreliable_reason is None:
+                unreliable_reason = f"{label} error"
+            return set()
 
     def _strip_prefix(paths: set[str]) -> set[str]:
         """Strip git-root prefix to get paths relative to base_path."""
@@ -907,7 +986,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> set[st
         return result
 
     # 1: committed diff — CRITICAL (compares git objects, no FS access, always fast).
-    committed = _run_git(
+    committed = _run_critical(
         [
             *base_args,
             "diff",
@@ -920,7 +999,6 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> set[st
             "--",
             ".",
         ],
-        critical=True,
     )
     if committed is None:
         return None
@@ -928,53 +1006,123 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> set[st
     # 2-3: staged & unstaged diff — BEST-EFFORT.
     # These commands stat() every file in the work-tree which can exceed the
     # subprocess timeout on Docker Desktop / Virtiofs with large projects.
-    # On timeout the files are silently skipped — they will be captured by the
-    # dirty snapshot and force-included in the next update's delta.
-    staged = _run_git(
-        [*base_args, "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--cached", "--", "."],
-        critical=False,
+    # We use --numstat (not --name-only) together with --ignore-cr-at-eol: only
+    # this combination OMITS files whose sole difference is CRLF-vs-LF (index LF,
+    # Windows checkout CRLF). --name-only still lists such files even with the
+    # flag, which would re-parse the whole tree. (git still reads the files, so
+    # the command may still time out → unreliable → full scan.)
+    staged = _run_best_effort(
+        [
+            *base_args,
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-cr-at-eol",
+            "--cached",
+            "--",
+            ".",
+        ],
+        "staged diff",
+        parser=_parse_numstat_paths,
     )
-    unstaged = _run_git(
-        [*base_args, "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--", "."],
-        critical=False,
+    unstaged = _run_best_effort(
+        [
+            *base_args,
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-cr-at-eol",
+            "--",
+            ".",
+        ],
+        "unstaged diff",
+        parser=_parse_numstat_paths,
     )
 
     git_root_paths = committed | staged | unstaged
 
     # 4: untracked files — BEST-EFFORT (same Virtiofs concern).
     # ls-files returns paths relative to -C directory (base_path) → no prefix stripping.
-    ls_paths = _run_git(
+    ls_paths = _run_best_effort(
         [*base_args, "ls-files", "--others", "--exclude-standard"],
-        critical=False,
+        "untracked",
     )
 
-    return _strip_prefix(git_root_paths) | ls_paths
+    return _GitDirtyResult(_strip_prefix(git_root_paths) | ls_paths, unreliable_reason)
 
 
-def _git_current_dirty(base_path: str, prefix: str) -> set[str]:
-    """Return files currently in dirty state (staged+unstaged+untracked), prefix-stripped."""
+def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
+    """Return files currently dirty (staged+unstaged+untracked), prefix-stripped.
+
+    Returns a :class:`_GitDirtyResult`. When a command times out / fails the
+    result's ``unreliable_reason`` is set so callers can avoid overwriting a
+    previously-good dirty snapshot with a partial one and can raise the
+    ``git_dirty_unreliable`` flag.
+    """
     cmd = _git_base_cmd(base_path)
     if cmd is None:
-        return set()
+        return _GitDirtyResult(set(), None)
     base_args = [*cmd, "-c", "core.quotePath=false"]
+    best_effort_timeout = _git_dirty_timeout()
+    unreliable_reason: str | None = None
 
-    def _run(cmd: list[str]) -> set[str]:
+    def _run(cmd: list[str], label: str, parser=_lines_to_set) -> set[str]:
+        nonlocal unreliable_reason
         try:
-            r = subprocess.run(cmd, **_GIT_SUBPROCESS_KW, timeout=60)
+            r = subprocess.run(cmd, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
             if r.returncode == 0:
-                return {line.strip() for line in r.stdout.splitlines() if line.strip()}
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+                return parser(r.stdout)
+            if unreliable_reason is None:
+                unreliable_reason = f"{label} rc={r.returncode}"
+        except subprocess.TimeoutExpired:
+            if unreliable_reason is None:
+                unreliable_reason = f"{label} timeout"
+        except OSError:
+            if unreliable_reason is None:
+                unreliable_reason = f"{label} error"
         return set()
 
     # diff returns paths relative to git root → need prefix stripping.
     # "-- ." limits scope to base_path subtree (see _git_changed_files comment).
+    # --numstat + --ignore-cr-at-eol: don't treat CRLF-vs-LF-only diffs as dirty
+    # (see _parse_numstat_paths — --name-only would still list such files).
     diff_paths = _run(
-        [*base_args, "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--cached", "--", "."]
+        [
+            *base_args,
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-cr-at-eol",
+            "--cached",
+            "--",
+            ".",
+        ],
+        "staged dirty",
+        parser=_parse_numstat_paths,
     )
-    diff_paths |= _run([*base_args, "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--", "."])
+    diff_paths |= _run(
+        [
+            *base_args,
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-cr-at-eol",
+            "--",
+            ".",
+        ],
+        "unstaged dirty",
+        parser=_parse_numstat_paths,
+    )
     # ls-files returns paths relative to -C directory → already correct
-    ls_paths = _run([*base_args, "ls-files", "--others", "--exclude-standard"])
+    ls_paths = _run([*base_args, "ls-files", "--others", "--exclude-standard"], "untracked dirty")
 
     stripped: set[str] = set()
     if prefix:
@@ -985,7 +1133,7 @@ def _git_current_dirty(base_path: str, prefix: str) -> set[str]:
     else:
         stripped = diff_paths
 
-    return stripped | ls_paths
+    return _GitDirtyResult(stripped | ls_paths, unreliable_reason)
 
 
 # ---------------------------------------------------------------------------
@@ -4602,6 +4750,45 @@ _FORM_ELEMENTS_INSERT = (
 class IndexBuilder:
     """Builds and incrementally updates the SQLite method index."""
 
+    @staticmethod
+    def _save_dirty_snapshot(
+        conn: sqlite3.Connection,
+        base_path: str,
+        prefix: str,
+        *,
+        preserve_on_unreliable: bool,
+    ) -> str | None:
+        """Persist the git dirty snapshot together with its reliability flag.
+
+        On a **reliable** detection: stores ``git_dirty_paths`` and clears
+        ``git_dirty_unreliable`` (=0) so the next update may use the git fast path.
+
+        On an **unreliable** detection (best-effort command timed out / failed):
+        sets ``git_dirty_unreliable`` (=1) so the next update is forced into a
+        correct full scan. When *preserve_on_unreliable* (update callsites, a
+        previous good snapshot exists) the stale-but-good ``git_dirty_paths`` is
+        kept intact rather than overwritten with a partial set; otherwise (fresh
+        build, no prior snapshot) the partial set is stored as best-effort info.
+
+        Returns the unreliable reason (or ``None`` when reliable).
+        """
+        result = _git_current_dirty(base_path, prefix)
+        if result.unreliable_reason is not None:
+            conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('git_dirty_unreliable', '1')")
+            if not preserve_on_unreliable:
+                conn.execute(
+                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                    ("git_dirty_paths", json.dumps(sorted(result.paths), ensure_ascii=False)),
+                )
+            logger.info("dirty snapshot unreliable (%s) — git_dirty_unreliable=1", result.unreliable_reason)
+            return result.unreliable_reason
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            ("git_dirty_paths", json.dumps(sorted(result.paths), ensure_ascii=False)),
+        )
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('git_dirty_unreliable', '0')")
+        return None
+
     def build(
         self,
         base_path: str,
@@ -4702,11 +4889,9 @@ class IndexBuilder:
                     repo_info = _git_repo_info(base_path)
                     if repo_info:
                         _, pfx = repo_info
-                        dirty_now = _git_current_dirty(base_path, pfx)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                            ("git_dirty_paths", json.dumps(sorted(dirty_now), ensure_ascii=False)),
-                        )
+                        # Fresh build: no prior snapshot to preserve. On unreliable
+                        # detection the flag forces a full scan on the first update.
+                        self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=False)
             conn.commit()
             conn.close()
             return db_path
@@ -4892,15 +5077,12 @@ class IndexBuilder:
                     "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                     ("git_head_commit", head),
                 )
-                # Save dirty snapshot for dirty→clean detection
+                # Save dirty snapshot for dirty→clean detection.
+                # Fresh build: no prior snapshot to preserve.
                 repo_info = _git_repo_info(base_path)
                 if repo_info:
                     _, pfx = repo_info
-                    dirty_now = _git_current_dirty(base_path, pfx)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                        ("git_dirty_paths", json.dumps(sorted(dirty_now), ensure_ascii=False)),
-                    )
+                    self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=False)
                 conn.commit()
 
         conn.execute("ANALYZE")
@@ -4986,24 +5168,42 @@ class IndexBuilder:
                 "changed": 0,
                 "removed": 0,
                 "git_fast_path": False,
+                "rebuild_reason": f"schema upgrade v{old_version}->{BUILDER_VERSION}",
             }
 
         # --- Git fast path attempt ---
-        force_full_scan = old_version != BUILDER_VERSION and old_version >= 8
+        version_mismatch = old_version != BUILDER_VERSION and old_version >= 8
+        # A previously-unreliable dirty snapshot means uncommitted changes may
+        # never have been indexed → force a correct full scan to catch up.
+        unreliable_row = conn.execute("SELECT value FROM index_meta WHERE key = 'git_dirty_unreliable'").fetchone()
+        prev_unreliable = unreliable_row is not None and unreliable_row["value"] == "1"
+        force_full_scan = version_mismatch or prev_unreliable
         fallback_reason = ""
+        # A git-tracked index (stored commit present) — used to flag a
+        # suspiciously high dirty ratio in the full-scan branch as a probable EOL
+        # mismatch rather than silent slowness. Read from meta (cheap, no git
+        # call) so it also covers the version-mismatch / prev-unreliable paths.
+        stored_commit_row = conn.execute("SELECT value FROM index_meta WHERE key = 'git_head_commit'").fetchone()
+        stored_commit = stored_commit_row["value"] if stored_commit_row else None
+        git_tracked = stored_commit is not None
 
         if not force_full_scan:
-            stored_commit_row = conn.execute("SELECT value FROM index_meta WHERE key = 'git_head_commit'").fetchone()
-            stored_commit = stored_commit_row["value"] if stored_commit_row else None
-
             if stored_commit and _git_available(base_path):
                 repo_info = _git_repo_info(base_path)
                 if repo_info:
                     git_root, prefix = repo_info
                     git_head = _git_head_sha(base_path)
-                    git_changed = _git_changed_files(base_path, stored_commit, prefix)
+                    git_result = _git_changed_files(base_path, stored_commit, prefix)
 
-                    if git_changed is not None and git_head is not None:
+                    if git_result is None or git_head is None:
+                        fallback_reason = "git error" if git_result is None else "head sha error"
+                    elif git_result.unreliable_reason is not None:
+                        # Best-effort detection timed out — the change set is
+                        # partial and must NOT be trusted. Fall through to a full
+                        # scan; the unreliable flag is (re)persisted there.
+                        fallback_reason = git_result.unreliable_reason
+                    else:
+                        git_changed = git_result.paths
                         # Merge previously-dirty files into delta
                         stored_dirty_row = conn.execute(
                             "SELECT value FROM index_meta WHERE key = 'git_dirty_paths'"
@@ -5029,17 +5229,17 @@ class IndexBuilder:
                         conn.close()
                         elapsed = time.time() - t0
                         logger.info("Git fast path update done in %.1fs", elapsed)
-                        return {**delta, "git_fast_path": True}
-                    else:
-                        fallback_reason = "git error" if git_changed is None else "head sha error"
+                        return {**delta, "git_fast_path": True, "git_fallback_reason": None}
                 else:
                     fallback_reason = "repo info error"
             elif not stored_commit:
                 fallback_reason = "no stored commit"
             else:
                 fallback_reason = "no git"
-        else:
+        elif version_mismatch:
             fallback_reason = "builder version mismatch"
+        else:  # prev_unreliable
+            fallback_reason = "prev dirty unreliable"
 
         if fallback_reason:
             logger.info("Git fast path unavailable (%s), using full scan", fallback_reason)
@@ -5078,6 +5278,19 @@ class IndexBuilder:
                     changed_paths.add(rel)
             except OSError:
                 changed_paths.add(rel)
+
+        # EOL-mismatch heuristic: in a git repo a full scan that finds most
+        # tracked modules "changed" by size/mtime almost always means the index
+        # was built with LF but the work-tree is CRLF (or vice-versa). Surface
+        # the likely cause instead of letting it look like silent slowness.
+        if git_tracked and len(common_paths) >= 20 and len(changed_paths) > 0.5 * len(common_paths):
+            logger.warning(
+                "Suspiciously high dirty ratio (%d/%d modules changed): possible EOL mismatch "
+                "(index LF vs worktree CRLF). Consider normalizing line endings via "
+                ".gitattributes (* text=auto eol=lf) or core.autocrlf so git can skip rehashing.",
+                len(changed_paths),
+                len(common_paths),
+            )
 
         to_remove = removed_paths | changed_paths
         to_add = added_paths | changed_paths
@@ -5466,7 +5679,11 @@ class IndexBuilder:
             ("version", str(BUILDER_VERSION)),
         )
 
-        # Save git_head_commit on fallback so NEXT update can use git fast path
+        # Save git_head_commit on fallback so NEXT update can use git fast path.
+        # The full scan already made the index correct; here we only refresh the
+        # dirty snapshot. If the snapshot can't be captured reliably, keep the
+        # previous good one (preserve_on_unreliable) and raise the flag so the
+        # next update full-scans again instead of trusting a partial set.
         if _git_available(base_path):
             head = _git_head_sha(base_path)
             if head:
@@ -5477,11 +5694,7 @@ class IndexBuilder:
                 repo_info = _git_repo_info(base_path)
                 if repo_info:
                     _, pfx = repo_info
-                    dirty_now = _git_current_dirty(base_path, pfx)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                        ("git_dirty_paths", json.dumps(sorted(dirty_now), ensure_ascii=False)),
-                    )
+                    self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=True)
 
         conn.commit()
         conn.execute("ANALYZE")
@@ -5495,6 +5708,7 @@ class IndexBuilder:
             "changed": len(changed_paths),
             "removed": len(removed_paths),
             "git_fast_path": False,
+            "git_fallback_reason": fallback_reason or None,
         }
 
     def _update_git_fast(
@@ -5864,16 +6078,14 @@ class IndexBuilder:
                 ("extension_overrides_count", str(len(override_rows))),
             )
 
-        # Save git_head_commit + dirty snapshot
+        # Save git_head_commit + dirty snapshot. On an unreliable snapshot keep
+        # the previous good one and raise git_dirty_unreliable so the next update
+        # full-scans; on a reliable snapshot the flag is cleared.
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("git_head_commit", git_head),
         )
-        dirty_now = _git_current_dirty(base_path, prefix)
-        conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-            ("git_dirty_paths", json.dumps(sorted(dirty_now), ensure_ascii=False)),
-        )
+        self._save_dirty_snapshot(conn, base_path, prefix, preserve_on_unreliable=True)
 
         # Telemetry — одна INFO-строка с агрегатами pointwise/fallback.
         logger.info(
