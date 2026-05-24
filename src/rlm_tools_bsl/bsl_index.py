@@ -4242,6 +4242,24 @@ def _iter_metadata_xml_files(
             return
         results.append((cat, obj_name, rel))
 
+    def _pick_object_metadata_xml(ext_dir: Path) -> Path | None:
+        """Pick an object's metadata XML from its ``Ext/`` directory, deterministically.
+
+        ``iterdir()`` order is filesystem-dependent, so we sort by name for
+        reproducibility AND skip ``Predefined.xml`` — it holds predefined items,
+        never the object's metadata (attributes/synonyms). Picking it as the
+        object locator made ``find_attributes`` return ``[]`` on filesystems
+        where ``Predefined.xml`` happened to sort before the object XML (this is
+        a fallback path; real CF dumps use a sibling ``Obj.xml`` and EDT uses
+        ``Obj.mdo``, both handled before this branch).
+        """
+        if not ext_dir.is_dir():
+            return None
+        for xml in sorted(ext_dir.iterdir(), key=lambda p: p.name):
+            if xml.suffix.lower() == ".xml" and xml.name.lower() != "predefined.xml" and xml.is_file():
+                return xml
+        return None
+
     def _collect_category(cat: str) -> list[tuple[str, str, str]]:
         results: list[tuple[str, str, str]] = []
         cat_dir = base / cat
@@ -4253,7 +4271,7 @@ def _iter_metadata_xml_files(
             return results
 
         seen: set[str] = set()
-        for obj_dir in cat_dir.iterdir():
+        for obj_dir in sorted(cat_dir.iterdir(), key=lambda p: p.name):
             if not obj_dir.is_dir():
                 continue
             mdo = obj_dir / f"{obj_dir.name}.mdo"
@@ -4266,15 +4284,12 @@ def _iter_metadata_xml_files(
                 _emit(sibling_xml, cat, obj_dir.name, results)
                 seen.add(obj_dir.name)
                 continue
-            ext_dir = obj_dir / "Ext"
-            if ext_dir.is_dir():
-                for xml in ext_dir.iterdir():
-                    if xml.suffix.lower() == ".xml" and xml.is_file():
-                        _emit(xml, cat, obj_dir.name, results)
-                        seen.add(obj_dir.name)
-                        break
+            ext_xml = _pick_object_metadata_xml(obj_dir / "Ext")
+            if ext_xml is not None:
+                _emit(ext_xml, cat, obj_dir.name, results)
+                seen.add(obj_dir.name)
 
-        for fp in cat_dir.iterdir():
+        for fp in sorted(cat_dir.iterdir(), key=lambda p: p.name):
             if not fp.is_file() or fp.suffix.lower() != ".xml":
                 continue
             obj_name = fp.stem
@@ -4291,7 +4306,7 @@ def _iter_metadata_xml_files(
         results: list[tuple[str, str, str]],
     ) -> None:
         seen: set[str] = set()
-        for obj_dir in parent_dir.iterdir():
+        for obj_dir in sorted(parent_dir.iterdir(), key=lambda p: p.name):
             if not obj_dir.is_dir():
                 continue
             mdo = obj_dir / f"{obj_dir.name}.mdo"
@@ -4304,18 +4319,15 @@ def _iter_metadata_xml_files(
                     _emit(sibling_xml, cat, obj_dir.name, results)
                     seen.add(obj_dir.name)
                 else:
-                    ext_dir = obj_dir / "Ext"
-                    if ext_dir.is_dir():
-                        for xml in ext_dir.iterdir():
-                            if xml.suffix.lower() == ".xml" and xml.is_file():
-                                _emit(xml, cat, obj_dir.name, results)
-                                seen.add(obj_dir.name)
-                                break
+                    ext_xml = _pick_object_metadata_xml(obj_dir / "Ext")
+                    if ext_xml is not None:
+                        _emit(ext_xml, cat, obj_dir.name, results)
+                        seen.add(obj_dir.name)
             nested = obj_dir / "Subsystems"
             if nested.is_dir():
                 _collect_subsystems_recursive(nested, cat, results)
 
-        for fp in parent_dir.iterdir():
+        for fp in sorted(parent_dir.iterdir(), key=lambda p: p.name):
             if not fp.is_file() or fp.suffix.lower() != ".xml":
                 continue
             obj_name = fp.stem

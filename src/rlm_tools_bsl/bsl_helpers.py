@@ -3717,9 +3717,16 @@ def make_bsl_helpers(
                 if rel.endswith(".mdo"):
                     candidates.append(rel)
                 else:
-                    ext_obj_dir = os.path.dirname(rel).replace("\\", "/")
-                    if ext_obj_dir.endswith("/Ext"):
-                        ext_obj_dir = ext_obj_dir[: -len("/Ext")]
+                    # Derive the object dir from the locator, which may be either
+                    # a sibling Cat/Name.xml (real CF/CFE dump) or Cat/Name/Ext/<Type>.xml.
+                    rel_p = rel.replace("\\", "/")
+                    parent = os.path.dirname(rel_p)
+                    if parent.endswith("/Ext"):
+                        ext_obj_dir = parent[: -len("/Ext")]
+                    elif rel_p.lower().endswith(".xml"):
+                        ext_obj_dir = rel_p[:-4]  # strip ".xml" → object dir
+                    else:
+                        ext_obj_dir = ""
                     if ext_obj_dir:
                         candidates.append(f"{ext_obj_dir}/Ext/Predefined.xml")
         return candidates

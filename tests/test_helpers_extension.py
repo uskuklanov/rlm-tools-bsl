@@ -195,8 +195,11 @@ def _make_main_with_extension(parent_dir):
         os.path.join(cfe, "CommonModules", "ExtOnlyModule", "Ext", "Module.bsl"),
         _EXT_MODULE_BSL,
     )
+    # Object metadata is a SIBLING Catalogs/<Name>.xml — the real CF/CFE dump
+    # layout (verified against real CF, CFE and EDT sources). Ext/ holds only
+    # modules + Predefined.xml.
     _write(
-        os.path.join(cfe, "Catalogs", "ExtCatalog", "Ext", "Catalog.xml"),
+        os.path.join(cfe, "Catalogs", "ExtCatalog.xml"),
         _EXT_CATALOG_XML,
     )
     _write(
@@ -207,14 +210,16 @@ def _make_main_with_extension(parent_dir):
         os.path.join(cfe, "Catalogs", "ExtCatalog", "Ext", "ObjectModule.bsl"),
         "Процедура ExtCatHandler() Экспорт\nКонецПроцедуры\n",
     )
-    # XML-only Subsystem (no <Synonym>) — tests metadata-XML pass.
+    # XML-only Subsystem (no <Synonym>) — kept under Ext/ on purpose to exercise
+    # the (now order-independent) Ext/*.xml fallback branch of
+    # _iter_metadata_xml_files.
     _write(
         os.path.join(cfe, "Subsystems", "ExtSubsystemNoSyn", "Ext", "Subsystem.xml"),
         _EXT_SUBSYSTEM_XML,
     )
-    # XML-only Catalog (no .bsl module) — tests bare-name auto-resolve.
+    # XML-only Catalog (no .bsl module) — sibling metadata, only Predefined.xml in Ext/.
     _write(
-        os.path.join(cfe, "Catalogs", "ExtCatNoModule", "Ext", "Catalog.xml"),
+        os.path.join(cfe, "Catalogs", "ExtCatNoModule.xml"),
         _EXT_CATALOG_NO_MODULE_XML,
     )
     _write(
@@ -638,3 +643,49 @@ class TestMainOnlyRegression:
             assert any(m.startswith("../") for m in mods), mods
         finally:
             reader.close()
+
+
+class TestMetadataXmlDiscoveryFallback:
+    """Regression: the Ext/*.xml fallback of _iter_metadata_xml_files must be
+    order-independent and never pick Predefined.xml as the object metadata
+    locator. A GitHub ubuntu-latest readdir-order change once made it pick
+    Predefined.xml first → find_attributes returned []. Real CF/CFE use a
+    sibling Obj.xml and EDT uses Obj.mdo, but the fallback must be robust too.
+    """
+
+    @staticmethod
+    def _make_ext_only_catalog(root):
+        # Object whose metadata sits inside Ext/ with NO sibling and NO .mdo,
+        # alongside Predefined.xml — the exact layout that triggered the bug.
+        ext_dir = os.path.join(root, "Catalogs", "Obj", "Ext")
+        os.makedirs(ext_dir)
+        _write(os.path.join(ext_dir, "Catalog.xml"), _EXT_CATALOG_XML)
+        _write(os.path.join(ext_dir, "Predefined.xml"), _EXT_PREDEFINED_XML)
+
+    def test_fallback_picks_object_xml_not_predefined(self, tmp_path):
+        from rlm_tools_bsl.bsl_index import _iter_metadata_xml_files
+
+        self._make_ext_only_catalog(str(tmp_path))
+        locators = _iter_metadata_xml_files(str(tmp_path))
+        obj = [(c, o, rel) for (c, o, rel) in locators if c == "Catalogs" and o == "Obj"]
+        assert len(obj) == 1, locators
+        rel = obj[0][2]
+        assert rel.endswith("Catalog.xml"), rel
+        assert "Predefined.xml" not in rel
+
+    def test_fallback_order_independent_reverse_iterdir(self, tmp_path, monkeypatch):
+        """Force reverse iterdir (Predefined.xml first) — the CI failure condition."""
+        import pathlib
+
+        from rlm_tools_bsl.bsl_index import _iter_metadata_xml_files
+
+        self._make_ext_only_catalog(str(tmp_path))
+        _orig = pathlib.Path.iterdir
+        monkeypatch.setattr(
+            pathlib.Path,
+            "iterdir",
+            lambda self: iter(sorted(_orig(self), key=lambda p: p.name, reverse=True)),
+        )
+        locators = _iter_metadata_xml_files(str(tmp_path))
+        rel = next(rel for (c, o, rel) in locators if c == "Catalogs" and o == "Obj")
+        assert rel.endswith("Catalog.xml"), rel
