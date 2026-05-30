@@ -168,7 +168,7 @@ Step 2 — READ: understand the code
   find_exports(path) → exported API of a module
 
 Step 3 — TRACE: follow the call chains
-  find_callers_context(proc, hint) → who calls this procedure (1 уровень + контекст вызова)
+  find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
   find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
   safe_grep(pattern, hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
@@ -459,31 +459,41 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "ссылки": {
         "compact": [
-            "find_references_to_object('Справочник.Имя') → unified reverse-index",
-            "Print res['by_kind'] и первые 20 references",
+            "find_references_to_object('Справочник.Имя') → метаданные-XML ссылки (типы, владелец, подсистемы, права…)",
+            "find_code_usages('Документ.Имя') → ОБРАЩЕНИЯ В КОДЕ (Документы.X, \"ДокументСсылка.X\", запросы Документ.X.ТЧ)",
+            "Нужны оба сразу — find_references_to_object('Документ.Имя', include_code=True)",
             "Если объект упоминается через DefinedType — find_defined_types('Имя') раскроет составляющие",
         ],
         "full": [
-            "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')",
+            "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')  # метаданные-XML",
             "print(res['by_kind'], res['total'])",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
-            "Если res['partial'] — индекс старый (v11), запустить rlm_index(action='build')",
+            "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')  # обращения в коде",
+            "print(code['by_kind'])  # {'manager':.., 'ref_type':.., 'query':..}; u['member'] = имя ТЧ для query",
+            "Filter by kind: find_code_usages('Документ.Х', kind='query') — только обращения к ТЧ/реквизитам в запросах",
+            "Полная картина одним вызовом: find_references_to_object('Документ.Х', include_code=True) → + ключи code_*",
+            "Если res['partial'] / code['partial'] — индекс старый, запустить rlm_index(action='build')",
             "Если объект упоминается через DefinedType — find_defined_types('ИмяТипа') раскроет составляющие; затем find_references_to_object('DefinedType.Имя') найдёт обратные использования",
-            "Аналог конфигуратора 'Найти ссылки → В свойствах' — issue #10",
+            "Аналог конфигуратора 'Найти ссылки' (XML — issue #10; код — v1.14.0). Код расширений вне индекса.",
         ],
         "code_hint": (
-            "# Поиск всех мест использования объекта:\n"
+            "# 1) Декларативные ссылки из метаданных-XML:\n"
             "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')\n"
-            "print(f\"total={res['total']} truncated={res['truncated']} partial={res['partial']}\")\n"
+            "print(f\"meta total={res['total']} partial={res['partial']}\")\n"
             "print('by_kind:', res['by_kind'])\n"
-            "for r in res['references'][:20]:\n"
-            "    print(f\"  {r['kind']:25s} {r['used_in']} ({r['path']})\")\n"
-            "# Раскрыть DefinedType:\n"
+            "# 2) Обращения В КОДЕ (обратный поиск использований):\n"
+            "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')\n"
+            "print(f\"code total={code['total']} by_kind={code['by_kind']}\")\n"
+            "for u in code['usages'][:20]:\n"
+            "    tail = f\" .{u['member']}\" if u['member'] else ''\n"
+            "    print(f\"  {u['kind']:8s} {u['path']}:{u['line']}{tail}\")\n"
+            "# 3) Метаданные + код в одном вызове:\n"
+            "full = find_references_to_object('Документ.ПриобретениеТоваровУслуг', include_code=True)\n"
+            "print(full['total'], full['code_total'], full['code_by_kind'])\n"
+            "# Раскрыть DefinedType и найти обратные использования:\n"
             "dt = find_defined_types('ДенежнаяСумма')\n"
-            "print('DefinedType содержит:', dt['types'])\n"
-            "# Где этот DefinedType используется:\n"
             "refs = find_references_to_object('DefinedType.ДенежнаяСумма')\n"
-            "print(refs['by_kind'])"
+            "print(dt['types'], refs['by_kind'])"
         ),
     },
     "перечисления": {
@@ -663,6 +673,13 @@ _RECIPE_ALIASES: dict[str, str] = {
     "поиск ссылок": "ссылки",
     "в свойствах": "ссылки",
     "вхождения": "ссылки",
+    "где используется в коде": "ссылки",
+    "использования в коде": "ссылки",
+    "обращения к объекту": "ссылки",
+    "обращения в коде": "ссылки",
+    "code usages": "ссылки",
+    "использования тч": "ссылки",
+    "тч в запросах": "ссылки",
     # «проведение»
     "движения": "проведение",
     "регистры документа": "проведение",

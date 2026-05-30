@@ -52,7 +52,7 @@ Step 2 — READ: understand the code
   find_exports(path) → exported API of a module
 
 Step 3 — TRACE: follow the call chains
-  find_callers_context(proc, hint) → who calls this procedure (1 уровень + контекст вызова)
+  find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
   find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
   safe_grep(pattern, hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
@@ -190,5 +190,13 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "when_b": "search_X() — точная типизация: поля специфичны (для search_methods → is_export, rank; для search_objects → category, synonym).",
         "rule": "Используй search для discovery; search_X — когда нужны типизированные поля для batch обработки. (Тэги покрывают и search_objects, и search_regions, и search_module_headers — фильтр rlm_help(helpers=['search_objects']) даст эту же запись.)",
         "tags": ["search", "discovery"],
+    },
+    {
+        "pair": ("find_references_to_object", "find_code_usages"),
+        "summary": "metadata-XML references vs in-code usages",
+        "when_a": "find_references_to_object — ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов, владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код модулей НЕ сканирует.",
+        "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.',
+        "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные и код расширений — вне охвата find_code_usages.",
+        "tags": ["references", "code", "usages"],
     },
 ]

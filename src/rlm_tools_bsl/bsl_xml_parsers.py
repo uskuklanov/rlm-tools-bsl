@@ -288,6 +288,221 @@ def canonicalize_type_ref(type_str: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Russian/English metadata FORMS for reverse code-usage extraction (v1.14.0)
+#
+# Single source of truth for the code-derived `metadata_code_usages` table:
+#   - ``plural`` (RU/EN)   — collection manager accessor in code:
+#                            ``Документы.X`` / ``Documents.X`` -> usage_kind 'manager'
+#   - ``singular`` (RU/EN) — metadata path inside a query string literal:
+#                            ``Документ.X`` / ``Документ.X.Товары`` -> usage_kind 'query'
+#   - ``reftypes`` (RU)    — string-literal reference type prefixes:
+#                            ``"ДокументСсылка.X"`` -> usage_kind 'ref_type'
+#                            (EN reftypes like ``DocumentRef.`` are covered by
+#                            canonicalize_type_ref — do NOT duplicate them here).
+#
+# IMPORTANT: Russian plural/reftype forms are irregular (РегистрСведений ->
+# РегистрыСведений, Обработка -> Обработки) — they are NOT derived by a rule and
+# must be listed explicitly. Only categories reachable via a manager collection
+# in code are included; metadata-only categories (Subsystem, Role, …) are NOT
+# code-addressable and are intentionally out of this table.
+_RU_META_FORMS: dict[str, dict] = {
+    "Catalog.": {
+        "ru_singular": "Справочник",
+        "ru_plural": "Справочники",
+        "en_singular": "Catalog",
+        "en_plural": "Catalogs",
+        "reftypes": ["СправочникСсылка", "СправочникОбъект", "СправочникМенеджер"],
+    },
+    "Document.": {
+        "ru_singular": "Документ",
+        "ru_plural": "Документы",
+        "en_singular": "Document",
+        "en_plural": "Documents",
+        "reftypes": ["ДокументСсылка", "ДокументОбъект", "ДокументМенеджер"],
+    },
+    "Enum.": {
+        "ru_singular": "Перечисление",
+        "ru_plural": "Перечисления",
+        "en_singular": "Enum",
+        "en_plural": "Enums",
+        "reftypes": ["ПеречислениеСсылка", "ПеречислениеМенеджер"],
+    },
+    "InformationRegister.": {
+        "ru_singular": "РегистрСведений",
+        "ru_plural": "РегистрыСведений",
+        "en_singular": "InformationRegister",
+        "en_plural": "InformationRegisters",
+        "reftypes": [
+            "РегистрСведенийЗапись",
+            "РегистрСведенийКлючЗаписи",
+            "РегистрСведенийМенеджер",
+            "РегистрСведенийНаборЗаписей",
+        ],
+    },
+    "AccumulationRegister.": {
+        "ru_singular": "РегистрНакопления",
+        "ru_plural": "РегистрыНакопления",
+        "en_singular": "AccumulationRegister",
+        "en_plural": "AccumulationRegisters",
+        "reftypes": [
+            "РегистрНакопленияЗапись",
+            "РегистрНакопленияКлючЗаписи",
+            "РегистрНакопленияМенеджер",
+            "РегистрНакопленияНаборЗаписей",
+        ],
+    },
+    "AccountingRegister.": {
+        "ru_singular": "РегистрБухгалтерии",
+        "ru_plural": "РегистрыБухгалтерии",
+        "en_singular": "AccountingRegister",
+        "en_plural": "AccountingRegisters",
+        "reftypes": [
+            "РегистрБухгалтерииЗапись",
+            "РегистрБухгалтерииКлючЗаписи",
+            "РегистрБухгалтерииМенеджер",
+            "РегистрБухгалтерииНаборЗаписей",
+        ],
+    },
+    "CalculationRegister.": {
+        "ru_singular": "РегистрРасчета",
+        "ru_plural": "РегистрыРасчета",
+        "en_singular": "CalculationRegister",
+        "en_plural": "CalculationRegisters",
+        "reftypes": [
+            "РегистрРасчетаЗапись",
+            "РегистрРасчетаКлючЗаписи",
+            "РегистрРасчетаМенеджер",
+            "РегистрРасчетаНаборЗаписей",
+        ],
+    },
+    "ChartOfCharacteristicTypes.": {
+        "ru_singular": "ПланВидовХарактеристик",
+        "ru_plural": "ПланыВидовХарактеристик",
+        "en_singular": "ChartOfCharacteristicTypes",
+        "en_plural": "ChartsOfCharacteristicTypes",
+        "reftypes": [
+            "ПланВидовХарактеристикСсылка",
+            "ПланВидовХарактеристикОбъект",
+            "ПланВидовХарактеристикМенеджер",
+        ],
+    },
+    "ChartOfAccounts.": {
+        "ru_singular": "ПланСчетов",
+        "ru_plural": "ПланыСчетов",
+        "en_singular": "ChartOfAccounts",
+        "en_plural": "ChartsOfAccounts",
+        "reftypes": ["ПланСчетовСсылка", "ПланСчетовОбъект", "ПланСчетовМенеджер"],
+    },
+    "ChartOfCalculationTypes.": {
+        "ru_singular": "ПланВидовРасчета",
+        "ru_plural": "ПланыВидовРасчета",
+        "en_singular": "ChartOfCalculationTypes",
+        "en_plural": "ChartsOfCalculationTypes",
+        "reftypes": [
+            "ПланВидовРасчетаСсылка",
+            "ПланВидовРасчетаОбъект",
+            "ПланВидовРасчетаМенеджер",
+        ],
+    },
+    "ExchangePlan.": {
+        "ru_singular": "ПланОбмена",
+        "ru_plural": "ПланыОбмена",
+        "en_singular": "ExchangePlan",
+        "en_plural": "ExchangePlans",
+        "reftypes": ["ПланОбменаСсылка", "ПланОбменаОбъект", "ПланОбменаМенеджер"],
+    },
+    "BusinessProcess.": {
+        "ru_singular": "БизнесПроцесс",
+        "ru_plural": "БизнесПроцессы",
+        "en_singular": "BusinessProcess",
+        "en_plural": "BusinessProcesses",
+        "reftypes": ["БизнесПроцессСсылка", "БизнесПроцессОбъект", "БизнесПроцессМенеджер"],
+    },
+    "Task.": {
+        "ru_singular": "Задача",
+        "ru_plural": "Задачи",
+        "en_singular": "Task",
+        "en_plural": "Tasks",
+        "reftypes": ["ЗадачаСсылка", "ЗадачаОбъект", "ЗадачаМенеджер"],
+    },
+    "Report.": {
+        "ru_singular": "Отчет",
+        "ru_plural": "Отчеты",
+        "en_singular": "Report",
+        "en_plural": "Reports",
+        "reftypes": [],
+    },
+    "DataProcessor.": {
+        "ru_singular": "Обработка",
+        "ru_plural": "Обработки",
+        "en_singular": "DataProcessor",
+        "en_plural": "DataProcessors",
+        "reftypes": [],
+    },
+    "Constant.": {
+        "ru_singular": "Константа",
+        "ru_plural": "Константы",
+        "en_singular": "Constant",
+        "en_plural": "Constants",
+        "reftypes": [],
+    },
+}
+
+
+def _build_code_collection_map() -> dict[str, str]:
+    """lower(collection accessor) -> canonical prefix, for 'manager' and 'query'.
+
+    Plural forms (Документы/Documents) drive manager-collection detection;
+    singular forms (Документ/Document) drive query-path detection. Both share
+    the same lookup table because plural and singular tokens never collide.
+    """
+    out: dict[str, str] = {}
+    for canonical, forms in _RU_META_FORMS.items():
+        for key in ("ru_plural", "en_plural", "ru_singular", "en_singular"):
+            tok = forms.get(key)
+            if tok:
+                out[tok.lower()] = canonical
+    return out
+
+
+def _build_manager_collection_map() -> dict[str, str]:
+    """lower(plural accessor) -> canonical prefix (manager usages only)."""
+    out: dict[str, str] = {}
+    for canonical, forms in _RU_META_FORMS.items():
+        for key in ("ru_plural", "en_plural"):
+            tok = forms.get(key)
+            if tok:
+                out[tok.lower()] = canonical
+    return out
+
+
+def _build_query_collection_map() -> dict[str, str]:
+    """lower(singular accessor) -> canonical prefix (query-path usages only)."""
+    out: dict[str, str] = {}
+    for canonical, forms in _RU_META_FORMS.items():
+        for key in ("ru_singular", "en_singular"):
+            tok = forms.get(key)
+            if tok:
+                out[tok.lower()] = canonical
+    return out
+
+
+def _build_ru_reftype_map() -> dict[str, str]:
+    """lower(RU reftype prefix incl. trailing dot) -> canonical prefix."""
+    out: dict[str, str] = {}
+    for canonical, forms in _RU_META_FORMS.items():
+        for rt in forms.get("reftypes", []):
+            out[rt.lower() + "."] = canonical
+    return out
+
+
+# Derived lookup tables (built once at import).
+_CODE_MANAGER_COLLECTIONS: dict[str, str] = _build_manager_collection_map()
+_CODE_QUERY_COLLECTIONS: dict[str, str] = _build_query_collection_map()
+_RU_REFTYPE_TO_CANONICAL: dict[str, str] = _build_ru_reftype_map()
+
+
 def _cf_parse_attributes(parent, ns: dict = _NS_CF) -> list[dict]:
     """Parse CF <Attribute> elements under parent."""
     attrs = []

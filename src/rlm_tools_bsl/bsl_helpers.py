@@ -4515,6 +4515,10 @@ def make_bsl_helpers(
             "exchange_plan_content_count": stats.get("exchange_plan_content", 0),
             "defined_types_count": stats.get("defined_types", 0),
             "characteristic_types_count": stats.get("characteristic_types", 0),
+            # v13 reverse code-usage index (v1.14.0). Capability is builder-gated,
+            # NOT count>0 — an empty table is a valid (no-usages) answer.
+            "has_metadata_code_usages": builder >= 13,
+            "metadata_code_usages_count": stats.get("metadata_code_usages", 0),
             # Git fast-path acceleration availability for incremental update (v1.8.0+)
             "git_accelerated": bool(stats.get("git_accelerated")),
             "git_head_commit": stats.get("git_head_commit"),
@@ -4841,9 +4845,13 @@ def make_bsl_helpers(
         if not s:
             return ("", [])
         text = s.strip()
-        # Convert Russian prefix to English (most common: "Справочник.X")
+        # Convert Russian prefix to English (most common: "Справочник.X").
+        # Case-insensitive on the prefix (casefold, Cyrillic-aware) so that
+        # "ДОКУМЕНТ.X" / "документ.X" normalize the same as "Документ.X" — the
+        # object NAME part is preserved as-is (its case is handled downstream by
+        # object_ref_key/py_lower lookups).
         for ru, en in _RU_META_PREFIXES.items():
-            if text.startswith(ru):
+            if text[: len(ru)].casefold() == ru.casefold():
                 text = en + text[len(ru) :]
                 break
         # Already canonical form like "Catalog.X" passes through canonicalize unchanged.
@@ -4879,17 +4887,38 @@ def make_bsl_helpers(
         object_ref: str,
         kinds: list[str] | None = None,
         limit: int = 1000,
+        include_code: bool = False,
     ) -> dict:
         """Find all references to a metadata object (Configurator "Найти ссылки → В свойствах" analogue).
+
+        Covers declarative metadata-XML references (attribute types, owner, subsystems,
+        functional options, rights, …). Pass include_code=True to additionally run
+        find_code_usages and surface in-code usages under separate `code_*` keys.
 
         Args:
             object_ref: e.g. 'Справочник.Контрагенты' or 'Catalog.Контрагенты'.
             kinds: optional filter by ref_kind (see _REF_KIND_PRIORITY for the list).
             limit: maximum references returned (default 1000).
+            include_code: also include in-code usages (find_code_usages) under
+                top-level keys code_usages/code_total/code_by_kind/code_truncated/
+                code_partial/code_meta. Metadata keys are unchanged.
 
         Returns:
-            {object, references, total, truncated, partial, by_kind}.
+            {object, references, total, truncated, partial, by_kind}
+            (+ code_* keys when include_code=True).
         """
+
+        def _finish(res: dict) -> dict:
+            if include_code:
+                code = find_code_usages(object_ref, limit=limit)
+                res["code_usages"] = code["usages"]
+                res["code_total"] = code["total"]
+                res["code_by_kind"] = code["by_kind"]
+                res["code_truncated"] = code["truncated"]
+                res["code_partial"] = code["partial"]
+                res["code_meta"] = code["_meta"]
+            return res
+
         canonical, _ = _normalize_object_ref(object_ref)
         result: dict = {
             "object": canonical,
@@ -4900,7 +4929,7 @@ def make_bsl_helpers(
             "by_kind": {},
         }
         if not canonical or "." not in canonical:
-            return result
+            return _finish(result)
 
         if idx_reader is not None:
             # Authoritative total + by_kind FIRST (cheap GROUP BY count)
@@ -4932,7 +4961,7 @@ def make_bsl_helpers(
                     }
                     for r in rows
                 ]
-                return result
+                return _finish(result)
 
         # Fallback: live scan
         result["partial"] = True
@@ -4944,6 +4973,103 @@ def make_bsl_helpers(
             result["truncated"] = True
             all_refs = all_refs[:limit]
         result["references"] = all_refs
+        return _finish(result)
+
+    def find_code_usages(
+        object_ref: str,
+        kind: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        """Find where a metadata object is used IN CODE (reverse code-usage search).
+
+        Complements find_references_to_object (which covers declarative metadata-XML
+        references). Backed by the metadata_code_usages index table (builder v13+).
+
+        Captures (light regex layer, source-aware):
+          - 'manager'  — collection access `Документы.X` / `Documents.X`;
+          - 'ref_type' — type in a string literal `"ДокументСсылка.X"` / `"DocumentRef.X"`;
+          - 'query'    — metadata path in a query literal `Документ.X` and
+                         `Документ.X.Товары` ('member' = tabular section name).
+        Does NOT capture attribute access via local variables (`Док.Товары.Количество`).
+
+        Scope: main configuration modules only (extensions are not in the index).
+
+        Args:
+            object_ref: 'Документ.X' / 'Document.X'. The metadata-type prefix is
+                accepted in either RU or EN form, case-insensitively; the object
+                NAME part is also matched case-insensitively (incl. Cyrillic) via
+                the stored object_ref_key.
+            kind: optional filter — 'manager' | 'ref_type' | 'query'.
+            limit: maximum usages returned (default 1000).
+
+        Returns:
+            {object, usages: [{path, object_name, category, module_type, line, kind, member}],
+             by_kind, total, truncated, partial, _meta: {scope, extensions_included}}.
+            partial=True only when the index lacks the table (rebuild required).
+        """
+        canonical, _ = _normalize_object_ref(object_ref)
+        result: dict = {
+            "object": canonical,
+            "usages": [],
+            "by_kind": {},
+            "total": 0,
+            "truncated": False,
+            "partial": False,
+            "_meta": {"scope": "main_config", "extensions_included": False},
+        }
+        if not canonical or "." not in canonical:
+            return result
+
+        if idx_reader is not None:
+            try:
+                counts = idx_reader.count_code_usages(canonical, kind=kind)
+            except Exception:
+                counts = None
+            try:
+                rows = idx_reader.find_code_usages(canonical, kind=kind, limit=limit)
+            except Exception:
+                rows = None
+            if rows is not None:
+                # Table present — authoritative answer (empty is a valid answer).
+                if counts is not None:
+                    result["total"] = counts["total"]
+                    result["by_kind"] = counts["by_kind"]
+                    if counts["total"] > limit:
+                        result["truncated"] = True
+                else:
+                    result["total"] = len(rows)
+                    result["by_kind"] = _count_by_kind([{"kind": r["kind"]} for r in rows])
+                result["usages"] = rows
+                return result
+
+        # Fallback: table missing (pre-v13 index) — limited live grep by short name.
+        result["partial"] = True
+        result["_meta"]["hint"] = (
+            "metadata_code_usages table missing — rebuild the index (rlm_index) for fast, complete code-usage search"
+        )
+        short_name = canonical.split(".", 1)[1] if "." in canonical else canonical
+        usages: list[dict] = []
+        try:
+            for hit in safe_grep(re.escape(short_name), max_files=40):
+                usages.append(
+                    {
+                        "path": hit["file"],
+                        "object_name": short_name,
+                        "category": "",
+                        "module_type": "",
+                        "line": hit["line"],
+                        "kind": "unknown",
+                        "member": None,
+                    }
+                )
+        except Exception:
+            pass
+        result["total"] = len(usages)
+        result["by_kind"] = _count_by_kind(usages)
+        if len(usages) > limit:
+            result["truncated"] = True
+            usages = usages[:limit]
+        result["usages"] = usages
         return result
 
     def _count_by_kind(refs: list[dict]) -> dict:
@@ -5387,7 +5513,7 @@ def make_bsl_helpers(
     _reg(
         "find_callers_context",
         find_callers_context,
-        "find_callers_context(proc, hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more}}",
+        "find_callers_context(proc, module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more}}",
         "code",
         ["caller", "call graph", "граф", "вызов", "вызыва", "кто вызывает", "find_callers"],
         "BUILD CALL GRAPH:\n"
@@ -5989,7 +6115,7 @@ def make_bsl_helpers(
     _reg(
         "find_references_to_object",
         find_references_to_object,
-        "find_references_to_object(object_ref, kinds=None, limit=1000) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind}",
+        "find_references_to_object(object_ref, kinds=None, limit=1000, include_code=False) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind} (+ code_usages/code_total/code_by_kind/code_truncated/code_partial/code_meta when include_code=True)",
         "business",
         [
             "ссылк",
@@ -6007,7 +6133,34 @@ def make_bsl_helpers(
         "      print(f\"  {r['kind']:25s} {r['used_in']} ({r['path']})\")\n"
         "  # Filter by kind:\n"
         "  attrs_only = find_references_to_object('Справочник.X', kinds=['attribute_type'])\n"
+        "  # Metadata refs + in-code usages in one call:\n"
+        "  full = find_references_to_object('Документ.X', include_code=True)\n"
+        "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
         "  # On v11 indexes (no metadata_references table) — partial=True via live scan",
+    )
+
+    _reg(
+        "find_code_usages",
+        find_code_usages,
+        "find_code_usages(object_ref, kind=None, limit=1000) -> {object, usages: [{path, object_name, category, module_type, line, kind, member}], by_kind, total, truncated, partial, _meta}",
+        "business",
+        [
+            "использования в коде",
+            "где используется в коде",
+            "code usages",
+            "обращения",
+            "find_code_usages",
+            "ТЧ в запросах",
+        ],
+        "FIND CODE USAGES (reverse: where a metadata object is used IN CODE):\n"
+        "  res = find_code_usages('Документ.ПриобретениеТоваровУслуг')\n"
+        "  print(f\"total={res['total']} by_kind={res['by_kind']}\")\n"
+        "  for u in res['usages'][:20]:\n"
+        "      tail = f\" .{u['member']}\" if u['member'] else ''\n"
+        "      print(f\"  {u['kind']:8s} {u['path']}:{u['line']}{tail}\")\n"
+        "  # kind: 'manager' (Документы.X) | 'ref_type' (\"ДокументСсылка.X\") | 'query' (Документ.X.ТЧ)\n"
+        "  # Filter: find_code_usages('Документ.X', kind='query')\n"
+        "  # Pairs with find_references_to_object (metadata-XML refs). Scope: main config only.",
     )
 
     _reg(

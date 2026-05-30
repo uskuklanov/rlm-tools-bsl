@@ -496,8 +496,8 @@ def refs_cf_fixture(tmp_path, monkeypatch):
 
 
 class TestIndexV12:
-    def test_builder_version_is_12(self):
-        assert BUILDER_VERSION == 12
+    def test_builder_version_is_13(self):
+        assert BUILDER_VERSION == 13
 
     def test_metadata_references_categories_set(self):
         # DefinedTypes must be a top-level trigger category for v12
@@ -594,6 +594,18 @@ class TestFindReferencesToObject:
         b = helpers["find_references_to_object"]("Catalog.Контрагенты")
         assert a["object"] == b["object"] == "Catalog.Контрагенты"
         assert a["total"] == b["total"]
+
+    def test_normalize_prefix_case_insensitive(self, refs_cf_fixture):
+        # The RU metadata-type prefix is matched case-insensitively, so an
+        # all-caps prefix normalizes to the same canonical and finds the refs.
+        reader, base, _ = refs_cf_fixture
+        helpers = _stub_helpers(base, reader)
+        expected = helpers["find_references_to_object"]("Справочник.Контрагенты")["total"]
+        assert expected >= 1
+        for variant in ("СПРАВОЧНИК.Контрагенты", "справочник.Контрагенты"):
+            res = helpers["find_references_to_object"](variant)
+            assert res["object"] == "Catalog.Контрагенты", variant
+            assert res["total"] == expected, variant
 
     def test_kinds_filter(self, refs_cf_fixture):
         reader, base, _ = refs_cf_fixture

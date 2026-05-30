@@ -24,10 +24,16 @@ from typing import NamedTuple
 from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
+from rlm_tools_bsl.bsl_xml_parsers import (
+    _CODE_MANAGER_COLLECTIONS,
+    _CODE_QUERY_COLLECTIONS,
+    _RU_REFTYPE_TO_CANONICAL,
+    canonicalize_type_ref,
+)
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 12
+BUILDER_VERSION = 13
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -112,6 +118,16 @@ _STRING_LITERAL_RE = re.compile(r'"[^"\r\n]*"')
 # Call-extraction patterns
 _QUALIFIED_CALL_RE = re.compile(r"(\w+)\.(\w+)\s*\(")
 _SIMPLE_CALL_RE = re.compile(r"(\w+)\s*\(")
+
+# Reverse code-usage extraction (v1.14.0, metadata_code_usages):
+#   _CODE_DOTTED_RE — a dotted identifier pair, applied to *stripped* code
+#                     (no strings/comments) to catch manager collection access
+#                     `Документы.X` / `Documents.X`.
+#   _CODE_PATH_RE   — a 2- or 3-segment dotted path, applied to the *contents*
+#                     of string literals to catch reference types and query
+#                     metadata paths (incl. an optional tabular-section segment).
+_CODE_DOTTED_RE = re.compile(r"(\w+)\.(\w+)")
+_CODE_PATH_RE = re.compile(r"(\w+)\.(\w+)(?:\.(\w+))?")
 
 # BSL keywords to exclude from call graph
 _BSL_KEYWORDS: frozenset[str] = frozenset(
@@ -479,6 +495,22 @@ CREATE TABLE IF NOT EXISTS characteristic_types (
     path           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ct_pvh ON characteristic_types(pvh_name);
+
+-- Level-13 (v1.14.0): reverse code-usage index for find_code_usages.
+-- Code-derived (mirrors regions/module_headers): scanned from .bsl bodies,
+-- keyed by module_id. object_ref_key = object_ref.lower() gives an indexed,
+-- Unicode/Cyrillic case-insensitive exact lookup WITHOUT the py_lower UDF
+-- (which is registered only on the reader connection and defeats a plain index).
+CREATE TABLE IF NOT EXISTS metadata_code_usages (
+    id             INTEGER PRIMARY KEY,
+    module_id      INTEGER NOT NULL REFERENCES modules(id),
+    object_ref     TEXT NOT NULL,
+    object_ref_key TEXT NOT NULL,
+    member_path    TEXT,
+    usage_kind     TEXT NOT NULL,
+    line           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(object_ref_key);
 """
 
 
@@ -1517,6 +1549,117 @@ def _strip_code_line(line: str) -> str:
     if ci >= 0:
         line = line[:ci]
     return line
+
+
+def _scan_module(lines: list[str]):
+    """Yield ``(lineno, code, strings)`` for each line, tracking string state.
+
+    A single multi-line-aware pass over the module body that separates real code
+    from string-literal content:
+
+      - ``code``    — the line with string-literal content AND comments removed
+                      (multi-line literals opened on a previous line contribute
+                      nothing to ``code`` here — fixes false ``manager`` matches
+                      on continuation lines like ``|Документы.X``);
+      - ``strings`` — the list of string-literal fragments on this line (each
+                      multi-line literal contributes one fragment per physical
+                      line, so a matched metadata path keeps its real line).
+
+    ``""`` inside a string is an escaped quote, not a terminator; ``//`` starts a
+    comment only outside of a string.
+    """
+    in_string = False
+    for lineno, raw in enumerate(lines, start=1):
+        n = len(raw)
+        i = 0
+        code_chars: list[str] = []
+        strings: list[str] = []
+        seg_start = 0 if in_string else -1
+        while i < n:
+            ch = raw[i]
+            if in_string:
+                if ch == '"':
+                    if i + 1 < n and raw[i + 1] == '"':
+                        i += 2  # escaped "" — stays inside the string
+                        continue
+                    strings.append(raw[seg_start:i])
+                    in_string = False
+                    seg_start = -1
+                    i += 1
+                else:
+                    i += 1
+            else:
+                if ch == '"':
+                    in_string = True
+                    seg_start = i + 1
+                    i += 1
+                elif ch == "/" and i + 1 < n and raw[i + 1] == "/":
+                    break  # line comment — rest is neither code nor string
+                else:
+                    code_chars.append(ch)
+                    i += 1
+        if in_string:
+            # literal continues onto the next line — emit what we have here
+            strings.append(raw[seg_start:])
+        yield lineno, "".join(code_chars), strings
+
+
+def _extract_code_usages(
+    lines: list[str],
+) -> list[tuple[str, str | None, str, int]]:
+    """Extract reverse code-usages of metadata objects from a .bsl module body.
+
+    Source-aware light regex layer (see plan / docs/INDEXING.md). A single
+    multi-line-aware scan (``_scan_module``) separates code from string content:
+      - ``manager``  — collection accessor `Документы.X` / `Documents.X`, matched
+        only on real *code* (string literals and comments removed, incl. across
+        multi-line string literals).
+      - ``ref_type`` — reference type in a *string literal*:
+        `"ДокументСсылка.X"` (RU) or `"DocumentRef.X"` (EN, via canonicalize_type_ref).
+      - ``query``    — metadata path in a *string literal* (query text):
+        `Документ.X` and `Документ.X.Товары` (3rd segment = tabular section name).
+        Multi-line query literals are covered.
+
+    Returns list of ``(object_ref, member_path, usage_kind, line)`` where
+    ``object_ref`` is canonical (e.g. ``Document.ПриобретениеТоваровУслуг``),
+    ``member_path`` is the tabular-section name for ``query`` (else ``None``).
+    Does NOT resolve local-variable types (`Док.Товары` is out of scope).
+    """
+    out: list[tuple[str, str | None, str, int]] = []
+
+    for lineno, code, strings in _scan_module(lines):
+        # manager — only on real code (no strings/comments, multiline-aware)
+        if "." in code:
+            for m in _CODE_DOTTED_RE.finditer(code):
+                canonical = _CODE_MANAGER_COLLECTIONS.get(m.group(1).lower())
+                if canonical:
+                    out.append((canonical + m.group(2), None, "manager", lineno))
+
+        # ref_type / query — only inside string-literal content
+        for content in strings:
+            if "." not in content:
+                continue
+            for pm in _CODE_PATH_RE.finditer(content):
+                g1, g2, g3 = pm.group(1), pm.group(2), pm.group(3)
+                low = g1.lower()
+                ru_ref = _RU_REFTYPE_TO_CANONICAL.get(low + ".")
+                if ru_ref:
+                    out.append((ru_ref + g2, None, "ref_type", lineno))
+                    continue
+                query_canon = _CODE_QUERY_COLLECTIONS.get(low)
+                if query_canon:
+                    out.append((query_canon + g2, g3 or None, "query", lineno))
+                    continue
+                en_ref = canonicalize_type_ref(f"{g1}.{g2}")
+                if en_ref:
+                    out.append((en_ref, None, "ref_type", lineno))
+    return out
+
+
+def _chunked(seq: list, size: int = 500):
+    """Yield ``seq`` in chunks of at most ``size`` (SQLite variable-limit safe)."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
@@ -4032,6 +4175,8 @@ class FileResult(NamedTuple):
     movements: list[tuple[str, str, str]]  # (register_name, source, rel_path)
     regions: list[dict] = []
     header_comment: str = ""
+    # (object_ref, member_path, usage_kind, line) — reverse code-usages (v1.14.0)
+    code_usages: tuple[tuple[str, str | None, str, int], ...] = ()
 
 
 def _extract_movements(
@@ -4107,7 +4252,22 @@ def _process_single_file(
     regions = _parse_regions(lines)
     header_comment = _extract_header_comment(lines)
 
-    return FileResult(info, mtime, size, methods, raw_calls, movements, regions, header_comment)
+    # In-band: reverse code-usages of metadata objects (zero extra I/O).
+    # Built unconditionally (like movements/regions) — the table is code-derived
+    # and must be populated even when metadata indexing is disabled (--no-metadata).
+    code_usages = tuple(_extract_code_usages(lines))
+
+    return FileResult(
+        info,
+        mtime,
+        size,
+        methods,
+        raw_calls,
+        movements,
+        regions,
+        header_comment,
+        code_usages,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5156,14 +5316,16 @@ class IndexBuilder:
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'has_synonyms'").fetchone()
         has_synonyms = meta_row is None or meta_row["value"] == "1"
 
-        # Schema upgrade v7→v8: regions/module_headers require full rebuild
+        # Schema upgrades that add code-derived tables (regions/module_headers in
+        # v8, metadata_code_usages in v13) cannot be back-filled incrementally —
+        # they require a one-time full rebuild. Threshold = newest such version.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 8:
+        if old_version < 13:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
-                "Upgrading index v%d → v%d: full rebuild required for regions/module_headers",
+                "Upgrading index v%d → v%d: full rebuild required for code-derived tables",
                 old_version,
                 BUILDER_VERSION,
             )
@@ -5340,6 +5502,18 @@ class IndexBuilder:
             with conn:
                 # Delete old data for removed + changed
                 if to_remove:
+                    # metadata_code_usages has no module_id index (weight) — batch
+                    # delete by chunk to stay under the SQLite variable limit.
+                    removed_ids = [db_modules[rel]["id"] for rel in to_remove if rel in db_modules]
+                    for chunk in _chunked(removed_ids):
+                        placeholders = ",".join("?" * len(chunk))
+                        try:
+                            conn.execute(
+                                f"DELETE FROM metadata_code_usages WHERE module_id IN ({placeholders})",
+                                chunk,
+                            )
+                        except sqlite3.OperationalError:
+                            pass  # table may not exist in pre-v13 index
                     for rel in to_remove:
                         mod_info = db_modules.get(rel)
                         if mod_info is None:
@@ -5434,6 +5608,17 @@ class IndexBuilder:
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                 (key, value),
             )
+
+        # Level-13: reverse code-usages table (code-derived, built regardless of
+        # metadata). Defensive create — a pre-v13 index would have been fully
+        # rebuilt above (old_version < 13), so this only guards same-version DBs.
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS metadata_code_usages ("
+            "id INTEGER PRIMARY KEY, module_id INTEGER NOT NULL REFERENCES modules(id), "
+            "object_ref TEXT NOT NULL, object_ref_key TEXT NOT NULL, "
+            "member_path TEXT, usage_kind TEXT NOT NULL, line INTEGER);\n"
+            "CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(object_ref_key);\n"
+        )
 
         # Refresh Level-2 metadata if originally built with metadata
         if has_metadata:
@@ -5806,6 +5991,18 @@ class IndexBuilder:
 
             with conn:
                 if to_remove:
+                    # metadata_code_usages has no module_id index (weight) — batch
+                    # delete by chunk to stay under the SQLite variable limit.
+                    removed_ids = [db_modules[rel]["id"] for rel in to_remove if rel in db_modules]
+                    for chunk in _chunked(removed_ids):
+                        placeholders = ",".join("?" * len(chunk))
+                        try:
+                            conn.execute(
+                                f"DELETE FROM metadata_code_usages WHERE module_id IN ({placeholders})",
+                                chunk,
+                            )
+                        except sqlite3.OperationalError:
+                            pass  # table may not exist in pre-v13 index
                     for rel in to_remove:
                         mod_info = db_modules.get(rel)
                         if mod_info is None:
@@ -6290,6 +6487,23 @@ class IndexBuilder:
             conn.executemany(
                 "INSERT OR REPLACE INTO module_headers (module_id, header_comment) VALUES (?, ?)",
                 header_rows,
+            )
+
+        # Insert reverse code-usages (v1.14.0). object_ref_key = object_ref.lower()
+        # computed here for indexed, Cyrillic-aware case-insensitive lookup.
+        usage_rows: list[tuple] = []
+        for r in results:
+            mod_id = path_to_id.get(r.info.relative_path)
+            if mod_id is None:
+                continue
+            for object_ref, member_path, usage_kind, line in r.code_usages:
+                usage_rows.append((mod_id, object_ref, object_ref.lower(), member_path, usage_kind, line))
+        if usage_rows:
+            conn.executemany(
+                "INSERT INTO metadata_code_usages "
+                "(module_id, object_ref, object_ref_key, member_path, usage_kind, line) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                usage_rows,
             )
 
     @staticmethod
@@ -7122,6 +7336,7 @@ class IndexReader:
                 "exchange_plan_content",
                 "defined_types",
                 "characteristic_types",
+                "metadata_code_usages",
             ):
                 try:
                     row = self._conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()  # noqa: S608
@@ -7996,6 +8211,86 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
             by_kind = {r["ref_kind"]: r["cnt"] for r in rows}
+            return {"total": sum(by_kind.values()), "by_kind": by_kind}
+
+    def find_code_usages(
+        self,
+        object_ref: str,
+        kind: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict] | None:
+        """Find reverse code-usages of a metadata object via metadata_code_usages.
+
+        Indexed exact-match on ``object_ref_key`` (= ``object_ref.lower()``) — a
+        plain, Cyrillic-aware case-insensitive lookup without the py_lower UDF.
+
+        Args:
+            object_ref: canonical reference (e.g. "Document.ПриобретениеТоваровУслуг").
+            kind: optional filter — 'manager' | 'ref_type' | 'query'.
+            limit: maximum rows to fetch.
+
+        Returns:
+            list of dicts {path, object_name, category, module_type, line, kind, member}
+            (JOIN to modules), or None if the metadata_code_usages table is missing
+            (caller should fall back / report a stale index).
+        """
+        with self._lock:
+            try:
+                conditions = ["u.object_ref_key = ?"]
+                params: list = [object_ref.lower()]
+                if kind:
+                    conditions.append("u.usage_kind = ?")
+                    params.append(kind)
+                where = " AND ".join(conditions)
+                sql = (
+                    "SELECT mod.rel_path AS path, mod.object_name AS object_name, "
+                    "mod.category AS category, mod.module_type AS module_type, "
+                    "u.line AS line, u.usage_kind AS kind, u.member_path AS member "
+                    "FROM metadata_code_usages u "
+                    "JOIN modules mod ON mod.id = u.module_id "
+                    f"WHERE {where} "  # noqa: S608
+                    "ORDER BY mod.rel_path, u.line "
+                    "LIMIT ?"
+                )
+                params.append(limit)
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            return [
+                {
+                    "path": r["path"],
+                    "object_name": r["object_name"],
+                    "category": r["category"],
+                    "module_type": r["module_type"],
+                    "line": r["line"],
+                    "kind": r["kind"],
+                    "member": r["member"],
+                }
+                for r in rows
+            ]
+
+    def count_code_usages(
+        self,
+        object_ref: str,
+        kind: str | None = None,
+    ) -> dict | None:
+        """Return {'total': int, 'by_kind': {kind: count}} or None if table missing."""
+        with self._lock:
+            try:
+                conditions = ["object_ref_key = ?"]
+                params: list = [object_ref.lower()]
+                if kind:
+                    conditions.append("usage_kind = ?")
+                    params.append(kind)
+                where = " AND ".join(conditions)
+                rows = self._conn.execute(
+                    f"SELECT usage_kind, COUNT(*) AS cnt FROM metadata_code_usages "  # noqa: S608
+                    f"WHERE {where} GROUP BY usage_kind",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            by_kind = {r["usage_kind"]: r["cnt"] for r in rows}
             return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
     def find_defined_type(self, name: str) -> dict | None:

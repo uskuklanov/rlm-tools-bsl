@@ -36,7 +36,7 @@ _MOCK_REGISTRY: dict = {
     "find_exports": {"fn": None, "sig": "find_exports(path) -> [{name, line}]", "cat": "code", "kw": [], "recipe": ""},
     "find_callers_context": {
         "fn": None,
-        "sig": "find_callers_context(proc, hint, 0, 50) -> {callers, _meta}",
+        "sig": "find_callers_context(proc, module_hint, 0, 50) -> {callers, _meta}",
         "cat": "code",
         "kw": [],
         "recipe": "",

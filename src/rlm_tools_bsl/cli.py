@@ -156,6 +156,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"  DefTypes:   {stats['defined_types']}")
     if stats.get("characteristic_types"):
         print(f"  CharTypes:  {stats['characteristic_types']}")
+    # Code-derived (built even with --no-metadata) — kept outside the metadata block.
+    if stats.get("metadata_code_usages"):
+        print(f"  CodeUsages: {stats['metadata_code_usages']}")
     if stats.get("file_paths"):
         print(f"  FilePaths:  {stats['file_paths']}")
     print(f"  DB size:  {_fmt_size(db_size)}")
@@ -277,6 +280,9 @@ def _cmd_info(args: argparse.Namespace) -> None:
         print(f"  DefTypes:   {stats['defined_types']}")
     if stats.get("characteristic_types"):
         print(f"  CharTypes:  {stats['characteristic_types']}")
+    # Code-derived (built even with --no-metadata) — kept outside the metadata block.
+    if stats.get("metadata_code_usages"):
+        print(f"  CodeUsages: {stats['metadata_code_usages']}")
     if stats.get("file_paths"):
         print(f"  FilePaths:  {stats['file_paths']}")
     print(f"  FTS:      {'yes' if stats.get('has_fts') else 'no'}")

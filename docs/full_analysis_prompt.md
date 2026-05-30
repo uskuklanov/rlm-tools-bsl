@@ -924,6 +924,39 @@ Replace `Справочник.ВидыПодарочныхСертификато
 
 ---
 
+## Reverse code-usage search (v1.14.0, `find_code_usages` / `metadata_code_usages`)
+
+Дополняет XML-reverse-index обращениями **В КОДЕ**. Пример: «найди все места использования
+документа ПриобретениеТоваровУслуг — обращения к нему, к его реквизитам/ТЧ».
+
+```
+# Обращения в коде (manager/ref_type/query):
+res = find_code_usages('Документ.ПриобретениеТоваровУслуг')
+print(res['total'], res['by_kind'])   # {'manager': .., 'ref_type': .., 'query': ..}
+for u in res['usages'][:20]:
+    tail = f" .{u['member']}" if u['member'] else ''   # member = имя ТЧ для query
+    print(f"  {u['kind']:8s} {u['path']}:{u['line']}{tail}")
+
+# Метаданные-XML + код одним вызовом:
+full = find_references_to_object('Документ.ПриобретениеТоваровУслуг', include_code=True)
+print(full['total'], full['code_total'], full['code_by_kind'])
+```
+
+| Metric | Expected |
+|--------|----------|
+| `get_index_info()['has_metadata_code_usages']` на индексе v13 | `true` |
+| `find_code_usages(...)` ответ по индексу | мгновенно (indexed exact-lookup по `object_ref_key`) |
+| `partial` на индексе v13 | `false` (пустой результат — валидный ответ `total=0`) |
+| `partial` на индексе старее v13 | `true` (ограниченный `safe_grep`-фолбэк, нужен rebuild) |
+| `member` для `query`-обращений к ТЧ (`Документ.X.Товары`) | имя ТЧ (`Товары`) |
+| `metadata_code_usages` size on ERP | ориентировочно ≤ `calls`; один индекс (`idx_mcu_ref`) |
+| Первый `update`/`rlm_start` на индексе старее v13 | разовый полный rebuild (код-производная таблица) |
+
+**Вне охвата** (документировано): доступ к реквизитам через локальные переменные
+(`Док = Документы.X; Док.Товары`), код расширений (только основная конфигурация).
+
+---
+
 # Reverse-Index Coverage Audit Prompt — E2E Test for v1.9.0 reverse-index breadth
 
 Данный промпт нагружает **новый reverse-index** (`metadata_references`) шире чем точечный where-used: проходит по нескольким kinds сразу, проверяет раскрытие `ОпределяемогоТипа` и поведение `partial` flag. Используется для:
@@ -1331,4 +1364,99 @@ in scan order are not lost before rank-merge.
 - Многострочная процедура с НЕзакрытой `)` в сигнатуре (битый/обрезанный
   файл) не должна вешать парсер — hard-cap 20 строк / 2000 символов
   внутри `_merge_proc_continuations` отрезает её и идёт дальше.
+
+---
+
+# Reverse Code-Usage Prompt — E2E Test for v1.14.0 `find_code_usages`
+
+Проверяет новый обратный поиск использований объекта метаданных **В КОДЕ**
+(таблица `metadata_code_usages`, helper `find_code_usages`, режим
+`find_references_to_object(..., include_code=True)`). Это ответ на вопрос вида
+«найди все места использования документа X — обращения к нему, к его реквизитам/ТЧ
+в коде». Замените `Документ.РеализацияТоваровУслуг` на реальный объект и `<path>`
+на путь к исходникам.
+
+---
+
+## Prompt
+
+```
+Мне нужно найти все обращения к документу РеализацияТоваровУслуг В КОДЕ конфигурации
+(к менеджеру, к ссылочному типу, к таблице/реквизитам в запросах).
+Путь: <путь к каталогу исходников 1С>
+
+Используй ТОЛЬКО MCP rlm-tools-bsl. Начни с rlm_help(topic='ссылки') (или help('ссылки')).
+
+Сделай:
+
+1. Состояние индекса — get_index_info(): сообщи builder_version,
+   has_metadata_code_usages, metadata_code_usages_count. Если builder_version < 13
+   или has_metadata_code_usages = False — сообщи, что нужен rebuild индекса (v13).
+
+2. Обращения в коде — find_code_usages('Документ.РеализацияТоваровУслуг'):
+   - выведи total и by_kind (manager / ref_type / query);
+   - покажи первые 15 usages: kind, path, line, member (имя ТЧ для query);
+   - убедись, что partial = False (ответ из индекса, не live-fallback).
+
+3. По видам отдельно — find_code_usages(obj, kind='manager'),
+   kind='ref_type', kind='query'. Для query покажи, что поле member заполняется
+   именем табличной части (обращения к ТЧ в тексте запроса), и что многострочные
+   запросы тоже попадают (path:line указывают на строку с путём метаданных).
+
+4. Метаданные-XML + код одним вызовом —
+   find_references_to_object('Документ.РеализацияТоваровУслуг', include_code=True):
+   сравни metadata-секцию (total/by_kind) с code-секцией
+   (code_total/code_by_kind). Объясни разницу слоёв: XML-ссылки vs обращения в коде.
+
+5. Кириллица/регистр и нормализация: повтори find_code_usages с английским
+   префиксом ('Document.РеализацияТоваровУслуг') и с другим регистром имени —
+   результат должен совпасть (нормализация + object_ref_key).
+
+6. Контроль границ: возьми заведомо несуществующий объект
+   ('Документ.ТакогоНетВПринципе') — ожидается total=0, partial=False (НЕ None,
+   НЕ live-fallback). Зафиксируй это как корректное поведение пустого результата.
+
+Дай итоговую сводку: total и by_kind по основному объекту, code_total из
+include_code, has_metadata_code_usages, metadata_code_usages_count, и вывод о том,
+покрывает ли фича исходный запрос «где используется объект в коде». Сохрани отчёт.
+
+## ВАЖНЫЕ ПРАВИЛА
+1. Один rlm_execute должен батчить связанные вызовы find_code_usages.
+2. НЕ ловит (документировано, не считать ошибкой): доступ к реквизитам через
+   локальные переменные (Док = Документы.X; Док.Товары) и код расширений
+   (только основная конфигурация).
+3. В конце вызови rlm_end.
+```
+
+---
+
+## What it covers
+
+| Аспект | Helper / поле |
+|--------|----------------|
+| Обращение к менеджеру коллекции (`Документы.X` / `Documents.X`) | `find_code_usages`, `kind='manager'` |
+| Ссылочный тип в строковом литерале (`"ДокументСсылка.X"` / `"DocumentRef.X"`) | `kind='ref_type'` |
+| Путь метаданных в тексте запроса (`Документ.X` и `Документ.X.ТЧ`) | `kind='query'`, поле `member` |
+| Многострочные запросы (путь на continuation-строке) | `find_code_usages` (scan строк-литералов) |
+| Метаданные-XML + код одним вызовом | `find_references_to_object(include_code=True)` → `code_*` |
+| Capability / размер таблицы | `get_index_info()['has_metadata_code_usages' / 'metadata_code_usages_count']` |
+| Нормализация RU/EN + регистр имени | `object_ref_key` (lower) |
+| Пустой результат = валидный ответ | `total=0, partial=False` (не None, не live) |
+
+## Expected results (v1.14.0, ERP CF/EDT)
+
+| Metric | Expected |
+|--------|----------|
+| `get_index_info()['has_metadata_code_usages']` (v13) | `true` |
+| `metadata_code_usages_count` на ERP | сотни тысяч строк (ориентир ≤ `calls`) |
+| `find_code_usages('Документ.РеализацияТоваровУслуг')` total | > 0, by_kind содержит ≥ 2 из {manager, ref_type, query} |
+| `partial` на индексе v13 | `false` |
+| `member` для `query`-обращений к ТЧ | имя ТЧ (например `Товары`) |
+| EN-префикс / иной регистр имени | тот же результат, что RU |
+| Несуществующий объект | `total=0`, `partial=false` |
+| `find_references_to_object(..., include_code=True)` | присутствуют ключи `code_total` / `code_by_kind` / `code_usages` |
+| Скорость `find_code_usages` | мгновенно (indexed exact-lookup) |
+
+**Граница покрытия:** index fast-path покрывает модули основной конфигурации.
+Локальные переменные (`Док.Товары`) и код расширений — вне охвата v1.14.0.
 
