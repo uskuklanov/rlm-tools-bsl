@@ -1169,6 +1169,236 @@ def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
 
 
 # ---------------------------------------------------------------------------
+# git grep — full-text search backend (opt-in: only when sources are under git)
+# ---------------------------------------------------------------------------
+def _git_grep_timeout() -> int:
+    """Timeout (seconds) for a single ``git grep`` search.
+
+    Configurable via ``RLM_GIT_SEARCH_TIMEOUT``. Defaults to 30s: ``git grep``
+    over a full 1C config (tens of thousands of files) completes in well under a
+    second, so 30s is a generous ceiling that still bounds a pathological regex
+    or a frozen filesystem. Invalid values fall back to 30.
+    """
+    try:
+        return max(1, int(os.environ.get("RLM_GIT_SEARCH_TIMEOUT", "30")))
+    except (ValueError, TypeError):
+        return 30
+
+
+# Leading magic that turns a pathspec into a git "magic" pathspec (e.g. ``:/``
+# escapes to repo root, ``:(top)`` likewise). User-supplied ``path`` must never
+# carry these — see _sanitize_grep_path.
+_PATHSPEC_MAGIC_PREFIXES = (":(", ":/", ":!", ":^")
+_FILE_EXT_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+# git pathspec glob metacharacters — rejected in a user ``path`` so the filter
+# stays a literal subtree/file and can't silently widen (e.g. ``CommonModules*``).
+_PATH_GLOB_CHARS = frozenset("*?[]")
+
+
+def _sanitize_grep_path(path: str | None) -> str | None:
+    """Normalise a user-supplied ``path`` filter into a safe git pathspec base.
+
+    Returns:
+      * ``""`` — input was empty/unset → no path filter (search whole config).
+      * a cleaned POSIX path (no leading/trailing ``/``) — valid directory/file
+        filter.
+      * ``None`` — input was **non-empty but malformed/unsafe**; caller must
+        surface an error rather than silently widening the search to the whole
+        config (or, worse, escaping ``base_path`` to the repo root).
+
+    Rejected (→ ``None``): backslashes, pathspec magic (``:/``, ``:(...)``,
+    leading ``:``), Windows drive prefixes, ``..``/``.`` segments, internal
+    empty segments (``a//b``), glob metacharacters (``* ? [ ]`` — ``path`` is a
+    **literal** subtree/file filter, so a glob would silently widen it past the
+    documented contract), and inputs that collapse to empty after stripping
+    surrounding slashes (``"/"``, ``"///"``) — the latter being non-empty intent
+    that we refuse to reinterpret as "whole config".
+    """
+    raw = path or ""
+    if not raw.strip():
+        return ""  # unset → no filter
+    if "\\" in raw:
+        return None
+    if raw.startswith(_PATHSPEC_MAGIC_PREFIXES) or raw.startswith(":"):
+        return None
+    cleaned = raw.strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        return None  # non-empty input that was all slashes ("/", "///")
+    if _DRIVE_RE.match(cleaned):
+        return None  # absolute Windows path (C:/...)
+    if any(c in _PATH_GLOB_CHARS for c in cleaned):
+        return None  # glob metachar → would silently widen the literal filter
+    for seg in cleaned.split("/"):
+        if seg in ("", "..", "."):
+            return None  # internal empty (a//b), parent escape, or '.'
+        if seg.startswith(":"):
+            return None
+    return cleaned
+
+
+def _sanitize_grep_file_types(file_types) -> list[str] | None:
+    """Normalise a user-supplied ``file_types`` filter into a list of extensions.
+
+    Accepts a comma-separated string (``"bsl,xml"``) or an iterable of strings.
+    Returns:
+      * ``[]`` — empty/unset → no type filter.
+      * a list of bare extensions (no leading dot) — valid filter.
+      * ``None`` — at least one extension is invalid (contains anything outside
+        ``[A-Za-z0-9_+-]``). We reject the whole call rather than silently
+        dropping the bad extension, because a silent drop could empty the filter
+        and unexpectedly widen the search.
+    """
+    raw = file_types or ""
+    if isinstance(raw, str):
+        items = [t.strip() for t in raw.split(",")]
+    else:
+        items = [str(t).strip() for t in raw]
+    items = [t for t in items if t]
+    if not items:
+        return []  # unset → no filter
+    out: list[str] = []
+    for t in items:
+        if not _FILE_EXT_RE.match(t):
+            return None  # invalid extension → error, no silent drop
+        out.append(t)
+    return out
+
+
+def _git_grep(
+    base_path: str,
+    pattern: str,
+    *,
+    path: str | None = None,
+    file_types=None,
+    literal_files: list[str] | None = None,
+    regex: bool = False,
+    ignore_case: bool = False,
+    mode: str = "lines",
+    max_results: int = 200,
+    max_per_file: int = 50,
+    include_truncation_sentinel: bool = False,
+    timeout: int | None = None,
+) -> list[dict] | None:
+    """Run a single ``git grep`` over the work tree at *base_path*.
+
+    The one and only place that shells out to ``git grep``. Searches the working
+    tree (tracked files as they are on disk, including uncommitted edits) plus
+    untracked-but-not-ignored files (``--untracked``); ``.gitignore``'d paths are
+    intentionally skipped.
+
+    Parameters:
+      * *pattern* — literal substring (default) or POSIX ERE when *regex* is True.
+        ``-F``/``-E`` only; ``-P``/PCRE is avoided (optional git build feature).
+      * *path* / *file_types* — scoped pathspec filter (composed as
+        ``{path}/*.{ext}`` so multiple file types don't OR-leak outside *path*).
+      * *literal_files* — a trusted, exact list of base-relative files (from the
+        index) to restrict the search to; passed via ``:(literal)`` magic so a
+        filename containing ``*`` or ``:`` can't act as a glob. When provided,
+        *path*/*file_types* are ignored. An empty list returns ``[]`` (nothing to
+        search) rather than widening to the whole config.
+      * *mode* — ``"lines"`` → ``[{file, line, text}]``; ``"files"`` → ``[{file}]``.
+      * *max_results* — hard cap on returned records.
+      * *max_per_file* — per-file match cap (``-m``), anti-noise for heavy files
+        (lines mode only).
+      * *include_truncation_sentinel* — when True and the result was capped, the
+        last element is ``{"_truncated": True, "shown": N}``. Kept False for
+        ``safe_grep`` whose strict ``[{file, line, text}]`` contract internal
+        callers rely on.
+
+    Returns a list of dicts, or **``None``** on a real failure (git unavailable,
+    rc≥2, timeout, or a malformed filter). ``None`` is distinct from ``[]`` (zero
+    matches) so the caller can report "search failed" rather than "nothing found".
+    """
+    if mode not in ("lines", "files"):
+        return None
+    if not isinstance(pattern, str) or pattern == "":
+        return None
+    # Multi-pattern guard: a NL/NUL in the pattern makes git treat it as several
+    # ``-e`` patterns (unexpected OR-search). Not supported in v1 → error.
+    if "\n" in pattern or "\x00" in pattern:
+        return None
+
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+
+    # Build pathspecs.
+    if literal_files is not None:
+        if not literal_files:
+            return []  # explicit empty candidate set → nothing to search
+        pathspecs = [f":(literal){f}" for f in literal_files]
+    else:
+        san_path = _sanitize_grep_path(path)
+        if san_path is None:
+            return None  # malformed path filter
+        exts = _sanitize_grep_file_types(file_types)
+        if exts is None:
+            return None  # malformed file_types
+        if san_path and exts:
+            pathspecs = [f"{san_path}/*.{ext}" for ext in exts]
+        elif exts:
+            pathspecs = [f"*.{ext}" for ext in exts]
+        elif san_path:
+            pathspecs = [san_path]
+        else:
+            pathspecs = []  # whole config
+
+    output_flag = "-l" if mode == "files" else "-n"
+    grep_cmd = [*cmd, "grep", "-z", "--untracked", "--no-color", "-I", output_flag]
+    if ignore_case:
+        grep_cmd.append("-i")
+    if mode == "lines" and max_per_file and max_per_file > 0:
+        grep_cmd += ["-m", str(max_per_file)]
+    grep_cmd.append("-E" if regex else "-F")
+    grep_cmd += ["-e", pattern, "--", *pathspecs]
+
+    t = timeout if timeout is not None else _git_grep_timeout()
+    try:
+        r = subprocess.run(grep_cmd, **_GIT_SUBPROCESS_KW, timeout=t)
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.info("_git_grep: %s: %s", type(exc).__name__, exc)
+        return None
+
+    rc = r.returncode
+    if rc == 1:
+        return []  # no matches — not an error
+    if rc != 0:
+        logger.info("_git_grep: rc=%d stderr=%r", rc, (r.stderr or "")[:200])
+        return None
+
+    stdout = r.stdout or ""
+    results: list[dict] = []
+    if mode == "files":
+        # ``-l -z`` → NUL-separated paths (printed verbatim).
+        for f in stdout.split("\x00"):
+            if f:
+                results.append({"file": f})
+    else:
+        # ``-n -z`` → records ``path \0 lineno \0 text`` separated by the file's
+        # line terminator. Split on ``\n``; ``.strip()`` removes the trailing
+        # ``\r`` left by CRLF files (and any surrounding whitespace).
+        for record in stdout.split("\n"):
+            if not record:
+                continue
+            parts = record.split("\x00", 2)
+            if len(parts) != 3:
+                continue
+            f, lineno, text = parts
+            try:
+                ln = int(lineno)
+            except ValueError:
+                continue
+            results.append({"file": f, "line": ln, "text": text.strip()})
+
+    if len(results) > max_results:
+        results = results[:max_results]
+        if include_truncation_sentinel:
+            results.append({"_truncated": True, "shown": max_results})
+    return results
+
+
+# ---------------------------------------------------------------------------
 # IndexStatus enum
 # ---------------------------------------------------------------------------
 class IndexStatus(Enum):

@@ -774,6 +774,28 @@ def build_helpers_table(registry: dict) -> str:
     return "\n".join(lines)
 
 
+def _git_search_routing(registry: dict | None) -> str:
+    """One routing block for git_search, only when it is in the live registry.
+
+    Presence is derived from the registry (gated by git availability at session
+    start) — no extra parameter needed. Disambiguates the three search intents so
+    the agent doesn't oscillate between safe_grep and git_search.
+    """
+    if not registry or "git_search" not in registry:
+        return ""
+    return (
+        "\n== FULL-TEXT SEARCH (git detected) ==\n"
+        "Sources are under git → git_search is available: full-text over ALL files,\n"
+        "including raw XML/forms/rights/DCS/queries that name-based helpers and the index never see.\n"
+        "Pick the tool by intent (avoid tool-oscillation):\n"
+        "  - by NAME (object/procedure/attribute) → search / find_module / find_attributes\n"
+        "  - inside a KNOWN module → safe_grep(pattern, hint)   (scoped, fast)\n"
+        "  - ANY substring ANYWHERE, incl. XML/forms/query text → git_search(pattern[, path, file_types])\n"
+        "Anti-noise on common tokens: git_search(tok, mode='files') first (which files), or narrow\n"
+        "file_types/path, then drill down. Mind max_results / the {'_truncated': True} sentinel."
+    )
+
+
 def _match_recipe(query: str) -> str | None:
     """Match query text against _BUSINESS_RECIPES domain keys and aliases."""
     q = query.lower()
@@ -879,6 +901,11 @@ def _build_full_strategy(
         parts.append(build_helpers_table(registry))
     else:
         parts.append(_STRATEGY_IO_SECTION)
+
+    # --- Full-text search routing (only when git_search is registered) ---
+    git_note = _git_search_routing(registry)
+    if git_note:
+        parts.append(git_note)
 
     # --- Index status ---
     if idx_stats is not None:
@@ -1142,6 +1169,11 @@ def _build_slim_strategy(
     # --- Compact helpers index (categories + names, no signatures) ---
     if registry:
         parts.append(build_slim_helpers_index(registry))
+
+    # --- Full-text search routing (only when git_search is registered) ---
+    git_note = _git_search_routing(registry)
+    if git_note:
+        parts.append(git_note)
 
     # --- DISAMBIGUATION + STEP 4 perf pointers ---
     parts.append(_SLIM_DISAMBIGUATION_POINTER)

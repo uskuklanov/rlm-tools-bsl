@@ -25,6 +25,17 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     parse_rights_xml,
 )
 
+# Regex metacharacters. A pattern with none of these is a plain literal, so a
+# ``git grep -F`` over it is identical to a Python ``re.search`` — that lets
+# safe_grep route literal patterns through the (much faster) git backend while
+# keeping real regexes on Python ``re``.
+_RE_METACHARS = frozenset(r"\^$.|?*+()[]{}")
+
+
+def _is_literal_pattern(pattern: str) -> bool:
+    """True when *pattern* contains no regex metacharacters (treat as literal)."""
+    return not any(c in _RE_METACHARS for c in pattern)
+
 
 class LazyList:
     """Thread-safe lazy-init list with double-check locking."""
@@ -109,6 +120,10 @@ def build_helper_metadata_snapshot() -> dict[str, dict]:
             read_file_fn=_stub_read,
             grep_fn=_stub_grep,
             glob_files_fn=_stub_glob,
+            # Force git_search into the snapshot regardless of the server's cwd /
+            # whether git is reachable, so `rlm_help git_search` is always
+            # documented. Live sessions gate it via "auto" (see make_bsl_helpers).
+            register_git_search="force",
         )
         registry = helpers.get("_registry") or {}
         snapshot: dict[str, dict] = {}
@@ -133,6 +148,7 @@ def make_bsl_helpers(
     idx_reader=None,  # optional IndexReader for SQLite index acceleration
     idx_zero_callers_authoritative: bool = False,
     extension_paths: list[str] | None = None,
+    register_git_search: str = "auto",
 ) -> dict:
     """Creates BSL helper functions for sandbox namespace.
     Internal _bsl_index is built lazily on first find_module() call.
@@ -144,6 +160,11 @@ def make_bsl_helpers(
     find_attributes, parse_object_xml, find_predefined and search() see the
     extension objects. The generic sandbox resolver (helpers.make_helpers) is
     NOT touched — extension files stay invisible to read_file/grep/glob_files.
+
+    ``register_git_search`` controls the opt-in full-text ``git_search`` helper:
+    ``"auto"`` (live sessions) registers it only when *base_path* is under a git
+    work-tree and ``git`` is reachable; ``"force"`` always registers it (used by
+    the rlm_help doc snapshot, independent of cwd/git); ``"never"`` never does.
     """
 
     _base_path_resolved = Path(base_path).resolve()
@@ -177,6 +198,36 @@ def make_bsl_helpers(
     _ext_predefined_cache: dict[tuple[str, str], list[dict]] = {}
     _ext_predefined_cache_built: list[bool] = [False]
     _ext_predefined_cache_lock = threading.Lock()
+
+    # Lazy, per-session git-availability for the full-text search backend.
+    # Cheap ``.git``-ancestor pre-check, confirmed by ``_git_available`` (one
+    # subprocess per session, then cached). Gates git_search registration and
+    # routes safe_grep's literal patterns through the git backend.
+    _git_search_state: dict = {"checked": False, "available": False}
+    _git_search_lock = threading.Lock()
+
+    def _git_search_available() -> bool:
+        if _git_search_state["checked"]:
+            return _git_search_state["available"]
+        with _git_search_lock:
+            if _git_search_state["checked"]:
+                return _git_search_state["available"]
+            avail = False
+            try:
+                has_git = False
+                for cand in (_base_path_resolved, *_base_path_resolved.parents):
+                    if (cand / ".git").exists():  # dir (normal) or file (worktree)
+                        has_git = True
+                        break
+                if has_git:
+                    from rlm_tools_bsl.bsl_index import _git_available
+
+                    avail = bool(_git_available(base_path))
+            except Exception:
+                avail = False
+            _git_search_state["available"] = avail
+            _git_search_state["checked"] = True
+            return avail
 
     def _ext_resolve_safe(path: str) -> Path:
         """Multi-root path resolver: accept any path resolving under base OR any
@@ -682,7 +733,18 @@ def make_bsl_helpers(
         return [p for p in extract_procedures(path) if p["is_export"]]
 
     def safe_grep(pattern: str, name_hint: str = "", max_files: int = 20) -> list[dict]:
-        """Timeout-safe grep across BSL files, optionally scoped by module name hint."""
+        """Timeout-safe grep across BSL files, optionally scoped by module name hint.
+
+        Contract is unchanged: returns ``[{file, line, text}]`` (no sentinel, no
+        result cap — scope is bounded by *max_files* candidates). When the sources
+        are under git **and** *pattern* is a plain literal, the non-extension
+        (base) candidates are searched with a single ``git grep`` call instead of
+        a thread-pool of per-file Python greps — the result is identical (literal
+        == substring) but far cheaper. Real regexes stay on Python ``re`` (git
+        ``-E`` is POSIX ERE, not equivalent to Python ``re``), and extension files
+        always use the Python path (they live outside the sandbox base, which
+        ``git -C base`` would not see).
+        """
         _ensure_index()
 
         if name_hint:
@@ -690,6 +752,33 @@ def make_bsl_helpers(
             paths = [c["path"] for c in candidates[:max_files]]
         else:
             paths = [relative_path for relative_path, _ in _index_state[:max_files]]
+
+        if not paths:
+            return []
+
+        results: list[dict] = []
+        py_paths: list[str] = list(paths)  # files still needing the Python path
+
+        # Fast literal path via git grep over base (non-extension) candidates.
+        if _is_literal_pattern(pattern) and _git_search_available():
+            base_paths = [p for p in paths if p not in _extension_paths_set]
+            if base_paths:
+                from rlm_tools_bsl.bsl_index import _git_grep
+
+                git_res = _git_grep(
+                    base_path,
+                    pattern,
+                    literal_files=base_paths,
+                    regex=False,
+                    mode="lines",
+                    max_results=10**9,  # no cap: scope already bounded by max_files
+                    max_per_file=0,  # no per-file cap (parity with Python path)
+                    include_truncation_sentinel=False,  # strict [{file,line,text}]
+                )
+                if git_res is not None:
+                    results.extend(git_res)
+                    base_set = set(base_paths)
+                    py_paths = [p for p in paths if p not in base_set]
 
         compiled = re.compile(pattern)
 
@@ -712,20 +801,71 @@ def make_bsl_helpers(
             except Exception:
                 return []
 
-        if len(paths) > 1:
+        if len(py_paths) > 1:
             from concurrent.futures import ThreadPoolExecutor as _TP
 
-            with _TP(max_workers=min(8, len(paths))) as pool:
-                all_results = list(pool.map(_grep_one, paths))
-            results = [m for batch in all_results for m in batch]
-        elif paths:
-            results = _grep_one(paths[0])
-        else:
-            results = []
+            with _TP(max_workers=min(8, len(py_paths))) as pool:
+                all_results = list(pool.map(_grep_one, py_paths))
+            for batch in all_results:
+                results.extend(batch)
+        elif py_paths:
+            results.extend(_grep_one(py_paths[0]))
 
         # Deterministic order: sort by (file, line)
         results.sort(key=lambda m: (m.get("file", ""), m.get("line", 0)))
         return results
+
+    def git_search(
+        pattern: str,
+        path: str = "",
+        file_types: str = "",
+        regex: bool = False,
+        ignore_case: bool = False,
+        mode: str = "lines",
+        max_results: int = 200,
+    ) -> list[dict]:
+        """Full-text search across ALL files under git (opt-in, only when the
+        sources are a git work-tree).
+
+        Unlike ``safe_grep`` (scoped to a known module / a bounded candidate set)
+        this searches every tracked + untracked-not-ignored file — including raw
+        ``.xml``/``.mdo`` (forms, rights, DCS, ConfigDumpInfo) and procedure
+        bodies / string literals / query text that the name-based helpers and the
+        SQLite index never see.
+
+        Args:
+            pattern: literal substring (default) or POSIX ERE when *regex* is True.
+            path: optional subtree/file filter (e.g. ``"CommonModules"``).
+            file_types: optional comma-separated extensions (e.g. ``"bsl,xml"``).
+            regex: treat *pattern* as POSIX ERE. NOTE: on CRLF files a trailing
+                CR sits before the line end, so the ``$`` anchor needs
+                ``[[:space:]]*$`` (git matches bytes and its ERE does NOT read
+                ``\\r`` as a carriage return — it is a literal ``r``).
+            ignore_case: case-insensitive match.
+            mode: ``"lines"`` → ``[{file, line, text}]``; ``"files"`` → ``[{file}]``
+                (cheap overview — use first on common tokens, then drill down).
+            max_results: cap; when hit, the last element is
+                ``{"_truncated": True, "shown": max_results}``.
+
+        Returns the hit list, or ``[{"error": ...}]`` if git grep failed / timed
+        out / a filter was malformed (distinct from ``[]`` = nothing found).
+        """
+        from rlm_tools_bsl.bsl_index import _git_grep
+
+        res = _git_grep(
+            base_path,
+            pattern,
+            path=path,
+            file_types=file_types,
+            regex=regex,
+            ignore_case=ignore_case,
+            mode=mode,
+            max_results=max_results,
+            include_truncation_sentinel=True,
+        )
+        if res is None:
+            return [{"error": "git grep failed or timed out"}]
+        return res
 
     def read_procedure(
         path: str, proc_name: str, include_overrides: bool = False, numbered: bool = False
@@ -6230,6 +6370,42 @@ def make_bsl_helpers(
         "help(task='') -> str  # get recipe: help('exports'), help('movements'), help('flow')",
         "navigation",
     )
+
+    # git_search — opt-in full-text backend. Registered only when the sources
+    # are under git ("auto", live sessions) or unconditionally for the rlm_help
+    # doc snapshot ("force"); never under "never".
+    _want_git_search = register_git_search == "force" or (register_git_search == "auto" and _git_search_available())
+    if _want_git_search:
+        _reg(
+            "git_search",
+            git_search,
+            "git_search(pattern, path='', file_types='', regex=False, ignore_case=False, mode='lines', max_results=200)"
+            " -> [{file,line,text}] | [{file}] (mode='files'). FULL-TEXT over ALL files incl. raw XML/forms/queries."
+            " Only available when sources are under git.",
+            "navigation",
+            [
+                "полнотекст",
+                "поиск везде",
+                "grep по всем файлам",
+                "найти подстроку",
+                "найти строку",
+                "найти текст",
+                "xml поиск",
+                "git_search",
+                "git grep",
+            ],
+            "FULL-TEXT SEARCH — all files, incl. raw XML/forms/rights/DCS/queries (only under git):\n"
+            "  hits = git_search('VIN')                       # substring anywhere\n"
+            "  hits = git_search('VIN', file_types='xml')     # narrow to a file type\n"
+            "  hits = git_search('VIN', path='Catalogs', mode='files')  # overview: which files\n"
+            "  for h in hits:\n"
+            "      print(h.get('file'), h.get('line'), h.get('text', ''))\n"
+            "  # Searches CURRENT on-disk state (incl. uncommitted + new untracked); .gitignore'd skipped.\n"
+            "  # Anti-noise on common tokens: start with mode='files' or a narrow file_types/path, then drill down.\n"
+            "  # Mind max_results / the {'_truncated': True} sentinel; regex=True is POSIX ERE\n"
+            "  #   (end-of-line anchor on CRLF files needs '[[:space:]]*$', not '$').\n"
+            "  # On failure returns [{'error': ...}] (NOT []). For a known module use safe_grep instead.",
+        )
 
     # ── Return all helpers (auto-generated from registry) ────────
     return {
