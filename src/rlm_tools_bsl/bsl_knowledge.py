@@ -169,7 +169,7 @@ Step 2 — READ: understand the code
 
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
-  find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
+  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
   safe_grep(pattern, hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
@@ -220,10 +220,14 @@ get_object_full_structure(name) vs analyze_object(name):
   - analyze_object → metadata + modules + procedures_count + exports. Тяжелее, читает все модули.
   Сначала get_object_full_structure; analyze_object — только если нужны процедуры.
 
-find_call_hierarchy(name, depth=N) vs find_callers_context(name):
+find_call_hierarchy(name, depth=N, module_hint=...) vs find_callers_context(name):
   - find_callers_context → 1 уровень callers + контекст вызова (line/text). Быстрее.
   - find_call_hierarchy → N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.
-  Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy.
+    + module_hint у hierarchy: для ОДНОИМЁННЫХ объектных методов (ОбработкаПроведения и т.п.)
+      привязывает корень к одному модулю → exact-режим (точные рёбра по callee_key, без однофамильцев).
+      Глубже exact распространяется сам. Доверие к рёбрам — в _meta (root_exact/exact_rows/fallback_rows).
+  Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy
+  (с module_hint, если корень — неуникальный объектный метод).
 
 find_callers(name) vs find_callers_context(name):
   - find_callers          → COMPACT FIRST PAGE: тонкая обёртка над find_callers_context,
@@ -352,8 +356,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "analyze_document_flow('ДокИмя') → проводки + подписки + рег.задания",
             "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting','Проведение','ПередЗаписью','ПриЗаписи']) → подписки на ключевые события документа",
             "read_procedure(path, 'ОбработкаПроведения') → код проведения",
-            "find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
-            "find_callers_context('ОбработкаПроведения') → 1 уровень callers + контекст вызова",
+            "find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.ДокИмя', depth=2) → транзитивные вызывающие. module_hint ОБЯЗАТЕЛЕН: ОбработкаПроведения одноимённа в сотнях документов → без hint root_exact=False и в дерево попадут ложные звенья от однофамильцев (hint у тебя уже есть — это path из read_procedure)",
+            "find_callers_context('ОбработкаПроведения', module_hint='Документ.ДокИмя') → 1 уровень callers + контекст вызова (тоже с hint — точные рёбра)",
             "ALT: search_methods('Проведение') если имя процедуры нестандартное",
         ],
     },
@@ -576,25 +580,33 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "иерархия вызовов": {
         "compact": [
             "find_call_hierarchy('ПроцИмя', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
+            "Одноимённый ОБЪЕКТНЫЙ метод (ОбработкаПроведения) → добавь module_hint='Документ.X' для точности (exact-режим)",
+            "Экспортный метод общего модуля с уникальным во всей БД именем → hint не нужен (exact сам); если root_exact=False — имя неуникально, передай module_hint",
             "Для одного уровня + контекст строк используй find_callers_context('ПроцИмя')",
             "direction='callees' пока не поддерживается (возвращает error-dict с hint)",
         ],
         "full": [
-            "tree = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)",
-            "Дерево по уровням: tree['tree'][i]['callers'][j]['callers'][k]...",
-            "tree['truncated_targets'] — список одноимённых методов с >200 callers (популярные имена)",
+            "tree = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)",
+            "module_hint привязывает КОРЕНЬ к одному модулю → exact-режим убирает ложные звенья от однофамильцев",
+            "Формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name; глубже обход exact идёт сам (по rel_path caller'а)",
+            "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows, node['meta'].target_exact, node['target_key']=rel_path::метод",
+            "Дерево по узлам: tree['tree'][i] = {name, target_hint, target_key, meta, callers}",
+            "tree['truncated_targets'] — список узлов с >200 callers (популярные имена)",
             "tree['visited'] — общее число уникальных узлов в обходе",
-            "Если name неоднозначный (омонимы в разных модулях) — раскроет всех носителей",
+            "БЕЗ hint для одноимённого объектного метода exact на корне НЕ включится → _meta.root_exact=False, раскроет всех носителей по имени",
+            "_meta.node_budget_exceeded=True → широкий корень без hint упёрся в visited_cap, дерево частичное; hint и точнее, и ограничивает обход",
             "ALT: find_callers_context('ПроцИмя') для одного уровня с контекстом строк и file:line",
             "ALT: find_callers_context('ПроцИмя', module_hint='ОбщегоНазначения') для disambig'а омонимов",
         ],
         "code_hint": (
-            "tree = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)\n"
-            "print(f\"visited={tree.get('visited')} truncated={tree.get('truncated_targets', [])}\")\n"
+            "tree = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
+            "m = tree.get('_meta', {})\n"
+            "print(f\"root_exact={m.get('root_exact')} exact_rows={m.get('exact_rows')} fallback_rows={m.get('fallback_rows')}\")\n"
             "for node in tree.get('tree', []):\n"
-            "    print(f\"{node['name']} ({len(node.get('callers', []))} L1)\")\n"
+            "    mark = 'EXACT' if node['meta']['target_exact'] else 'name'\n"
+            "    print(f\"{node['name']} [{mark}] ({len(node.get('callers', []))} callers)\")\n"
             "    for caller in node.get('callers', [])[:5]:\n"
-            "        print(f\"  ← {caller['name']} ({len(caller.get('callers', []))} L2)\")"
+            "        print(f\"  ← {caller['caller_name']} ({caller['object_name']} {caller['module_path']}:{caller['line']})\")"
         ),
     },
     "расширения": {
@@ -989,7 +1001,8 @@ def _build_full_strategy(
         # Workflow hints
         tips = [
             "INDEX TIPS:",
-            "  - find_callers_context() returns instantly — no need to limit scope with hint, search the whole codebase.",
+            "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
+            "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноимённых объектных методов (ОбработкаПроведения, ПередЗаписью) hint включает exact-режим (точные рёбра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
             "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
             "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
             "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
@@ -1313,7 +1326,8 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
 
     tips = [
         "INDEX TIPS:",
-        "  - find_callers_context() returns instantly — no need to limit scope with hint, search the whole codebase.",
+        "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
+        "  - НО module_hint у find_call_hierarchy/find_callers_context — это ТОЧНОСТЬ, не скорость: для одноимённых объектных методов (ОбработкаПроведения, ПередЗаписью) hint включает exact-режим (точные рёбра по callee_key, без однофамильцев из других модулей); экспортному методу общего модуля hint не нужен, ЕСЛИ его имя уникально во всей БД — иначе (root_exact=False) передай module_hint.",
         "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
         "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
         "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",

@@ -31,6 +31,15 @@ from rlm_tools_bsl.bsl_xml_parsers import (
 # keeping real regexes on Python ``re``.
 _RE_METACHARS = frozenset(r"\^$.|?*+()[]{}")
 
+# Backstop for find_call_hierarchy BFS: a hard cap on distinct visited targets.
+# visited-by-target (v1.16.0) correctly keeps same-named callers from different
+# modules as separate nodes, but a wide root with no hint (e.g. ОбработкаПроведения,
+# called by ~150 documents that each re-call it) can fan out into hundreds of
+# exact-mode targets. Unreachable for small/medium trees (namesake tests touch a
+# handful of nodes); only bounds the pathological wide-root case. Read as a module
+# global at call time so tests can monkeypatch it.
+_HIERARCHY_VISITED_CAP = 2000
+
 
 def _is_literal_pattern(pattern: str) -> bool:
     """True when *pattern* contains no regex metacharacters (treat as literal)."""
@@ -1209,6 +1218,11 @@ def make_bsl_helpers(
                 "returned": len(callers),
                 "offset": offset,
                 "has_more": (offset + limit) < total_files,
+                # FS fallback (no call index): exact (resolved) mode unavailable.
+                "exact_available": False,
+                "target_exact": False,
+                "exact_rows": 0,
+                "fallback_rows": len(callers),
             },
         }
 
@@ -1216,30 +1230,49 @@ def make_bsl_helpers(
         name: str,
         direction: str = "callers",
         depth: int = 2,
+        module_hint: str = "",
     ) -> dict:
-        """Build multi-level call hierarchy. v1.10.0: only direction='callers'
-        (uses existing idx_calls_callee). callees/both → structured error-dict.
+        """Build multi-level call hierarchy. Only direction='callers'
+        (uses idx_calls_callee). callees/both → structured error-dict.
 
         Args:
             name: Target procedure/function name.
-            direction: 'callers' only in v1.10.0.
+            direction: 'callers' only.
             depth: Levels to traverse (1..3, default 2).
+            module_hint: Optional disambiguator for the ROOT target — enables the
+                exact (resolved) call-graph mode for same-named object methods
+                (e.g. ОбработкаПроведения in many Documents). Forms:
+                  - rel_path (the precise form, e.g. 'Documents/X/.../ObjectModule.bsl');
+                  - public 'Документ.X' / 'Document.X' (RU/EN);
+                  - bare object_name 'РеализацияТоваровУслуг'.
+                An exported common-module method needs no hint ONLY if its name is
+                globally unique across the whole DB (no-hint exact requires global
+                name-uniqueness); if root_exact=False the name is ambiguous — pass
+                module_hint. Deeper levels propagate each caller's rel_path
+                automatically, so the exact mode continues without per-level hints.
 
         Returns:
-            On success: {root, direction, depth, tree:[{name, callers:[...]}], visited}
-              where each caller is {caller_name, module_path, category, object_name,
-              line, is_export, level}.
+            On success: {root, direction, depth, tree, visited, truncated_targets, _meta}
+              where each tree node is
+                {name, target_hint, target_key, meta:{exact_rows, fallback_rows,
+                 exact_available, target_exact}, callers:[...]}
+              and each caller is {caller_name, module_path, category, object_name,
+              line, is_export, level}. top-level _meta:
+                {exact_available, root_exact, exact_targets, fallback_targets,
+                 exact_rows, fallback_rows, node_budget_exceeded, visited_cap}.
+                node_budget_exceeded=True means a wide root hit visited_cap and the
+                tree is partial (level-ordered) — pass module_hint to narrow it.
             On unsupported direction: {error, hint, supported_directions}.
         """
         if direction not in ("callers", "callees", "both"):
             return {
                 "error": f"Unknown direction: {direction!r}",
-                "hint": "Use direction='callers' (the only supported direction in v1.10.0).",
+                "hint": "Use direction='callers' (the only supported direction).",
                 "supported_directions": ["callers"],
             }
         if direction != "callers":
             return {
-                "error": f"Direction '{direction}' not supported in v1.10.0",
+                "error": f"Direction '{direction}' not supported",
                 "hint": (
                     "Use direction='callers' to find callers transitively. "
                     "For callees, the alternative is: extract_procedures(path) + "
@@ -1260,47 +1293,81 @@ def make_bsl_helpers(
             "tree": [],
             "visited": 0,
             "truncated_targets": [],
+            "_meta": {
+                "exact_available": False,
+                "root_exact": False,
+                "exact_targets": 0,
+                "fallback_targets": 0,
+                "exact_rows": 0,
+                "fallback_rows": 0,
+                # Node-budget backstop (see _HIERARCHY_VISITED_CAP). Always present
+                # so the contract is stable; True only if the BFS hit the cap and
+                # returned a partial (but connected, level-ordered) tree.
+                "node_budget_exceeded": False,
+                "visited_cap": _HIERARCHY_VISITED_CAP,
+            },
         }
 
-        # BFS by levels with cycle protection ON NAME (not on (name, level)).
-        # Если cycle A → B → A: на уровне 1 обрабатываем A, на уровне 2 — B,
-        # на уровне 3 пытаемся снова A. С protection (name, level) ключ (A, 3)
-        # отличается от (A, 1) и A обрабатывается заново → дубликаты + ложное
-        # ощущение «глубокого» дерева. С protection по имени — A обрабатывается
-        # один раз, цикл корректно отсекается.
-        visited_names: set[str] = set()
-        queue: list[tuple[str, int]] = [(name, 1)]
-        # Group callers by callee name for tree[i].
-        by_target: dict[str, list[dict]] = {}
-        # Аккумуляция truncated targets — find_callers_context имеет limit=200
-        # и при популярных методах легко обрезается; молча терять данные нельзя.
-        per_target_truncation: dict[str, dict] = {}
+        # BFS with cycle protection BY TARGET (not by bare name). Queue entries
+        # are (target_name, level, hint):
+        #   - root hint = the user-supplied module_hint (may be '');
+        #   - deeper levels propagate the caller's rel_path (most precise) so the
+        #     exact mode stays engaged automatically.
+        # The visited-key flavor depends on whether the target resolved exactly
+        # (known only AFTER calling find_callers_context):
+        #   - exact branch  → (name.casefold(), target_key=rel_path::method) so two
+        #     same-named callers in different modules are NOT collapsed;
+        #   - fallback branch → (name.casefold(), '') — legacy name-only behavior,
+        #     no precision to preserve.
+        visited: set[tuple[str, str]] = set()
+        queue: list[tuple[str, int, str]] = [(name, 1, module_hint or "")]
+        per_target_truncation: dict[tuple[str, str], dict] = {}
+        root_seen = False
 
         while queue:
-            target_name, level = queue.pop(0)
-            name_key = target_name.lower()
-            if name_key in visited_names:
-                continue
-            visited_names.add(name_key)
-            result["visited"] += 1
+            # Node-budget backstop: stop BEFORE the next (expensive) lookup once
+            # the cap is reached. BFS is level-ordered (append-tail / pop-head) so
+            # the returned tree stays connected and shallow-first.
+            if result["visited"] >= _HIERARCHY_VISITED_CAP:
+                result["_meta"]["node_budget_exceeded"] = True
+                break
+            target_name, level, hint = queue.pop(0)
+            name_cf = target_name.casefold()
 
             try:
-                ctx = find_callers_context(target_name, module_hint="", offset=0, limit=200)
+                ctx = find_callers_context(target_name, module_hint=hint, offset=0, limit=200)
             except Exception:
                 continue
+            if not isinstance(ctx, dict):
+                continue
 
-            callers_list: list = []
-            if isinstance(ctx, dict):
-                callers_list = ctx.get("callers", []) or []
-                meta = ctx.get("_meta", {}) or {}
-                if meta.get("has_more"):
-                    per_target_truncation[target_name] = {
-                        "name": target_name,
-                        "level": level,
-                        "total": meta.get("total_callers"),
-                        "returned": meta.get("returned"),
-                    }
+            callers_list = ctx.get("callers", []) or []
+            meta = ctx.get("_meta", {}) or {}
+            target_exact = bool(meta.get("target_exact", False))
+            exact_available = bool(meta.get("exact_available", False))
+            target_key = meta.get("target_key") if target_exact else None
 
+            # visited-key: exact → keep target identity; fallback → name only.
+            vkey = (name_cf, target_key or "") if (target_exact and target_key) else (name_cf, "")
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            result["visited"] += 1
+
+            if not root_seen:
+                root_seen = True
+                result["_meta"]["exact_available"] = exact_available
+                result["_meta"]["root_exact"] = target_exact
+
+            if meta.get("has_more"):
+                per_target_truncation[vkey] = {
+                    "name": target_name,
+                    "level": level,
+                    "total": meta.get("total_callers"),
+                    "returned": meta.get("returned"),
+                }
+
+            node_callers: list[dict] = []
             for c in callers_list:
                 caller_dict = {
                     "caller_name": c.get("caller_name", ""),
@@ -1311,14 +1378,39 @@ def make_bsl_helpers(
                     "is_export": bool(c.get("caller_is_export", False)),
                     "level": level,
                 }
-                by_target.setdefault(target_name, []).append(caller_dict)
+                node_callers.append(caller_dict)
                 if level < depth_int:
                     next_name = c.get("caller_name", "")
-                    if next_name and next_name.lower() not in visited_names:
-                        queue.append((next_name, level + 1))
+                    if next_name:
+                        # Propagate the caller's rel_path as the next hint — the
+                        # most precise form, keeps exact mode engaged on descent.
+                        queue.append((next_name, level + 1, c.get("file", "")))
 
-        for target_name, callers_list in by_target.items():
-            result["tree"].append({"name": target_name, "callers": callers_list})
+            node_meta = {
+                "exact_rows": meta.get("exact_rows", 0),
+                "fallback_rows": meta.get("fallback_rows", len(node_callers)),
+                "exact_available": exact_available,
+                "target_exact": target_exact,
+            }
+            result["tree"].append(
+                {
+                    "name": target_name,
+                    "target_hint": hint or None,
+                    "target_key": target_key,
+                    "meta": node_meta,
+                    "callers": node_callers,
+                }
+            )
+
+        # Top-level aggregates from per-target meta.
+        for node in result["tree"]:
+            nm = node["meta"]
+            if nm["target_exact"]:
+                result["_meta"]["exact_targets"] += 1
+            else:
+                result["_meta"]["fallback_targets"] += 1
+            result["_meta"]["exact_rows"] += int(nm.get("exact_rows") or 0)
+            result["_meta"]["fallback_rows"] += int(nm.get("fallback_rows") or 0)
         result["truncated_targets"] = list(per_target_truncation.values())
 
         return result
@@ -5653,7 +5745,7 @@ def make_bsl_helpers(
     _reg(
         "find_callers_context",
         find_callers_context,
-        "find_callers_context(proc, module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more}}",
+        "find_callers_context(proc, module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # exact_rows/fallback_rows: точные (по callee_key) vs эвристические (по имени) рёбра",
         "code",
         ["caller", "call graph", "граф", "вызов", "вызыва", "кто вызывает", "find_callers"],
         "BUILD CALL GRAPH:\n"
@@ -5675,10 +5767,14 @@ def make_bsl_helpers(
     _reg(
         "find_call_hierarchy",
         find_call_hierarchy,
-        "find_call_hierarchy(name, direction='callers', depth=2) -> "
-        "{root, direction, depth, tree:[{name, callers:[{caller_name, module_path, category, "
-        "object_name, line, is_export, level}]}], visited:int, "
-        "truncated_targets:[{name, level, total, returned}]} | {error, hint, supported_directions}",
+        "find_call_hierarchy(name, direction='callers', depth=2, module_hint='') -> "
+        "{root, direction, depth, tree:[{name, target_hint, target_key, "
+        "meta:{exact_rows, fallback_rows, exact_available, target_exact}, "
+        "callers:[{caller_name, module_path, category, object_name, line, is_export, level}]}], "
+        "visited:int, truncated_targets:[{name, level, total, returned}], "
+        "_meta:{exact_available, root_exact, exact_targets, fallback_targets, exact_rows, fallback_rows, "
+        "node_budget_exceeded, visited_cap}} "
+        "| {error, hint, supported_directions}",
         "code",
         [
             "иерархия вызовов",
@@ -5690,7 +5786,7 @@ def make_bsl_helpers(
             "транзитивный",
         ],
         "BUILD CALL HIERARCHY (multi-level callers tree):\n"
-        "  # depth=1..3 (по умолчанию 2). Только direction='callers' в v1.10.0.\n"
+        "  # depth=1..3 (по умолчанию 2). Только direction='callers'.\n"
         "  res = find_call_hierarchy('ОбработкаПроведения', direction='callers', depth=2)\n"
         "  if 'error' in res:\n"
         "      print(res['hint'])  # callees/both пока не поддержаны\n"
@@ -5698,12 +5794,26 @@ def make_bsl_helpers(
         "      for node in res['tree']:\n"
         "          for c in node['callers']:\n"
         "              print(f\"  L{c['level']} {c['caller_name']} <- {c['object_name']} ({c['module_path']}:{c['line']})\")\n"
-        "      # Если на каком-то таргете callers > 200 — узел truncated, дерево неполное:\n"
-        "      for t in res['truncated_targets']:\n"
-        "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): returned {t['returned']}/{t['total']}\")\n"
-        "          # для полного списка callers конкретного метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
-        "  # Одноимённые методы возвращают список носителей — выбирай по object_name/category\n"
-        "  # Для глубины 1 эффективнее обычный find_callers_context()",
+        "      for t in res['truncated_targets']:  # callers>200 на узле — дерево неполное\n"
+        "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): {t['returned']}/{t['total']}\")\n"
+        "          # полный список callers метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
+        "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЁННЫХ объектных методов (ОбработкаПроведения,\n"
+        "  #   ПередЗаписью в сотнях документов) передай module_hint — привяжет КОРЕНЬ к одному\n"
+        "  #   модулю и уберёт ложные звенья от однофамильцев:\n"
+        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.РеализацияТоваровУслуг', depth=2)\n"
+        "  #   формы hint: rel_path | 'Документ.X'/'Document.X' | голый object_name.\n"
+        "  #   Экспортному методу общего модуля hint НЕ нужен, ЕСЛИ его имя уникально во всей БД\n"
+        "  #   (exact включится сам); если root_exact=False — имя неуникально, передай module_hint.\n"
+        "  #   Глубже 1-го уровня обход идёт по rel_path найденного caller'а → exact автоматически.\n"
+        "  # ДОВЕРИЕ к рёбрам — читай _meta:\n"
+        "  #   _meta.exact_available — поддерживает ли схема индекса точный режим (callee_key);\n"
+        "  #   _meta.root_exact      — включился ли exact на корне (иначе корень по имени, возможны однофамильцы);\n"
+        "  #   _meta.exact_rows/fallback_rows — сколько рёбер точные vs эвристические (по имени);\n"
+        "  #   node['meta'].target_exact — точен ли конкретный узел; node['target_key'] = rel_path::метод.\n"
+        "  # Одноимённые методы без hint возвращают список носителей — выбирай по object_name/category.\n"
+        "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
+        "  #     (по уровням): передай module_hint, чтобы и сузить, и ускорить обход.\n"
+        "  # Для глубины 1 эффективнее обычный find_callers_context().",
     )
     _reg(
         "find_callers",

@@ -33,7 +33,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 13
+BUILDER_VERSION = 14
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -194,6 +194,137 @@ _BSL_KEYWORDS: frozenset[str] = frozenset(
 # Case-insensitive set for fast lookup
 _BSL_KEYWORDS_LOWER: frozenset[str] = frozenset(k.lower() for k in _BSL_KEYWORDS)
 
+
+# ---------------------------------------------------------------------------
+# Call-graph resolution helpers (v1.16.0)
+# ---------------------------------------------------------------------------
+def _make_callee_key(rel_path: str, method_name: str) -> str:
+    """Build the stable resolved-target key for a call edge.
+
+    Key = ``"<rel_path>::<casefold(method_name)>"`` with the path separator
+    normalized to ``/``. ``rel_path`` is UNIQUE in ``modules`` and survives a
+    rebuild / rowid re-creation, so the key stays valid after an incremental
+    update (unlike a ``methods.id`` rowid, which is re-issued for changed
+    modules). The SAME helper is used on build-time (resolver) and query-time
+    (target resolution in ``IndexReader.get_callers``) so keys match byte-for-byte.
+    """
+    norm_path = rel_path.replace("\\", "/")
+    return f"{norm_path}::{method_name.casefold()}"
+
+
+def _callee_short_expr(col: str = "callee_name") -> str:
+    """SQL expression yielding the bare method name (suffix after the dot).
+
+    ``callee_name`` has ALWAYS 0 or 1 dot (extractor regex ``(\\w+)\\.(\\w+)``),
+    so the substring after the dot is the method name; with no dot the column
+    itself is the name. This is the SINGLE SOURCE of the expression used by both
+    the ``idx_calls_callee_short`` index DDL and ``get_callers`` query-building
+    (Codex finding 2 — copies would silently drift into a full-scan regression).
+    """
+    return f"(CASE WHEN instr({col},'.')>0 THEN substr({col}, instr({col},'.')+1) ELSE {col} END)"
+
+
+def _callee_match_clause(proc_name: str, col: str = "callee_name") -> tuple[str, str]:
+    """Indexed equality clause matching callers of ``proc_name``; (sql, param).
+
+    Replaces the leading-wildcard ``callee_name = ? OR callee_name LIKE '%.name'``
+    (the ``%`` prefix forbade index use → full scan of ~3.7M rows). Because
+    ``callee_name`` has ≤1 dot:
+
+    * **bare ``proc_name``** → match the method-name suffix
+      (``idx_calls_callee_short``): equals ``proc_name`` for both bare and
+      ``X.proc_name`` qualified edges — same recall as the old clause, indexed.
+    * **dotted ``Module.Method``** → match the FULL ``callee_name``
+      (``idx_calls_callee``), preserving legacy behavior (a suffix match would
+      drop the qualifier; the old ``LIKE '%.Module.Method'`` never fired at ≤1 dot).
+
+    ``COLLATE NOCASE`` is load-bearing: without it the planner ignores the
+    case-insensitive expression index and falls back to a scan.
+    """
+    if "." in proc_name:
+        return (f"{col} = ? COLLATE NOCASE", proc_name)
+    return (f"{_callee_short_expr(col)} = ? COLLATE NOCASE", proc_name)
+
+
+# module_hint normalization for IndexReader.get_callers / find_call_hierarchy.
+# Maps a casefolded RU/EN singular metadata prefix → the ``modules.category``
+# value. This is a module-level map living next to IndexReader on purpose: the
+# analogous bsl_helpers._normalize_object_ref / _RU_META_PREFIXES are nested
+# inside the make_bsl_helpers closure and are NOT importable here (would create
+# a circular dependency). Keep this minimal and aligned with
+# format_detector.METADATA_CATEGORIES.
+_HINT_PREFIX_TO_CATEGORY: dict[str, str] = {
+    "документ": "Documents",
+    "document": "Documents",
+    "справочник": "Catalogs",
+    "catalog": "Catalogs",
+    "перечисление": "Enums",
+    "enum": "Enums",
+    "регистрсведений": "InformationRegisters",
+    "informationregister": "InformationRegisters",
+    "регистрнакопления": "AccumulationRegisters",
+    "accumulationregister": "AccumulationRegisters",
+    "регистрбухгалтерии": "AccountingRegisters",
+    "accountingregister": "AccountingRegisters",
+    "регистррасчета": "CalculationRegisters",
+    "calculationregister": "CalculationRegisters",
+    "планвидовхарактеристик": "ChartsOfCharacteristicTypes",
+    "chartofcharacteristictypes": "ChartsOfCharacteristicTypes",
+    "плансчетов": "ChartsOfAccounts",
+    "chartofaccounts": "ChartsOfAccounts",
+    "планвидоврасчета": "ChartsOfCalculationTypes",
+    "chartofcalculationtypes": "ChartsOfCalculationTypes",
+    "планобмена": "ExchangePlans",
+    "exchangeplan": "ExchangePlans",
+    "бизнеспроцесс": "BusinessProcesses",
+    "businessprocess": "BusinessProcesses",
+    "задача": "Tasks",
+    "task": "Tasks",
+    "отчет": "Reports",
+    "report": "Reports",
+    "обработка": "DataProcessors",
+    "dataprocessor": "DataProcessors",
+    "константа": "Constants",
+    "constant": "Constants",
+    "общиймодуль": "CommonModules",
+    "commonmodule": "CommonModules",
+}
+
+
+def _normalize_module_hint(hint: str) -> tuple[str | None, str | None, str | None]:
+    """Normalize a ``module_hint`` into ``(rel_path, category, object_name)``.
+
+    Three accepted forms (exactly one tuple slot is populated besides
+    ``object_name`` for the public form):
+      - ``rel_path`` (contains ``/`` or ``\\``) → ``(<norm_path>, None, None)`` —
+        the most precise, unambiguous form (used for deep propagation);
+      - public ``Документ.X`` / ``Document.X`` (RU/EN prefix) →
+        ``(None, "Documents", "X")``;
+      - bare ``object_name`` (``РеализацияТоваровУслуг``) →
+        ``(None, None, "X")``.
+
+    Returns all-``None`` for an empty/None hint. An unknown dotted prefix is
+    treated as a bare object_name (it simply will not match → no exact mode,
+    name-based fallback still applies).
+    """
+    if not hint:
+        return (None, None, None)
+    h = hint.strip()
+    if not h:
+        return (None, None, None)
+    if "/" in h or "\\" in h:
+        return (h.replace("\\", "/"), None, None)
+    if "." in h:
+        prefix, _, obj = h.partition(".")
+        category = _HINT_PREFIX_TO_CATEGORY.get(prefix.casefold())
+        if category and obj:
+            return (None, category, obj)
+        # Unknown prefix — not a recognized metadata reference; treat the whole
+        # token as a bare object_name (will not match a dotted object_name).
+        return (None, None, h)
+    return (None, None, h)
+
+
 # ---------------------------------------------------------------------------
 # SQL schema
 # ---------------------------------------------------------------------------
@@ -231,13 +362,16 @@ CREATE TABLE IF NOT EXISTS calls (
     id INTEGER PRIMARY KEY,
     caller_id INTEGER NOT NULL REFERENCES methods(id),
     callee_name TEXT NOT NULL,
-    line INTEGER
+    line INTEGER,
+    callee_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mod_object ON modules(object_name);
 CREATE INDEX IF NOT EXISTS idx_mod_category ON modules(category);
 CREATE INDEX IF NOT EXISTS idx_meth_name ON methods(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_meth_module ON methods(module_id);
 CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_calls_callee_key ON calls(callee_key);
 -- idx_calls_caller removed: saves ~56MB on ERP, update uses callee-based cleanup instead
 
 -- Level-2 metadata tables (optional, controlled by --no-metadata flag)
@@ -512,6 +646,16 @@ CREATE TABLE IF NOT EXISTS metadata_code_usages (
 );
 CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(object_ref_key);
 """
+
+# Expression index for the bare method-name suffix (v1.16.0): lets get_callers /
+# find_call_hierarchy match callers by method name via index equality instead of
+# a leading-wildcard ``LIKE '%.name'`` full scan. Appended (not f-string-ified
+# into the big literal above) so the DDL is built from the SINGLE-SOURCE
+# _callee_short_expr — covers BOTH executescript sites (empty-repo + normal build)
+# with no DDL duplication / drift (Codex round-4).
+_SCHEMA_SQL += (
+    f"CREATE INDEX IF NOT EXISTS idx_calls_callee_short ON calls({_callee_short_expr('callee_name')} COLLATE NOCASE);\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1982,24 +2126,33 @@ def _extract_calls_from_body(
     """
     calls: list[tuple[str, int]] = []
 
-    # Iterate over body lines (skip definition and end lines)
-    body_start = start_line  # 1-based def line — skip it
+    # Body line range (0-based indices): skip the definition line and the
+    # EndProcedure/EndFunction line.
+    body_start = start_line  # 0-based index of the first body line (def skipped)
     body_end = min(end_line - 1, len(lines))  # skip EndProcedure line
+    if body_start >= body_end:
+        return calls
 
-    for line_idx in range(body_start, body_end):  # 0-based index = body_start .. body_end-1
-        if line_idx >= len(lines):
-            break
-        raw_line = lines[line_idx]
-        cleaned = _strip_code_line(raw_line)
-        if not cleaned.strip():
+    # Use the multi-line-aware scanner instead of a per-line strip: ``code`` has
+    # string literals (incl. multi-line query texts opened with a continuation
+    # ``|``) and comments already removed across line boundaries. This stops
+    # query-language functions like ЕСТЬNULL(/ВЫРАЗИТЬ(/СУММА( inside multi-line
+    # string literals from leaking in as false call edges (a per-line strip
+    # cannot see that a continuation line is still inside a string).
+    #
+    # Line numbering: _scan_module yields 1-based ``lineno`` relative to the
+    # slice ``lines[body_start:body_end]``; the absolute 1-based line number of
+    # the original file is ``body_start + lineno``.
+    for lineno, code, _strings in _scan_module(lines[body_start:body_end]):
+        if not code.strip():
             continue
 
-        line_number = line_idx + 1  # 1-based
+        line_number = body_start + lineno  # 1-based absolute
 
         seen_on_line: set[str] = set()
 
         # Qualified calls first: Module.Method(
-        for qm in _QUALIFIED_CALL_RE.finditer(cleaned):
+        for qm in _QUALIFIED_CALL_RE.finditer(code):
             module_part = qm.group(1)
             method_part = qm.group(2)
             if module_part.lower() in _BSL_KEYWORDS_LOWER:
@@ -2012,7 +2165,7 @@ def _extract_calls_from_body(
                 calls.append((callee, line_number))
 
         # Simple calls: FunctionName(
-        for sm in _SIMPLE_CALL_RE.finditer(cleaned):
+        for sm in _SIMPLE_CALL_RE.finditer(code):
             func_name = sm.group(1)
             if func_name.lower() in _BSL_KEYWORDS_LOWER:
                 continue
@@ -2021,7 +2174,7 @@ def _extract_calls_from_body(
             if func_name not in seen_on_line:
                 # Check this isn't the method part of a qualified call
                 start_pos = sm.start()
-                if start_pos > 0 and cleaned[start_pos - 1] == ".":
+                if start_pos > 0 and code[start_pos - 1] == ".":
                     continue
                 seen_on_line.add(func_name)
                 calls.append((func_name, line_number))
@@ -5331,6 +5484,7 @@ class IndexBuilder:
         conn.executescript(_SCHEMA_SQL)
 
         self._bulk_insert(conn, results, build_calls)
+        self._refresh_call_resolution_stats(conn)
 
         # Level-1 metadata: Configuration XML
         config_meta = _parse_configuration_meta(base_path)
@@ -5546,12 +5700,16 @@ class IndexBuilder:
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'has_synonyms'").fetchone()
         has_synonyms = meta_row is None or meta_row["value"] == "1"
 
-        # Schema upgrades that add code-derived tables (regions/module_headers in
-        # v8, metadata_code_usages in v13) cannot be back-filled incrementally —
-        # they require a one-time full rebuild. Threshold = newest such version.
+        # Schema upgrades that add code-derived tables/columns (regions/
+        # module_headers in v8, metadata_code_usages in v13, calls.callee_key in
+        # v14) cannot be back-filled incrementally — they require a one-time full
+        # rebuild that recreates the schema. Threshold = newest such version.
+        # NB: a plain version bump without this forced rebuild would route v13
+        # DBs into the version-mismatch full *scan* below, which INSERTs into the
+        # OLD schema (no callee_key column) and fails — so the rebuild is required.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 13:
+        if old_version < 14:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -5574,6 +5732,17 @@ class IndexBuilder:
                 "git_fast_path": False,
                 "rebuild_reason": f"schema upgrade v{old_version}->{BUILDER_VERSION}",
             }
+
+        # Self-heal perf indexes (idx_calls_callee_short, idx_meth_module) on EVERY
+        # v14+ update (no-op, metadata-only, git-fast, full-scan all pass this
+        # point). Unconditional — NOT under `if bsl_changed:` — so a v14 DB built
+        # before an index existed gets it even on a no-op update (Codex round-3).
+        # Build paths already have them via _SCHEMA_SQL. old_version >= 14 is
+        # guaranteed here (the < 14 branch above returned), so the tables have
+        # their final v14 shape.
+        with conn:
+            self._ensure_callee_short_index(conn)
+            self._ensure_meth_module_index(conn)
 
         # --- Git fast path attempt ---
         version_mismatch = old_version != BUILDER_VERSION and old_version >= 8
@@ -5776,7 +5945,9 @@ class IndexBuilder:
                         conn.execute("DELETE FROM modules WHERE id = ?", (mod_id,))
 
                 # Insert new data
+                self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
+                self._refresh_call_resolution_stats(conn)
 
                 # Update FTS for newly inserted methods
                 if has_fts and results:
@@ -6263,7 +6434,9 @@ class IndexBuilder:
                             pass
                         conn.execute("DELETE FROM modules WHERE id = ?", (mod_id,))
 
+                self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
+                self._refresh_call_resolution_stats(conn)
 
                 if has_fts and results:
                     new_rel_paths = [r.info.relative_path for r in results]
@@ -6591,6 +6764,85 @@ class IndexBuilder:
     # --- Private helpers ---
 
     @staticmethod
+    def _ensure_callee_key_column(conn: sqlite3.Connection) -> None:
+        """Defensively add ``calls.callee_key`` if a same-version DB lacks it.
+
+        A v14 index is always created via a full rebuild (old_version < 14 forces
+        it), so the column exists on every real v14 DB. This guard mirrors the
+        defensive ``CREATE TABLE IF NOT EXISTS`` pattern used elsewhere and keeps
+        the incremental INSERT from failing should a malformed DB slip through.
+        """
+        try:
+            cols = conn.execute("PRAGMA table_info(calls)").fetchall()
+            names = {(c[1] if not isinstance(c, sqlite3.Row) else c["name"]) for c in cols}
+            if "callee_key" not in names:
+                conn.execute("ALTER TABLE calls ADD COLUMN callee_key TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_callee_key ON calls(callee_key)")
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
+    def _ensure_callee_short_index(conn: sqlite3.Connection) -> None:
+        """Self-heal: create ``idx_calls_callee_short`` if a v14 DB lacks it.
+
+        Build paths get the index from ``_SCHEMA_SQL`` (both executescript sites).
+        This guard exists ONLY for already-built v14 DBs created before the index
+        existed: ``_update_locked`` calls it UNCONDITIONALLY on every update (incl.
+        no-op / metadata-only), since ``_SCHEMA_SQL`` is not re-run on the update
+        path. DDL comes from the single-source ``_callee_short_expr`` — same
+        expression as the schema and the query (no drift). ``IF NOT EXISTS`` makes
+        it a cheap no-op once present.
+        """
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_calls_callee_short "
+                f"ON calls({_callee_short_expr('callee_name')} COLLATE NOCASE)"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
+    def _ensure_meth_module_index(conn: sqlite3.Connection) -> None:
+        """Self-heal: create ``idx_meth_module`` if a v14 DB lacks it.
+
+        FK index on ``methods(module_id)`` that lets ``_resolve_target_key`` go
+        modules→methods by an index lookup instead of scanning all methods (the
+        ``py_lower(name)`` predicate already defeats ``idx_meth_name``). Build
+        paths get it from ``_SCHEMA_SQL``; this guard covers already-built v14 DBs
+        created before the index existed (``_SCHEMA_SQL`` is not re-run on update).
+        Called UNCONDITIONALLY by ``_update_locked`` on every update. ``IF NOT
+        EXISTS`` makes it a cheap no-op once present.
+        """
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_meth_module ON methods(module_id)")
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
+    def _refresh_call_resolution_stats(conn: sqlite3.Connection) -> None:
+        """Recompute call-resolution aggregates over the WHOLE calls table.
+
+        Writes ``calls_total`` / ``calls_resolved`` into ``index_meta`` with a
+        single SQL pass. Must be called AFTER ``_bulk_insert`` in every write
+        path (full build, full-scan update, git fast path) — counting inside
+        ``_bulk_insert`` would only see the current batch on an incremental run.
+        """
+        try:
+            row = conn.execute("SELECT COUNT(*), COUNT(callee_key) FROM calls").fetchone()
+        except sqlite3.OperationalError:
+            return
+        total = row[0] if row else 0
+        resolved = row[1] if row else 0
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            ("calls_total", str(total)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            ("calls_resolved", str(resolved)),
+        )
+
+    @staticmethod
     def _bulk_insert(
         conn: sqlite3.Connection,
         results: list[FileResult],
@@ -6678,6 +6930,49 @@ class IndexBuilder:
                     mid, modid = row[0], row[1]
                 methods_by_module.setdefault(modid, []).append(mid)
 
+            # Build callee resolution lookups over the WHOLE DB (an incremental
+            # target may live in an unchanged module, so we cannot restrict to
+            # the current batch). Two provably-safe tiers only:
+            #   local           — bare ``B()`` → a method of the caller's own module
+            #   common_exported — ``A.B()`` → an exported method of common module A
+            # Object/manager qualified calls (Справочники.X.Метод / Объект.Метод)
+            # are intentionally NOT resolved (ambiguous variable/manager method).
+            # Value ``None`` marks an ambiguous key (multiple candidates) → NULL.
+            local_lookup: dict[tuple[int, str], str | None] = {}
+            common_exported: dict[tuple[str, str], str | None] = {}
+            for row in conn.execute(
+                "SELECT mod.id AS module_id, mod.rel_path AS rel_path, mod.category AS category, "
+                "mod.object_name AS object_name, mod.module_type AS module_type, "
+                "me.name AS name, me.is_export AS is_export "
+                "FROM methods me JOIN modules mod ON me.module_id = mod.id"
+            ):
+                if isinstance(row, sqlite3.Row):
+                    module_id = row["module_id"]
+                    rel_path = row["rel_path"]
+                    category = row["category"]
+                    object_name = row["object_name"]
+                    module_type = row["module_type"]
+                    mname = row["name"]
+                    is_export = row["is_export"]
+                else:
+                    module_id, rel_path, category, object_name, module_type, mname, is_export = row
+                name_cf = mname.casefold()
+                lk = (module_id, name_cf)
+                local_lookup[lk] = None if lk in local_lookup else rel_path
+                if is_export and category == "CommonModules" and module_type == "Module" and object_name:
+                    ck = (object_name.casefold(), name_cf)
+                    common_exported[ck] = None if ck in common_exported else rel_path
+
+            def _resolve_callee_key(caller_module_id: int, callee: str) -> str | None:
+                if "." in callee:
+                    # Qualified A.B — only common-exported is safe to resolve.
+                    a, _, b = callee.partition(".")
+                    rel = common_exported.get((a.casefold(), b.casefold()))
+                    return _make_callee_key(rel, b) if rel else None
+                # Bare B — resolve only within the caller's own module.
+                rel = local_lookup.get((caller_module_id, callee.casefold()))
+                return _make_callee_key(rel, callee) if rel else None
+
             call_rows: list[tuple] = []
             for r in results:
                 mod_id = path_to_id.get(r.info.relative_path)
@@ -6688,11 +6983,12 @@ class IndexBuilder:
                 for method_idx, callee_name, call_line in r.raw_calls:
                     if method_idx < len(method_ids):
                         caller_method_id = method_ids[method_idx]
-                        call_rows.append((caller_method_id, callee_name, call_line))
+                        callee_key = _resolve_callee_key(mod_id, callee_name)
+                        call_rows.append((caller_method_id, callee_name, call_line, callee_key))
 
             if call_rows:
                 conn.executemany(
-                    "INSERT INTO calls (caller_id, callee_name, line) VALUES (?, ?, ?)",
+                    "INSERT INTO calls (caller_id, callee_name, line, callee_key) VALUES (?, ?, ?, ?)",
                     call_rows,
                 )
 
@@ -6882,16 +7178,38 @@ class IndexReader:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
-        # UDF for Cyrillic case-insensitive search
-        self._conn.create_function("py_lower", 1, str.lower)
+        # UDF for Cyrillic case-insensitive search. NULL-safe: modules.object_name
+        # is nullable (e.g. root application/session modules), and SQLite would
+        # otherwise call str.lower(None) → "user-defined function raised exception"
+        # for any query that applies py_lower() to such a column (bare module_hint
+        # resolution). Returning None makes the comparison NULL (row excluded),
+        # which is the correct semantics.
+        self._conn.create_function("py_lower", 1, lambda s: s.lower() if s is not None else None)
+        # Capability check (Phase B): a v13 DB opened read-only BEFORE a
+        # background rebuild has no calls.callee_key column. Probe once and gate
+        # the exact (resolved) call-graph mode on it — otherwise get_callers must
+        # not touch callee_key at all (would raise "no such column").
+        self._has_callee_key = self._probe_callee_key()
+
+    def _probe_callee_key(self) -> bool:
+        try:
+            cols = self._conn.execute("PRAGMA table_info(calls)").fetchall()
+            return any(c["name"] == "callee_key" for c in cols)
+        except sqlite3.Error:
+            return False
 
     @property
     def has_calls(self) -> bool:
-        """Check if the calls table has any data."""
+        """Check if the calls table has any data.
+
+        Existence probe (``LIMIT 1``), NOT ``COUNT(*)``: find_callers_context
+        reads this property on EVERY hierarchy node, and a full count scans
+        ~3.7M rows (~112ms) on big ERP. ``SELECT 1 ... LIMIT 1`` is O(1).
+        """
         with self._lock:
             try:
-                row = self._conn.execute("SELECT COUNT(*) AS cnt FROM calls").fetchone()
-                return row is not None and row["cnt"] > 0
+                row = self._conn.execute("SELECT 1 FROM calls LIMIT 1").fetchone()
+                return row is not None
             except sqlite3.Error:
                 return False
 
@@ -6924,6 +7242,70 @@ class IndexReader:
                 for r in rows
             ]
 
+    def _resolve_target_key(self, proc_name: str, module_hint: str) -> str | None:
+        """Resolve a query target to a single stable ``callee_key`` (or None).
+
+        Exact mode only (requires ``self._has_callee_key``). The target of a
+        ``get_callers`` query has no caller_module_id, so the build-time
+        ``local`` tier is inapplicable — the target is resolved by module
+        identity instead:
+
+          - with ``module_hint`` → normalize it (rel_path / category+object_name
+            / bare object_name) and find the module carrying ``proc_name``;
+          - without hint → exact only if ``proc_name`` is an exported method of a
+            common module AND unique across the whole DB.
+
+        Returns ``_make_callee_key(rel_path, proc_name)`` when the target maps to
+        exactly one module; otherwise None (→ name-based fallback).
+        """
+        if not self._has_callee_key:
+            return None
+        rel_hint, category, object_name = _normalize_module_hint(module_hint)
+        rel_paths: list[str]
+        if rel_hint is not None:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mod.rel_path FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                "WHERE mod.rel_path = ? AND py_lower(m.name) = py_lower(?)",
+                (rel_hint, proc_name),
+            ).fetchall()
+            rel_paths = [r["rel_path"] for r in rows]
+        elif category is not None and object_name is not None:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mod.rel_path FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                "WHERE mod.category = ? AND py_lower(mod.object_name) = py_lower(?) "
+                "AND py_lower(m.name) = py_lower(?)",
+                (category, object_name, proc_name),
+            ).fetchall()
+            rel_paths = [r["rel_path"] for r in rows]
+        elif object_name is not None:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mod.rel_path FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                "WHERE py_lower(mod.object_name) = py_lower(?) AND py_lower(m.name) = py_lower(?)",
+                (object_name, proc_name),
+            ).fetchall()
+            rel_paths = [r["rel_path"] for r in rows]
+        else:
+            # No hint — exact ONLY if the name is GLOBALLY UNIQUE across the whole
+            # DB AND that single method is an exported common-module method. A
+            # same-named method ANYWHERE else (local object method, form, another
+            # module) makes the name ambiguous → NOT exact, so name-based fallback
+            # preserves recall instead of silently pinning the common-module target
+            # and dropping resolved local edges (plan §Консьюмеры п.1).
+            rows = self._conn.execute(
+                "SELECT mod.rel_path, mod.category, mod.module_type, m.is_export "
+                "FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                "WHERE py_lower(m.name) = py_lower(?) LIMIT 2",
+                (proc_name,),
+            ).fetchall()
+            rel_paths = []
+            if len(rows) == 1:
+                r = rows[0]
+                if r["is_export"] and r["category"] == "CommonModules" and r["module_type"] == "Module":
+                    rel_paths = [r["rel_path"]]
+        if len(rel_paths) == 1:
+            return _make_callee_key(rel_paths[0], proc_name)
+        return None
+
     def get_callers(
         self,
         proc_name: str,
@@ -6937,41 +7319,95 @@ class IndexReader:
         {
             "callers": [{file, caller_name, caller_is_export, line, object_name,
                          category, module_type}],
-            "_meta": {total_callers, returned, offset, has_more}
+            "_meta": {total_callers, returned, offset, has_more,
+                      exact_available, exact_rows, fallback_rows}
         }
+
+        Exact (resolved) mode: when the schema has ``callee_key`` and the target
+        resolves to exactly one module, callers are matched precisely on
+        ``callee_key`` (collisions from same-named methods elsewhere are dropped),
+        plus any still-unresolved (``callee_key IS NULL``) name matches kept for
+        recall. ``_meta`` reports ``exact_rows`` vs ``fallback_rows`` so the
+        consumer can tell precise edges from heuristic ones. When the column is
+        absent (v13 DB read before rebuild) exact mode is off
+        (``exact_available=False``) and the legacy name-based query runs.
+
         Returns None if the calls table has no data.
         """
         with self._lock:
             try:
-                count_row = self._conn.execute("SELECT COUNT(*) AS cnt FROM calls").fetchone()
-                if count_row is None or count_row["cnt"] == 0:
+                # Existence check, NOT a full COUNT(*) (which scans ~3.7M rows
+                # ~112ms on big ERP — see perf fix v1.16.0). get_callers is called
+                # per node in find_call_hierarchy, so this must be O(1).
+                exists_row = self._conn.execute("SELECT 1 FROM calls LIMIT 1").fetchone()
+                if exists_row is None:
                     return None
             except sqlite3.Error:
                 return None
 
-            # Build query: match callee_name case-insensitively
-            # Also match qualified calls (e.g., "Module.Method" matches "Method")
-            query = """
-                SELECT
-                    c.line AS call_line,
-                    c.callee_name,
-                    m.name AS caller_name,
-                    m.is_export AS caller_is_export,
-                    mod.rel_path,
-                    mod.object_name,
-                    mod.category,
-                    mod.module_type
-                FROM calls c
-                JOIN methods m ON m.id = c.caller_id
-                JOIN modules mod ON mod.id = m.module_id
-                WHERE c.callee_name LIKE ? ESCAPE '\\'
-            """
-            # Try exact match (case-insensitive via COLLATE on index)
-            # Also search for qualified variants: *.proc_name
-            escaped_name = proc_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            # Indexed name-match clause (single source: _callee_match_clause →
+            # _callee_short_expr). Replaces the old leading-wildcard
+            # ``= ? OR LIKE '%.name'`` (full scan) — bare names hit
+            # idx_calls_callee_short, dotted input hits idx_calls_callee. Shared
+            # verbatim by every match site below so the planner uses the index.
+            match_sql, match_param = _callee_match_clause(proc_name, "c.callee_name")
 
-            # We want: callee_name = proc_name OR callee_name LIKE '%.proc_name'
-            query = """
+            # --- Exact (resolved) mode ---------------------------------------
+            exact_key = self._resolve_target_key(proc_name, module_hint)
+            if exact_key is not None:
+                base_select = (
+                    "SELECT c.line AS call_line, c.callee_name, m.name AS caller_name, "
+                    "m.is_export AS caller_is_export, mod.rel_path, mod.object_name, "
+                    "mod.category, mod.module_type "
+                    "FROM calls c JOIN methods m ON m.id = c.caller_id "
+                    "JOIN modules mod ON mod.id = m.module_id "
+                )
+                where = f"WHERE (c.callee_key = ? OR (c.callee_key IS NULL AND {match_sql}))"
+
+                exact_cnt_row = self._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM calls WHERE callee_key = ?", (exact_key,)
+                ).fetchone()
+                exact_rows = exact_cnt_row["cnt"] if exact_cnt_row else 0
+                fb_cnt_row = self._conn.execute(
+                    f"SELECT COUNT(*) AS cnt FROM calls c WHERE c.callee_key IS NULL AND {match_sql}",
+                    (match_param,),
+                ).fetchone()
+                fallback_rows = fb_cnt_row["cnt"] if fb_cnt_row else 0
+                total_callers = exact_rows + fallback_rows
+
+                query = base_select + where + " ORDER BY mod.rel_path, call_line LIMIT ? OFFSET ?"
+                rows = self._conn.execute(query, (exact_key, match_param, limit, offset)).fetchall()
+                callers = [
+                    {
+                        "file": r["rel_path"],
+                        "caller_name": r["caller_name"],
+                        "caller_is_export": bool(r["caller_is_export"]),
+                        "line": r["call_line"],
+                        "object_name": r["object_name"],
+                        "category": r["category"],
+                        "module_type": r["module_type"],
+                    }
+                    for r in rows
+                ]
+                return {
+                    "callers": callers,
+                    "_meta": {
+                        "total_callers": total_callers,
+                        "returned": len(callers),
+                        "offset": offset,
+                        "has_more": (offset + limit) < total_callers,
+                        "exact_available": True,
+                        "target_exact": True,
+                        "target_key": exact_key,
+                        "exact_rows": exact_rows,
+                        "fallback_rows": fallback_rows,
+                    },
+                }
+
+            # --- Fallback (name-based) mode — legacy behavior ----------------
+            # Match callers by method name via the shared indexed clause; for a
+            # bare proc_name this also covers qualified "Module.proc_name" edges.
+            query = f"""
                 SELECT
                     c.line AS call_line,
                     c.callee_name,
@@ -6984,10 +7420,9 @@ class IndexReader:
                 FROM calls c
                 JOIN methods m ON m.id = c.caller_id
                 JOIN modules mod ON mod.id = m.module_id
-                WHERE (c.callee_name = ? COLLATE NOCASE
-                       OR c.callee_name LIKE ? ESCAPE '\\')
+                WHERE ({match_sql})
             """
-            params_list: list = [proc_name, f"%.{escaped_name}"]
+            params_list: list = [match_param]
 
             if module_hint:
                 # Filter by callee qualification: match qualified "hint.proc"
@@ -7012,14 +7447,11 @@ class IndexReader:
             # Count total
             _t0 = time.monotonic()
             if not module_hint:
-                # Fast path: COUNT on calls table only (uses idx_calls_callee)
-                count_query = (
-                    "SELECT COUNT(*) AS cnt FROM calls "
-                    "WHERE (callee_name = ? COLLATE NOCASE "
-                    "       OR callee_name LIKE ? ESCAPE '\\')"
-                )
-                count_params = [proc_name, f"%.{escaped_name}"]
-                count_row = self._conn.execute(count_query, count_params).fetchone()
+                # Fast path: COUNT on calls table only. Unaliased column → matches
+                # idx_calls_callee_short (bare) / idx_calls_callee (dotted).
+                count_sql, count_param = _callee_match_clause(proc_name, "callee_name")
+                count_query = f"SELECT COUNT(*) AS cnt FROM calls WHERE ({count_sql})"
+                count_row = self._conn.execute(count_query, [count_param]).fetchone()
             else:
                 # Exact path: COUNT via JOIN (precise, with module filter)
                 count_query = f"SELECT COUNT(*) AS cnt FROM ({query})"
@@ -7064,6 +7496,13 @@ class IndexReader:
                     "returned": len(callers),
                     "offset": offset,
                     "has_more": (offset + limit) < total_callers,
+                    # Name-based fallback: schema may support exact mode
+                    # (exact_available) but the target was not uniquely resolved,
+                    # so every returned row is heuristic (name match).
+                    "exact_available": self._has_callee_key,
+                    "target_exact": False,
+                    "exact_rows": 0,
+                    "fallback_rows": total_callers,
                 },
             }
 

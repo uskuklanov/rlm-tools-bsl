@@ -505,28 +505,37 @@ class TestIndexReader:
         finally:
             reader.close()
 
-    def test_reader_get_callers_non_export_scoped(self, built_index):
-        """Non-export method: callers scoped to same file only."""
+    def test_reader_get_callers_non_export_exact(self, built_index):
+        """Non-export method + hint: same-module local call resolves EXACTLY.
+
+        v1.16.0 superseded the old "non-export → same file only" heuristic with
+        callee_key resolution. ВычислитьИтоги is a private method of МойМодуль; its
+        only real-and-resolvable caller is the same-module local call from
+        ЗаполнитьТабличнуюЧасть (exact). The cross-module ``МойМодуль.ВычислитьИтоги``
+        in ObjectModule does NOT resolve (qualified calls resolve only for EXPORTED
+        common methods) → it stays a NULL-key edge, surfaced as a fallback edge for
+        recall and counted separately in _meta.
+        """
         db_path, _ = built_index
         reader = IndexReader(db_path)
         try:
-            # ВычислитьИтоги is NOT export (defined in МойМодуль)
-            # ObjectModule.bsl calls МойМодуль.ВычислитьИтоги — but scope
-            # should restrict to same-file callers only.
-            # Without scope narrowing, ObjectModule caller would leak through.
+            # Without hint, the private method is not a unique exported common
+            # method → name-based fallback (cross-module reference IS visible).
             result_no_hint = reader.get_callers("ВычислитьИтоги")
-            # Sanity: without hint, cross-module caller IS visible
             assert any("ObjectModule" in c["file"] for c in result_no_hint["callers"]), (
-                "Sanity check: ObjectModule should call ВычислитьИтоги"
+                "Sanity check: ObjectModule references ВычислитьИтоги"
             )
+            assert result_no_hint["_meta"]["target_exact"] is False
 
             result = reader.get_callers("ВычислитьИтоги", module_hint="МойМодуль")
-            # Must have at least 1 caller (non-empty result)
-            assert len(result["callers"]) >= 1, "Expected at least 1 same-file caller for non-export method"
-            for c in result["callers"]:
-                assert "CommonModules" in c["file"], (
-                    f"Non-export method callers must be from same module, got {c['file']}"
-                )
+            meta = result["_meta"]
+            # Exact resolution engaged: the same-module local caller is precise.
+            assert meta["target_exact"] is True
+            assert meta["exact_rows"] == 1
+            exact_caller = next(c for c in result["callers"] if "CommonModules" in c["file"])
+            assert exact_caller["caller_name"] == "ЗаполнитьТабличнуюЧасть"
+            # The unresolved cross-module reference is kept as a labeled fallback.
+            assert meta["fallback_rows"] >= 1
         finally:
             reader.close()
 

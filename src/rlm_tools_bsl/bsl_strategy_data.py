@@ -53,7 +53,7 @@ Step 2 — READ: understand the code
 
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
-  find_call_hierarchy(name, direction='callers', depth=2) → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context.
+  find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
   safe_grep(pattern, hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
@@ -138,9 +138,9 @@ DISAMBIGUATION_PAIRS: list[dict] = [
     {
         "pair": ("find_call_hierarchy", "find_callers_context"),
         "summary": "multi-level tree vs single level + context",
-        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации.",
+        "when_a": "N уровней (1-3) дерево БЕЗ контекста строк. Один вызов вместо итерации. module_hint включает exact-режим для одноимённых объектных методов (точные рёбра по callee_key, _meta.root_exact/exact_rows).",
         "when_b": "1 уровень callers + контекст вызова (line/text). Быстрее.",
-        "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy.",
+        "rule": "Для одного уровня используй find_callers_context; для глубины >=2 — find_call_hierarchy (с module_hint, если корень — неуникальный объектный метод).",
         "tags": ["callers", "trace"],
     },
     {

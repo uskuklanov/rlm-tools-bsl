@@ -118,7 +118,7 @@ def _make_extension_only(parent_dir):
 
 class TestSchema:
     def test_builder_version_is_10(self):
-        assert BUILDER_VERSION == 13
+        assert BUILDER_VERSION == 14
 
     def test_extension_overrides_table_created(self, tmp_path, monkeypatch):
         """Build creates extension_overrides table in schema."""
