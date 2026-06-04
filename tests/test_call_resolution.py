@@ -270,10 +270,15 @@ class TestPhaseBResolver:
         assert _edge_key(db_path, NAKLADNAYA_PATH, "Контрагенты.НайтиПоКоду") is None
         assert _edge_key(db_path, NAKLADNAYA_PATH, "Контрагент.ПолучитьОбъект") is None
 
-    def test_platform_external_bare_is_null(self, built):
+    def test_platform_global_noise_filtered_out(self, built):
         db_path, _ = built
-        # Сообщить() is a platform method — no module defines it → NULL.
-        assert _edge_key(db_path, OBSHIY_PATH, "Сообщить") is None
+        # Сообщить() is a reserved platform global — as of the noise filter it is
+        # dropped at extraction, so it never reaches the calls table at all (it
+        # used to land as an unresolved NULL edge). _edge_key returns the missing
+        # sentinel, NOT None. The dedicated coverage lives in
+        # tests/test_calls_noise_filter.py.
+        assert "Сообщить" not in _callees(db_path)
+        assert _edge_key(db_path, OBSHIY_PATH, "Сообщить") == "<<missing>>"
 
     def test_resolution_stats_written(self, built):
         db_path, _ = built

@@ -195,6 +195,144 @@ _BSL_KEYWORDS: frozenset[str] = frozenset(
 _BSL_KEYWORDS_LOWER: frozenset[str] = frozenset(k.lower() for k in _BSL_KEYWORDS)
 
 
+# Reserved 1C PLATFORM globals — dropped ONLY from bare (unqualified) call edges.
+# A bare ``Сообщить(`` / ``НСтр(`` / ``Новый Структура(`` is always the platform
+# global/type, never a real call target → those rows are permanently unresolved
+# noise (~27% of the whole ``calls`` table on real configs). NOT applied to the
+# qualified ``Модуль.Метод(`` branch — a same-named CommonModule export could be
+# real, so qualified edges are left untouched.
+#
+# Validated against real indexes (multiple ERP / документооборот / БГУ configs):
+# every name here has ZERO resolved edges (oracle: ``removed_resolved == 0`` on
+# every validated config). The following look platform-ish but are REAL user methods in some
+# production config (the resolver bound a bare call to a same-named user method)
+# and are DELIBERATELY EXCLUDED — never add them: ЗакрытьФорму,
+# ПолеКомпоновкиДанных, ТаблицаЗначений, УникальныйИдентификатор, Массив, and
+# Квартал (shadowed by a real user method in a БГУ "бюджетный учёт" config — the
+# extraction filter runs BEFORE resolution, so keeping it would drop those edges).
+# Source of truth = this frozenset +
+# ``tests/test_calls_noise_filter.py::test_curated_set_guard``; re-validation =
+# the opt-in oracle test (skipped without RLM_VALIDATION_INDEXES).
+_BSL_GLOBAL_FUNCS_LOWER: frozenset[str] = frozenset(
+    k.casefold()
+    for k in {
+        # --- strings ---
+        "Сообщить",
+        "Формат",
+        "НСтр",
+        "СтрШаблон",
+        "СтрНайти",
+        "СтрЗаменить",
+        "СтрДлина",
+        "СтрРазделить",
+        "СтрСоединить",
+        "СтрЧислоСтрок",
+        "СтрЧислоВхождений",
+        "СтрПолучитьСтроку",
+        "СтрНачинаетсяС",
+        "СтрЗаканчиваетсяС",
+        "СтрСравнить",
+        "ВРег",
+        "НРег",
+        "ТРег",
+        "СокрЛ",
+        "СокрП",
+        "СокрЛП",
+        "Лев",
+        "Прав",
+        "Сред",
+        "Символ",
+        "КодСимвола",
+        "ПустаяСтрока",
+        # --- dates ---
+        "ТекущаяДата",
+        "ТекущаяДатаСеанса",
+        "Год",
+        "Месяц",
+        "День",
+        "Час",
+        "Минута",
+        "Секунда",
+        "ДеньНедели",
+        "ДобавитьМесяц",
+        "НачалоГода",
+        "КонецГода",
+        "НачалоКвартала",
+        "КонецКвартала",
+        "НачалоМесяца",
+        "КонецМесяца",
+        "НачалоДня",
+        "КонецДня",
+        "НачалоНедели",
+        "КонецНедели",
+        # --- math ---
+        "Цел",
+        "Окр",
+        "Макс",
+        "Мин",
+        "Abs",
+        "Pow",
+        "Sqrt",
+        "Exp",
+        # --- types / values ---
+        "ТипЗнч",
+        "ЗначениеЗаполнено",
+        "ЕстьNull",
+        "ПредопределенноеЗначение",
+        # --- type casts ---
+        "Строка",
+        "Число",
+        "Дата",
+        "Булево",
+        # --- reserved types (only ever `Новый X(`) ---
+        "Структура",
+        "Соответствие",
+        "СписокЗначений",
+        "Запрос",
+        "СхемаЗапроса",
+        "ОписаниеОповещения",
+        "ОписаниеТипов",
+        "КвалификаторыСтроки",
+        "КвалификаторыЧисла",
+        "ХранилищеЗначения",
+        "Цвет",
+        # --- transactions / locks ---
+        "НачатьТранзакцию",
+        "ЗафиксироватьТранзакцию",
+        "ОтменитьТранзакцию",
+        "ТранзакцияАктивна",
+        "ЗаблокироватьДанныеДляРедактирования",
+        # --- forms / messages / options / privileges / temp storage ---
+        "ОткрытьФорму",
+        "ПолучитьФорму",
+        "ЗаполнитьЗначенияСвойств",
+        "ВыполнитьОбработкуОповещения",
+        "ПолучитьФункциональнуюОпцию",
+        "ПоказатьВопрос",
+        "ПоказатьПредупреждение",
+        "ПоказатьОповещениеПользователя",
+        "Вопрос",
+        "Предупреждение",
+        "ОповеститьОбИзменении",
+        "УстановитьПривилегированныйРежим",
+        "ПривилегированныйРежим",
+        "ПоместитьВоВременноеХранилище",
+        "ПолучитьИзВременногоХранилища",
+        "УдалитьИзВременногоХранилища",
+        "ИнформацияОбОшибке",
+        "Состояние",
+        "ПравоДоступа",
+        "ПодключитьОбработчикОжидания",
+        "ЗначениеВДанныеФормы",
+        "КопироватьДанныеФормы",
+        "РеквизитФормыВЗначение",
+        "ЗаписьЖурналаРегистрации",
+        "Оповестить",
+        "ОчиститьСообщения",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Call-graph resolution helpers (v1.16.0)
 # ---------------------------------------------------------------------------
@@ -2168,6 +2306,11 @@ def _extract_calls_from_body(
         for sm in _SIMPLE_CALL_RE.finditer(code):
             func_name = sm.group(1)
             if func_name.lower() in _BSL_KEYWORDS_LOWER:
+                continue
+            # Drop bare calls to reserved platform globals (Сообщить/НСтр/Новый
+            # Структура(/…): permanently unresolved navigation noise. Applied
+            # ONLY here, never to the qualified Module.Method branch above.
+            if func_name.casefold() in _BSL_GLOBAL_FUNCS_LOWER:
                 continue
             # Skip if already captured as part of a qualified call on this line
             # (the simple regex also matches the method part of Module.Method)
@@ -5744,6 +5887,18 @@ class IndexBuilder:
             self._ensure_callee_short_index(conn)
             self._ensure_meth_module_index(conn)
 
+        # One-time in-place cleanup of bare-global call noise for legacy indexes
+        # built before the extraction filter existed. Idempotent (meta flag),
+        # runs only on update/build — never on read-only rlm_start. Placed AFTER
+        # the schema-upgrade early return (rebuild is already clean) but BEFORE
+        # fast-path / full-scan branching so it fires regardless of BSL delta.
+        purged = self._purge_call_noise_once(conn)
+        if purged:
+            logger.info(
+                "Purged %d bare-global noise rows from calls (legacy index migration)",
+                purged,
+            )
+
         # --- Git fast path attempt ---
         version_mismatch = old_version != BUILDER_VERSION and old_version >= 8
         # A previously-unreliable dirty snapshot means uncommitted changes may
@@ -6843,6 +6998,65 @@ class IndexBuilder:
         )
 
     @staticmethod
+    def _meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+        """Read a single ``index_meta`` value (k/v store; None if missing)."""
+        row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        return row[0] if isinstance(row, tuple) else row["value"]
+
+    @staticmethod
+    def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+        """Upsert a single ``index_meta`` value."""
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            (key, str(value)),
+        )
+
+    @staticmethod
+    def _register_casefold_udf(conn: sqlite3.Connection) -> None:
+        """Register a NULL-safe ``py_casefold`` UDF on this connection.
+
+        The update connection (``_update_locked``) registers NO UDF — unlike
+        ``IndexReader`` which sets ``py_lower`` (``.lower()``). The builtin SQLite
+        ``lower()`` does NOT fold Cyrillic, so the in-place purge needs its own
+        Python folder. ``casefold()`` is used for consistency with
+        ``_BSL_GLOBAL_FUNCS_LOWER`` and the extraction-time check.
+        """
+        conn.create_function("py_casefold", 1, lambda s: s.casefold() if s is not None else None)
+
+    @staticmethod
+    def _purge_call_noise_once(conn: sqlite3.Connection) -> int:
+        """One-time in-place purge of bare-global noise from a legacy ``calls`` table.
+
+        Idempotent via the ``calls_noise_cleaned`` meta flag: new builds set the
+        flag in ``_write_meta`` (extraction filter already produced clean data),
+        so this only fires on indexes built before the filter existed. Deletes
+        ONLY unresolved (``callee_key IS NULL``) bare (``instr(name,'.')=0``) rows
+        whose name is a reserved platform global — physically cannot touch a real
+        edge. Recomputes ``calls_total`` / ``calls_resolved`` so the meta invariant
+        holds even when the surrounding update has no BSL delta (no-op / git-fast).
+
+        Returns the number of deleted rows (0 if already cleaned).
+        """
+        if IndexBuilder._meta_get(conn, "calls_noise_cleaned"):
+            return 0
+        IndexBuilder._register_casefold_udf(conn)
+        names = list(_BSL_GLOBAL_FUNCS_LOWER)
+        placeholders = ",".join("?" * len(names))
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM calls "
+                "WHERE callee_key IS NULL AND instr(callee_name, '.') = 0 "
+                f"AND py_casefold(callee_name) IN ({placeholders})",
+                names,
+            )
+            deleted = cur.rowcount
+            IndexBuilder._refresh_call_resolution_stats(conn)
+            IndexBuilder._meta_set(conn, "calls_noise_cleaned", "1")
+        return deleted
+
+    @staticmethod
     def _bulk_insert(
         conn: sqlite3.Connection,
         results: list[FileResult],
@@ -7059,6 +7273,9 @@ class IndexBuilder:
             ("has_fts", "1" if build_fts else "0"),
             ("has_synonyms", "1" if build_synonyms else "0"),
             ("file_paths_count", str(file_paths_count)),
+            # A full build produces clean data (extraction filter applied), so the
+            # legacy in-place purge in update() can skip straight away.
+            ("calls_noise_cleaned", "1"),
         ]
         # Level-1: Configuration metadata
         if config_meta:
