@@ -164,7 +164,7 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "summary": "live XML (slow, full) vs index (instant, flat)",
         "when_a": "читает XML напрямую, видит синонимы ТЧ и подробные типы. SLOW без индекса.",
         "when_b": "flat-список из индекса, INSTANT, но синонимов ТЧ нет.",
-        "rule": "Для «карточки объекта» используй get_object_full_structure (выбирает оптимальный путь). Контракт ключей различается: find_attributes → r['attr_name'], get_object_full_structure → for a in s['attributes']: a['name'].",
+        "rule": "Для «карточки объекта» используй get_object_full_structure (выбирает оптимальный путь). Каноничные ключи атрибутов разные (find_attributes → r['attr_name'], get_object_full_structure → a['name']), но записи толерантны: «чужой» алиас тоже работает.",
         "tags": ["metadata", "xml", "attributes"],
     },
     {

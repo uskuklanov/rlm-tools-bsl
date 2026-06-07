@@ -25,6 +25,134 @@ BSL_PATTERNS = {
 }
 
 
+class _AttrRecord(dict):
+    """Запись атрибута, толерантная к «диалекту» ключей (v1.18.0, Фикс 1).
+
+    Два хелпера исторически отдают атрибуты под разными именами ключей:
+    ``get_object_full_structure`` -> ``{name, synonym, type}``, а
+    ``find_attributes`` -> ``{attr_name, attr_synonym, attr_type}``. Агент,
+    переносящий паттерн с одного на другой, писал ``a['attr_name']`` на
+    структуре и получал детерминированный ``KeyError`` (6 из 10 e2e-тестов
+    июня 2026). Этот dict-подкласс принимает доступ по «чужому» имени ключа
+    прозрачно (через ``[]``, ``.get``, ``in``), но **итерация / .keys() / len()
+    остаются каноничными** — агент по-прежнему видит реальные имена и учится,
+    а ``json.dumps`` сериализует только реальные ключи (нулевая цена по токенам).
+
+    Алиасинг охватывает только триаду name/synonym/type; служебные ключи вроде
+    ``attr_kind`` алиаса не имеют (намеренно — у структурных записей его нет).
+    """
+
+    _EQUIV = {
+        "name": "attr_name",
+        "attr_name": "name",
+        "synonym": "attr_synonym",
+        "attr_synonym": "synonym",
+        "type": "attr_type",
+        "attr_type": "type",
+    }
+
+    def __missing__(self, key):
+        alt = self._EQUIV.get(key)
+        if alt is not None and dict.__contains__(self, alt):
+            return dict.__getitem__(self, alt)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        if dict.__contains__(self, key):
+            return True
+        alt = self._EQUIV.get(key)
+        return alt is not None and dict.__contains__(self, alt)
+
+
+_PARAM_BYVAL_PREFIX_RE = re.compile(r"(?i)(?:Знач|Val)\s+")
+
+
+def _split_params(raw: str) -> list[str]:
+    """Разбить сырую строку параметров BSL-сигнатуры на список ИМЁН (v1.18.0, Фикс 2).
+
+    ``params`` исторически хранится/возвращается строкой (``"Знач А, Б = 5"``),
+    и агент, ожидавший список, получал ``AttributeError`` при итерации. Эта
+    функция — единый разборщик, применяемый на helper-границе (не в build-time).
+
+    Возвращает только имена параметров: отбрасывает по-значению-префикс
+    ``Знач``/``Val`` (регистронезависимо — ключевые слова 1С) и хвост
+    ``= <default>``. Пустая/пробельная сигнатура -> ``[]``.
+
+    Разбор — мини state-machine по top-level запятым, устойчивый к строковым
+    литералам с **удвоенными кавычками** (``""``): запятая внутри строкового
+    default (``Разделитель = ", "``) НЕ считается разделителем параметров.
+    Глубина скобок не нужна — апстрим-регекс ``procedure_def`` захватывает
+    ``([^)]*)``, поэтому ``)`` и вложенные ``(...)`` в строку ``params`` не
+    попадают; защищаемся только от строк с запятой/кавычками.
+    """
+    if not raw or not raw.strip():
+        return []
+
+    # --- top-level split, уважая строковые литералы с "" эскейпом ---
+    tokens: list[str] = []
+    buf: list[str] = []
+    in_str = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and raw[i + 1] == '"':
+                    buf.append('""')  # экранированная кавычка — остаёмся в строке
+                    i += 2
+                    continue
+                in_str = False
+                buf.append(ch)
+            else:
+                buf.append(ch)
+        elif ch == '"':
+            in_str = True
+            buf.append(ch)
+        elif ch == ",":
+            tokens.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    tokens.append("".join(buf))
+
+    names: list[str] = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _PARAM_BYVAL_PREFIX_RE.match(tok)
+        if m:
+            tok = tok[m.end() :]
+        # Имя — всё до первого `=` (default отбрасывается). Имя стоит первым и
+        # не содержит ни строк, ни `=`, поэтому простого split достаточно.
+        tok = tok.split("=", 1)[0].strip()
+        if tok:
+            names.append(tok)
+    return names
+
+
+def _normalize_method_params(rows: list[dict]) -> list[dict]:
+    """In-place: строковый ``params`` метода -> ``list[str]`` (v1.18.0, Фикс 2).
+
+    Применяется на helper-границе (после вызова IndexReader), а НЕ внутри ридера:
+    ``idx_reader`` duck-typed, fake/stub-ридеры из тестов отдают записи мимо
+    реального IndexReader, и граница покрывает любой ридер. Идемпотентна —
+    list-вход (ридер уже отдал список) не трогается.
+    """
+    for rec in rows:
+        if isinstance(rec.get("params"), str):
+            rec["params"] = _split_params(rec["params"])
+    return rows
+
+
 # Lightweight prefix detector for multi-line procedure signatures.
 # Note: matches the START of a Procedure/Function declaration that opens a
 # paren-list. The actual `procedure_def` regex (above) requires a balanced
@@ -253,8 +381,9 @@ get_object_full_structure(name) ключи vs find_attributes:
   - get_object_full_structure: {attributes:[{name, synonym, type}], dimensions:[{name, synonym, type}],
                                 resources:[{name, synonym, type}],
                                 tabular_sections:[{name, synonym, columns:[{name, synonym, type}]}]}
-  Если используешь get_object_full_structure — НЕ обращайся r['attr_name'] (это контракт find_attributes),
-  получишь KeyError. Итерируй: for a in s['attributes']: a['name'].
+  Каноничные ключи разные, но записи ТОЛЕРАНТНЫ (v1.18.0): get_object_full_structure → a['name'],
+  find_attributes → r['attr_name']; «чужой» алиас (name↔attr_name, synonym↔attr_synonym, type↔attr_type)
+  тоже принимается. Итерируй: for a in s['attributes']: a['name'].
   Для регистров — данные в s['dimensions'] и s['resources'], s['attributes'] пустой.
 
 parse_object_xml(path) — путь к ДИРЕКТОРИИ объекта (не к файлу):

@@ -2183,6 +2183,8 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     always sits alone on its own row.
 
     Returns list of dicts: {name, type, line, end_line, is_export, params, loc}.
+    Здесь ``params`` — СЫРАЯ строка сигнатуры (build-time, хранится в TEXT-колонке).
+    На helper-границе ``_split_params`` превращает её в list[str] для агента (v1.18.0).
     """
     merged_lines, line_map = _merge_proc_continuations(lines)
     total_merged = len(merged_lines)

@@ -10,7 +10,13 @@ import time as _time_mod
 from dataclasses import replace
 from pathlib import Path
 from rlm_tools_bsl.format_detector import parse_bsl_path, BslFileInfo, FormatInfo
-from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
+from rlm_tools_bsl.bsl_knowledge import (
+    BSL_PATTERNS,
+    _AttrRecord,
+    _merge_proc_continuations,
+    _normalize_method_params,
+    _split_params,
+)
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
 
@@ -293,6 +299,10 @@ def make_bsl_helpers(
     _index_state: list = []  # list of tuples (relative_path, BslFileInfo)
     _index_built: list[bool] = [False]
     _index_lock = threading.Lock()
+
+    # v1.18.0 Фикс 4b: формат дампа ("cf"/"edt"/"unknown"/None) — для упорядочивания
+    # XML-кандидатов и текста HINT _resolve_object_xml. format_info уже в сигнатуре.
+    _dump_format = format_info.primary_format.value if format_info is not None else None
 
     def _load_main_into_index_state() -> None:
         """Load main config modules into _index_state (idx_reader or glob+cache)."""
@@ -615,7 +625,8 @@ def make_bsl_helpers(
 
             proc_type = m.group(1)
             proc_name = m.group(2)
-            params = m.group(3).strip() if m.group(3) else ""
+            # v1.18.0 Фикс 2: params -> list[str] имён параметров (на агент-границе).
+            params = _split_params(m.group(3) or "")
             is_export = m.group(4) is not None and m.group(4).strip() != ""
             line_number = line_map[m_idx]  # 1-based
 
@@ -694,7 +705,8 @@ def make_bsl_helpers(
         self-healing — multi-line procedures appear immediately, without
         requiring ``rlm-bsl-index index update``.
 
-        Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}."""
+        Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}.
+        ``params`` — список имён параметров (list[str], v1.18.0; напр. "Знач А, Б=5" → ["А", "Б"])."""
 
         def _extract_with_index():
             overrides_map: dict | None = None
@@ -708,7 +720,8 @@ def make_bsl_helpers(
             if idx_reader is not None:
                 idx_result = idx_reader.get_methods_by_path(path)
                 if idx_result is not None:
-                    result = idx_result
+                    # v1.18.0 Фикс 2: нормализуем params строкой -> list на границе.
+                    result = _normalize_method_params(idx_result)
                     _attach_overrides(result, overrides_map)
 
             if result is None:
@@ -738,7 +751,8 @@ def make_bsl_helpers(
     def find_exports(path: str) -> list[dict]:
         """Return only exported procedures/functions from a BSL file.
 
-        Returns: list of dicts {name, type, line, end_line, is_export, params}."""
+        Returns: list of dicts {name, type, line, end_line, is_export, params}.
+        ``params`` — список имён параметров (list[str], v1.18.0)."""
         return [p for p in extract_procedures(path) if p["is_export"]]
 
     def safe_grep(pattern: str, name_hint: str = "", max_files: int = 20) -> list[dict]:
@@ -859,6 +873,18 @@ def make_bsl_helpers(
         Returns the hit list, or ``[{"error": ...}]`` if git grep failed / timed
         out / a filter was malformed (distinct from ``[]`` = nothing found).
         """
+        # v1.18.0 Фикс 4a: пустой/пробельный паттерн -> внятный [{error, hint}]
+        # (list-форма, как и любой результат git_search), а не таймаут-заглушка.
+        if not pattern or not pattern.strip():
+            return [
+                {
+                    "error": "empty pattern",
+                    "hint": (
+                        "задайте непустую подстроку или regex; для поиска по типу объекта — "
+                        "find_by_type(...), по имени метода — search_methods(...)."
+                    ),
+                }
+            ]
         from rlm_tools_bsl.bsl_index import _git_grep
 
         res = _git_grep(
@@ -1064,6 +1090,24 @@ def make_bsl_helpers(
         Returns:
             dict with "callers" list and "_meta" pagination info.
         """
+        # --- v1.18.0 Фикс 3: int-guard ДО reader-вызова ---
+        # _normalize_module_hint делает hint.strip(), поэтому НЕнулевой int роняет
+        # AttributeError внутри ридера (`if not hint` ловит лишь 0/пусто). Политика —
+        # НЕ угадывать сдвиг аргументов, а не падать и явно назвать сигнатуру.
+        arg_warning: str | None = None
+        if not isinstance(module_hint, str):
+            arg_warning = (
+                f"module_hint ожидался строкой, получено {type(module_hint).__name__}={module_hint!r} "
+                "— проигнорирован. Сигнатура: find_callers_context(proc_name, module_hint, offset, limit)."
+            )
+            module_hint = ""
+
+        def _tag(res: dict) -> dict:
+            """Прокинуть arg_warning в _meta любого возвращаемого результата."""
+            if arg_warning and isinstance(res, dict) and isinstance(res.get("_meta"), dict):
+                res["_meta"]["arg_warning"] = arg_warning
+            return res
+
         # --- Fast path: SQLite call graph ---
         if idx_reader is not None and idx_reader.has_calls:
             _t0 = _time_mod.monotonic()
@@ -1077,8 +1121,22 @@ def make_bsl_helpers(
                     _n,
                     _elapsed,
                 )
+                # v1.18.0 Фикс 3: offset-overshoot. returned=0, но total>0 и offset
+                # за пределами — вероятно перепутаны позиционные аргументы. Возвращаем
+                # индексный результат с HINT ДО authoritative/FS-fallback (которые
+                # перетёрли бы _meta["hint"] или выбросили бы total_callers).
+                _meta = result.get("_meta") or {}
+                _total = _meta.get("total_callers")
+                if _n == 0 and isinstance(_total, int) and _total > 0 and isinstance(offset, int) and offset >= _total:
+                    _meta["hint"] = (
+                        f"offset ({offset}) >= total_callers ({_total}): вероятно перепутаны "
+                        "позиционные аргументы. Сигнатура: find_callers_context(proc_name, "
+                        "module_hint, offset, limit). Повторите с offset=0."
+                    )
+                    result["_meta"] = _meta
+                    return _tag(result)
                 if _n > 0:
-                    return result
+                    return _tag(result)
                 if idx_zero_callers_authoritative:
                     logger.debug(
                         "find_callers_context: proc=%s index=0, authoritative=True, skip FS fallback",
@@ -1088,7 +1146,7 @@ def make_bsl_helpers(
                     result["_meta"]["hint"] = (
                         "No callers found in call index. Use safe_grep(proc_name) to search for text mentions."
                     )
-                    return result
+                    return _tag(result)
                 # Untrusted/stale index — fall back to FS scan
                 logger.debug(
                     "find_callers_context: proc=%s index returned 0, falling back to scan",
@@ -1211,20 +1269,27 @@ def make_bsl_helpers(
             scanned_files,
             total_files,
         )
-        return {
-            "callers": callers,
-            "_meta": {
-                "total_callers": len(callers),
-                "returned": len(callers),
-                "offset": offset,
-                "has_more": (offset + limit) < total_files,
-                # FS fallback (no call index): exact (resolved) mode unavailable.
-                "exact_available": False,
-                "target_exact": False,
-                "exact_rows": 0,
-                "fallback_rows": len(callers),
-            },
+        _fs_meta = {
+            "total_callers": len(callers),
+            "returned": len(callers),
+            "offset": offset,
+            "has_more": (offset + limit) < total_files,
+            # FS fallback (no call index): exact (resolved) mode unavailable.
+            "exact_available": False,
+            "target_exact": False,
+            "exact_rows": 0,
+            "fallback_rows": len(callers),
         }
+        # v1.18.0 Фикс 3: симметричный offset-overshoot guard по total_files.
+        # Страница пуста, но файлы-кандидаты есть и offset за их пределами →
+        # вероятно перепутаны позиционные аргументы, а не «нет вызовов».
+        if not callers and total_files > 0 and isinstance(offset, int) and offset >= total_files:
+            _fs_meta["hint"] = (
+                f"offset ({offset}) >= файлов-кандидатов ({total_files}): вероятно перепутаны "
+                "позиционные аргументы. Сигнатура: find_callers_context(proc_name, module_hint, "
+                "offset, limit). Повторите с offset=0."
+            )
+        return _tag({"callers": callers, "_meta": _fs_meta})
 
     def find_call_hierarchy(
         name: str,
@@ -1445,10 +1510,17 @@ def make_bsl_helpers(
         last_segment = parts[-1] if parts else ""
 
         out: list[str] = []
-        if last_segment:
-            out.append(f"{object_name}/{last_segment}.mdo")
-        if xml_name:
-            out.append(f"{object_name}/Ext/{xml_name}.xml")
+        # v1.18.0 Фикс 4b: порядок директорных кандидатов под формат дампа
+        # (CF -> Ext/*.xml сначала, EDT -> *.mdo сначала). ПЕРЕУПОРЯДОЧИВАЕМ, НЕ
+        # сокращаем — все кандидаты пробуются (смешанные CF+EDT расширения корректны).
+        edt_cand = f"{object_name}/{last_segment}.mdo" if last_segment else None
+        cf_cand = f"{object_name}/Ext/{xml_name}.xml" if xml_name else None
+        if _dump_format == "cf":
+            ordered = [cf_cand, edt_cand]
+        else:
+            # EDT и UNKNOWN сохраняют прежний порядок (EDT-кандидат первым).
+            ordered = [edt_cand, cf_cand]
+        out.extend(c for c in ordered if c)
         out.append(f"{object_name}.xml")
         out.append(f"{object_name}.mdo")
 
@@ -1569,11 +1641,14 @@ def make_bsl_helpers(
             raise PermissionError(f"Access denied: path {path!r} escapes sandbox and extension roots")
 
         if ends_with_xml or ends_with_mdo:
+            # v1.18.0 Фикс 4b: ведём подсказку форматом дампа (CF -> Ext/*.xml первым).
+            edt_hint = f"'{base}/{last_segment}.mdo' (EDT)"
+            cf_hint = f"'{base}/Ext/{xml_name or '<Type>'}.xml' (CF)"
+            fmt_hints = f"{cf_hint} / {edt_hint}" if _dump_format == "cf" else f"{edt_hint} / {cf_hint}"
             raise FileNotFoundError(
                 f"Path not found: {path!r}. "
                 f"Возможно вы передали '{path}' (фейковый файл). "
-                f"Попробуйте '{base}' (директория) или '{base}/{last_segment}.mdo' (EDT) / "
-                f"'{base}/Ext/{xml_name or '<Type>'}.xml' (CF)."
+                f"Попробуйте '{base}' (директория) или {fmt_hints}."
             )
         raise FileNotFoundError(
             f"Path not found: {path!r}. Use find_module('{last_segment}') to discover the correct path."
@@ -1593,7 +1668,18 @@ def make_bsl_helpers(
         dimensions, resources (depends on metadata type)."""
         resolved = _resolve_object_xml(path)
         content = _ext_read_file(resolved)
-        return parse_metadata_xml(content)
+        parsed = parse_metadata_xml(content)
+        # v1.18.0 Фикс 1: атрибутные записи толерантны к диалекту ключей
+        # (name <-> attr_name). Оборачиваем ТОЛЬКО вложенные записи, не сам
+        # верхний dict (его internal-консьюмеры проверяют isinstance(..., dict)).
+        if isinstance(parsed, dict):
+            for _section in ("attributes", "dimensions", "resources"):
+                if isinstance(parsed.get(_section), list):
+                    parsed[_section] = [_AttrRecord(a) if isinstance(a, dict) else a for a in parsed[_section]]
+            for _ts in parsed.get("tabular_sections", []) or []:
+                if isinstance(_ts, dict) and isinstance(_ts.get("attributes"), list):
+                    _ts["attributes"] = [_AttrRecord(a) if isinstance(a, dict) else a for a in _ts["attributes"]]
+        return parsed
 
     # ── Composite helpers (wrappers over existing functions) ────────
 
@@ -2085,6 +2171,7 @@ def make_bsl_helpers(
                         }
                     )
                 if result["attributes"]:
+                    result["attributes"] = [_AttrRecord(r) for r in result["attributes"]]
                     structural_filled_from_live = True
             if not result["dimensions"]:
                 for dim in meta.get("dimensions", []) or []:
@@ -2098,6 +2185,7 @@ def make_bsl_helpers(
                         }
                     )
                 if result["dimensions"]:
+                    result["dimensions"] = [_AttrRecord(r) for r in result["dimensions"]]
                     structural_filled_from_live = True
             if not result["resources"]:
                 for res_attr in meta.get("resources", []) or []:
@@ -2111,6 +2199,7 @@ def make_bsl_helpers(
                         }
                     )
                 if result["resources"]:
+                    result["resources"] = [_AttrRecord(r) for r in result["resources"]]
                     structural_filled_from_live = True
 
             # --- Tabular sections: либо полное заполнение, либо обогащение synonym ---
@@ -2134,6 +2223,8 @@ def make_bsl_helpers(
                         }
                     )
                 if result["tabular_sections"]:
+                    for _ts in result["tabular_sections"]:
+                        _ts["columns"] = [_AttrRecord(c) for c in _ts.get("columns") or []]
                     structural_filled_from_live = True
             else:
                 # TS уже из индекса — у них synonym=None. Обогащаем по name.
@@ -2197,11 +2288,13 @@ def make_bsl_helpers(
             ts_groups: dict[str, list[dict]] = {}
             for row in attrs_rows or []:
                 kind = row.get("attr_kind") or ""
-                attr_dict = {
-                    "name": row.get("attr_name", ""),
-                    "synonym": row.get("attr_synonym", "") or "",
-                    "type": row.get("attr_type", []) or [],
-                }
+                attr_dict = _AttrRecord(
+                    {
+                        "name": row.get("attr_name", ""),
+                        "synonym": row.get("attr_synonym", "") or "",
+                        "type": row.get("attr_type", []) or [],
+                    }
+                )
                 if kind == "attribute":
                     result["attributes"].append(attr_dict)
                 elif kind == "dimension":
@@ -3593,7 +3686,7 @@ def make_bsl_helpers(
                         )
 
                 if rows:
-                    _ext_attrs_cache[key] = rows
+                    _ext_attrs_cache[key] = [_AttrRecord(r) for r in rows]
 
             _ext_attrs_cache_built[0] = True
 
@@ -3752,6 +3845,8 @@ def make_bsl_helpers(
                 kind=kind,
                 limit=limit,
             )
+            if results:
+                results = [_AttrRecord(r) for r in results]
             if results is not None:
                 if results:  # non-empty — authoritative for main config
                     # Merge ext-side rows for name-only queries BEFORE truncation
@@ -3909,7 +4004,7 @@ def make_bsl_helpers(
                             "source_file": resolved,
                         }
                     )
-            return results[:limit]
+            return [_AttrRecord(r) for r in results[:limit]]
 
         # No idx_reader, no object_name → scan extension metadata as the only live source.
         if _extension_metadata_xml and not object_name:
@@ -4475,10 +4570,12 @@ def make_bsl_helpers(
 
         Returns: list of dicts {name, type, is_export, line, end_line, params,
                  module_path, object_name, rank} ordered by relevance.
+                 ``params`` — список имён параметров (list[str], v1.18.0).
                  Empty list if index/FTS not available."""
         result: list[dict] = []
         if idx_reader is not None and idx_reader.has_fts:
-            result = list(idx_reader.search_methods(query, limit))
+            # v1.18.0 Фикс 2: params строкой -> list на helper-границе.
+            result = _normalize_method_params(list(idx_reader.search_methods(query, limit)))
         _ensure_index()
         # Merge BEFORE truncation: even when main FTS fills `limit`, an ext
         # method with exact-name match must be visible. Rank-merge with 3-level
@@ -5699,13 +5796,13 @@ def make_bsl_helpers(
     _reg(
         "extract_procedures",
         extract_procedures,
-        "extract_procedures(path) -> [{name, type, line, end_line, is_export, params}]",
+        "extract_procedures(path) -> [{name, type, line, end_line, is_export, params(list)}]",
         "code",
     )
     _reg(
         "find_exports",
         find_exports,
-        "find_exports(path) -> [{name, line, is_export, type, params}]",
+        "find_exports(path) -> [{name, line, is_export, type, params(list)}]",
         "code",
         ["export", "экспорт", "find_exports", "процедур", "функци"],
         "FIND EXPORTS:\n"
@@ -6006,7 +6103,7 @@ def make_bsl_helpers(
         "  # ⚠️ КЛЮЧИ В РЕЗУЛЬТАТЕ ОТЛИЧАЮТСЯ от find_attributes!\n"
         "  #   find_attributes:           [{attr_name, attr_synonym, attr_type, attr_kind}]\n"
         "  #   get_object_full_structure: {attributes:[{name, synonym, type}], dimensions:[...], resources:[...], ...}\n"
-        "  #   Итерация: for a in s['attributes']: a['name']  (НЕ a['attr_name'] — будет KeyError)\n"
+        "  #   Итерация: for a in s['attributes']: a['name']  (a['attr_name'] тоже работает — алиас, v1.18.0)\n"
         "  s = get_object_full_structure('РеализацияТоваровУслуг')\n"
         "  print(f\"{s['object_name']} ({s.get('synonym')}) posting={s.get('posting')}\")\n"
         "  print(f\"Реквизитов: {len(s['attributes'])}, ТЧ: {len(s['tabular_sections'])}, форм: {len(s['forms'])}\")\n"
@@ -6224,7 +6321,7 @@ def make_bsl_helpers(
     _reg(
         "search_methods",
         search_methods,
-        "search_methods(query, limit=30) -> [{name, type, is_export, module_path, object_name, rank}]",
+        "search_methods(query, limit=30) -> [{name, type, is_export, params(list), module_path, object_name, rank}]",
         "discovery",
         ["поиск метод", "search", "fts", "full-text", "найти метод", "подстрок"],
         "SEARCH METHODS BY NAME (FTS5, requires pre-built index with --no-fts NOT set):\n"

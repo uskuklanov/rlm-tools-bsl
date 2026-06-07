@@ -333,11 +333,28 @@ class Sandbox:
             bad_keys = ("'attr_name'", "'attr_synonym'", "'attr_type'", "'attr_kind'")
             if any(k in error for k in bad_keys):
                 hints.append(
-                    "HINT: get_object_full_structure возвращает ключи name/synonym/type "
-                    "(НЕ attr_name/attr_synonym/attr_type — это контракт find_attributes). "
+                    "HINT: get_object_full_structure отдаёт ключи name/synonym/type "
+                    "(attr_name/attr_synonym/attr_type теперь принимаются как алиасы — это контракт "
+                    "find_attributes). Если KeyError всё же возник — у структурных записей нет поля "
+                    "attr_kind (алиаса для него нет). "
                     "Итерируй: for a in result['attributes']: print(a['name'], a['type']). "
                     "Для регистров — result['dimensions'] и result['resources']."
                 )
+
+        # v1.18.0 Фикс 2 follow-up: params теперь list[str] ИМЁН (не list[dict]).
+        # Агент, ожидавший list[dict], пишет p['name'] / p.get('name') на строке-элементе
+        # → TypeError "string indices must be integers" или AttributeError "'str' object
+        # has no attribute …". Подсказываем форму контракта (зеркало attr_kind-хинта).
+        params_str_misuse = "string indices must be integers" in error or (
+            "AttributeError" in error and "'str' object has no attribute" in error
+        )
+        if params_str_misuse and "params" in code:
+            hints.append(
+                "HINT: поле params — это СПИСОК ИМЁН параметров (list[str], v1.18.0), а не "
+                "list[dict]. Элемент params уже строка-имя: итерируй "
+                "for name in m['params']: print(name). НЕ обращайся p['name'] / p.get('name') "
+                "к элементу params (extract_procedures / find_exports / search_methods)."
+            )
 
         if "import" in error.lower() and "restricted" in error.lower():
             hints.append(
