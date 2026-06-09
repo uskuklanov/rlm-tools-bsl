@@ -69,15 +69,19 @@ async def _health_endpoint(request):  # type: ignore[no-untyped-def]
 
 from rlm_tools_bsl.helpers import _SKIP_DIRS, _BINARY_EXTENSIONS
 
-_MAX_OVERRIDES_IN_RESPONSE = 100
-
 
 def _auto_scan_overrides(ext_context) -> dict[str, list[dict]]:
     """Auto-scan extension overrides during rlm_start.
 
-    Returns dict mapping extension path -> list of override dicts.
-    If current path is an extension, scans itself under key "self".
-    If main config with nearby extensions, scans each extension.
+    Returns dict mapping extension path -> list of override dicts (key "self" for
+    an extension-role session). Consumed by (a) the strategy's bounded "CRITICAL
+    EXTENSIONS DETECTED" by-object summary and (b) the rlm_start response — which
+    surfaces only the COUNT, NOT the full per-override dump. v1.19.0: the inline
+    dump was dropped from the response because it duplicated get_overrides()/
+    find_ext_overrides(), was not actionable from the sandbox (tool-response text,
+    not a variable), went unused by agents (e2e: all re-fetched), and cost ~30K
+    tokens on EVERY session of an extension config. Full detail on demand via
+    get_overrides('Object').
     """
 
     result: dict[str, list[dict]] = {}
@@ -85,13 +89,11 @@ def _auto_scan_overrides(ext_context) -> dict[str, list[dict]]:
 
     try:
         if current.role == ConfigRole.EXTENSION:
-            overrides = find_extension_overrides(current.path)
-            result["self"] = overrides[:_MAX_OVERRIDES_IN_RESPONSE]
+            result["self"] = find_extension_overrides(current.path)
 
         elif current.role == ConfigRole.MAIN and ext_context.nearby_extensions:
             for ext in ext_context.nearby_extensions:
-                overrides = find_extension_overrides(ext.path)
-                result[ext.path] = overrides[:_MAX_OVERRIDES_IN_RESPONSE]
+                result[ext.path] = find_extension_overrides(ext.path)
     except Exception:
         pass  # non-critical, don't fail rlm_start
 
@@ -601,7 +603,9 @@ def _rlm_start(
                     "purpose": e.purpose,
                     "prefix": e.name_prefix,
                     "path": e.path,
-                    "overrides": ext_overrides.get(e.path, []),
+                    # Count only — full per-override detail via get_overrides('Object')
+                    # (the inline dump was unused noise, ~30K on extension configs).
+                    "overrides_count": len(ext_overrides.get(e.path, [])),
                 }
                 for e in ext_context.nearby_extensions
             ],
@@ -610,7 +614,9 @@ def _rlm_start(
                 if ext_context.nearby_main
                 else None
             ),
-            "own_overrides": ext_overrides.get("self", []) if ext_context.current.role.value == "extension" else None,
+            "own_overrides_count": (
+                len(ext_overrides.get("self", [])) if ext_context.current.role.value == "extension" else None
+            ),
         },
         "detected_custom_prefixes": detected_prefixes,
         "index": {
@@ -1106,7 +1112,9 @@ if get_strategy_mode() == "slim":
                     "(aliases: 'найти ссылки', 'where used', 'где используется в коде', 'code usages'), "
                     "'перечисления' (alias: 'enum'), "
                     "'ввод на основании', 'структура объекта' (alias: 'карточка объекта'), "
-                    "'тип реквизита' (alias: 'субконто'), 'себестоимость', 'распределение'. "
+                    "'тип реквизита' (alias: 'субконто'), 'себестоимость', 'распределение', "
+                    "'достижимость' (aliases: 'reachability', 'путь вызовов', 'доходит ли'), "
+                    "'путь данных' (aliases: 'data path', 'как связаны', 'граф данных'). "
                     "Use rlm_help() with no args to see the full menu."
                 )
             ),

@@ -7,7 +7,7 @@
 [![CI](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml/badge.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rlm-tools-bsl.svg)](https://pypi.org/project/rlm-tools-bsl/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Coverage](https://img.shields.io/badge/coverage-81%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-82%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 MCP-сервер для токен-эффективного анализа кодовых баз 1С (BSL).
@@ -207,7 +207,7 @@ rlm_start(project="My Config", query="find module...")
 
 ## Как работает (под капотом)
 
-Шесть MCP-инструментов (`rlm_projects`, `rlm_index`, `rlm_start` → `rlm_help` → `rlm_execute` → `rlm_end`), песочница с **57 хелперами** (47 BSL-специфичных + 8 стандартных + 2 LLM), сессионные кэши, таймауты, безопасность, пример построения графа вызовов на крупной конфигурации (23K+ файлов) — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+Шесть MCP-инструментов (`rlm_projects`, `rlm_index`, `rlm_start` → `rlm_help` → `rlm_execute` → `rlm_end`), песочница с **59 хелперами** (49 BSL-специфичных + 8 стандартных + 2 LLM), сессионные кэши, таймауты, безопасность, пример построения графа вызовов на крупной конфигурации (23K+ файлов) — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 Полный список хелперов — **[docs/HELPERS.md](docs/HELPERS.md)** | Совместное использование с RAG — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#совместное-использование-с-rag)**
 

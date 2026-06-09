@@ -636,9 +636,11 @@ def test_help_sig_mentions_hint_and_meta(project):
     assert "module_hint" in sig
     assert "exact_available" in sig
     assert "target_key" in sig
+    assert "include_triggers" in sig
     recipe = entry["recipe"]
     assert "module_hint" in recipe
     assert "root_exact" in recipe
+    assert "include_triggers" in recipe
 
 
 def test_help_topic_recipe_reflects_hint(project):

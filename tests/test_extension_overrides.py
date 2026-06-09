@@ -274,6 +274,42 @@ class TestBuildExtensionOnly:
             assert r["target_method_line"] is None
 
 
+class TestLiveOverridesContract:
+    """get_overrides() LIVE fallback must carry extension_name in EVERY branch.
+
+    Regression: a session opened directly ON an extension (role=EXTENSION) used the
+    raw find_extension_overrides rows, which lack extension_name → the `расширения`
+    recipe's `{o['extension_name'] for o in ov}` raised KeyError (confirmed live).
+    """
+
+    def test_extension_session_live_overrides_have_extension_name(self, tmp_path):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+        from rlm_tools_bsl.format_detector import detect_format
+        from rlm_tools_bsl.helpers import make_helpers
+
+        ext_dir = _make_extension_only(tmp_path)
+        helpers, resolve_safe = make_helpers(str(ext_dir))
+        fmt = detect_format(str(ext_dir))
+        bsl = make_bsl_helpers(
+            base_path=str(ext_dir),
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=fmt,
+            idx_reader=None,  # force the live fallback → EXTENSION-role branch
+        )
+        res = bsl["get_overrides"]()
+        assert res["source"] == "live"
+        assert res["overrides"], "expected live overrides from the extension"
+        for ov in res["overrides"]:
+            assert ov.get("extension_name"), ov
+            assert "extension_root" in ov
+        # The расширения recipe's set-comprehension must not raise.
+        names = {o["extension_name"] for o in res["overrides"]}
+        assert names == {"ТестовоеРасширение"}
+
+
 # ---------------------------------------------------------------------------
 # IndexReader methods
 # ---------------------------------------------------------------------------

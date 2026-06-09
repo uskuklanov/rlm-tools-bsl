@@ -7575,7 +7575,8 @@ class IndexReader:
             exact_key = self._resolve_target_key(proc_name, module_hint)
             if exact_key is not None:
                 base_select = (
-                    "SELECT c.line AS call_line, c.callee_name, m.name AS caller_name, "
+                    "SELECT c.line AS call_line, c.callee_name, c.callee_key AS edge_callee_key, "
+                    "m.name AS caller_name, "
                     "m.is_export AS caller_is_export, mod.rel_path, mod.object_name, "
                     "mod.category, mod.module_type "
                     "FROM calls c JOIN methods m ON m.id = c.caller_id "
@@ -7605,6 +7606,11 @@ class IndexReader:
                         "object_name": r["object_name"],
                         "category": r["category"],
                         "module_type": r["module_type"],
+                        # Additive per-edge precision flag (v1.19.0, for find_path):
+                        # True ⇔ this edge matched the stable callee_key, False ⇔
+                        # kept by name recall (callee_key IS NULL). _meta aggregates
+                        # cannot carry this per-row, so find_path reads it here.
+                        "edge_exact": bool(r["edge_callee_key"] is not None and r["edge_callee_key"] == exact_key),
                     }
                     for r in rows
                 ]
@@ -7704,6 +7710,8 @@ class IndexReader:
                     "object_name": r["object_name"],
                     "category": r["category"],
                     "module_type": r["module_type"],
+                    # Name-based fallback: no edge resolved to a stable key.
+                    "edge_exact": False,
                 }
                 for r in rows
             ]
@@ -7724,6 +7732,233 @@ class IndexReader:
                     "fallback_rows": total_callers,
                 },
             }
+
+    def resolve_target_identity(self, proc_name: str, module_hint: str = "") -> str | None:
+        """Public, LOCKED wrapper over ``_resolve_target_key`` (v1.19.0).
+
+        ``_resolve_target_key`` is an INTERNAL, lockless SQL helper: ``get_callers``
+        and ``get_inbound_edges`` already call it while holding ``self._lock`` (a
+        plain ``threading.Lock``, NOT an ``RLock`` — re-acquiring would deadlock).
+        Callers running OUTSIDE the reader lock (e.g. ``find_path`` in
+        ``bsl_helpers``) must use THIS method, never the lockless internal directly.
+
+        Returns ``"<rel_path>::<casefold(proc_name)>"`` when the target maps to
+        exactly one module; otherwise None (ambiguous / no exact mode / old index).
+        """
+        with self._lock:
+            return self._resolve_target_key(proc_name, module_hint)
+
+    def get_inbound_edges(self, proc_name: str, module_hint: str = "") -> list[dict]:
+        """Non-call inbound edges into ``proc_name`` (the 1C control-flow graph).
+
+        A method is reached not only from code (``calls`` → ``get_callers``) but
+        also via four declarative sources, all resolved through the SAME
+        ``callee_key`` identity space used by the call graph:
+
+          * ``cfe_override``  — an extension CFE-override (``&Перед``/``&После``/
+            ``&Вместо``) that wraps the method;
+          * ``form_event``    — a form element/event whose handler IS the method;
+          * ``subscription``  — an EventSubscription whose handler IS the method;
+          * ``scheduled_job`` — a ScheduledJob whose handler IS the method.
+
+        Contract (v1.19.0): ALWAYS returns ``list[dict]`` (NEVER None — an empty
+        list means "no non-call edges", so ``find_call_hierarchy`` can blindly
+        merge it). Each row::
+
+            {edge_type, source_name, source_kind, detail, file, line,
+             caller_name, object_name, category, target_key: str|None, resolved: bool}
+
+        ``resolved=True`` ⇔ matched on the stable ``target_key``; ``False`` ⇔
+        matched by name only (recall path). Mirroring ``get_callers``, even in
+        exact mode we keep name-matched-but-unresolved rows (``resolved=False``):
+        extension-only indexes store ``extension_overrides.source_path == ""`` and
+        a subscription whose ``handler_module`` does not resolve in ``modules`` —
+        dropping them would silently lose edges.
+
+        ``COLLATE NOCASE`` folds ONLY ASCII, so Cyrillic method names are compared
+        in Python via ``.casefold()`` (the method in ``target_key`` is already
+        casefold'd by ``_make_callee_key``). No-op safe: each block is guarded by
+        ``try/except sqlite3.OperationalError`` so old indexes simply add nothing.
+        """
+        edges: list[dict] = []
+        proc_cf = proc_name.casefold()
+        with self._lock:
+            # Resolve the target identity ONCE (lockless internal — we hold the
+            # lock). exact_key = "<rel_path>::<casefold(method)>" or None.
+            try:
+                exact_key = self._resolve_target_key(proc_name, module_hint)
+            except sqlite3.Error:
+                exact_key = None
+            target_rel_path = exact_key.rsplit("::", 1)[0] if exact_key is not None else None
+
+            # --- (1) cfe_override — reverse, scan of the SMALL overrides table ---
+            # No index fits our filter (idx_eo_source=source_module_id;
+            # idx_eo_method=COLLATE NOCASE, which does not fold Cyrillic), so we
+            # mirror get_extension_overrides: read rows, filter in Python casefold.
+            try:
+                rows = self._conn.execute(
+                    "SELECT object_name, source_path, target_method, annotation, "
+                    "extension_name, extension_method, ext_module_path, ext_line "
+                    "FROM extension_overrides"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            for r in rows:
+                if (r["target_method"] or "").casefold() != proc_cf:
+                    continue
+                src_path = (r["source_path"] or "").replace("\\", "/")
+                resolved = bool(
+                    exact_key is not None
+                    and src_path != ""
+                    and target_rel_path is not None
+                    and src_path.casefold() == target_rel_path.casefold()
+                )
+                edges.append(
+                    {
+                        "edge_type": "cfe_override",
+                        "source_name": r["extension_name"],
+                        "source_kind": "Extension",
+                        "detail": r["annotation"],
+                        "file": r["ext_module_path"],
+                        "line": r["ext_line"],
+                        "caller_name": r["extension_method"],
+                        "object_name": r["object_name"],
+                        "category": None,
+                        "target_key": exact_key if resolved else None,
+                        "resolved": resolved,
+                    }
+                )
+
+            # --- (2) form_event — reverse, two steps (handler is BARE, in form) ---
+            frow = None
+            if exact_key is not None and target_rel_path is not None:
+                try:
+                    frow = self._conn.execute(
+                        "SELECT object_name, category, form_name FROM modules WHERE rel_path = ? AND is_form = 1",
+                        (target_rel_path,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    frow = None
+            if frow is not None:
+                # Authoritative form context: emit ONLY this form's matching
+                # handlers (exact, resolved=True). object_name/form_name come from
+                # modules so they are precise; match the BARE handler in Python.
+                try:
+                    handlers = self._conn.execute(
+                        "SELECT object_name, category, form_name, element_name, event, handler, file "
+                        "FROM form_elements WHERE kind = 'handler' AND object_name = ? AND form_name = ?",
+                        (frow["object_name"], frow["form_name"]),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    handlers = []
+                _form_resolved = True
+            elif exact_key is not None:
+                # Target resolved to a NON-form module → it CANNOT be a form event
+                # handler (handlers are bare procedures living IN the form module).
+                # Skip the scan entirely. PERF (v1.19.0 fix): the old recall branch
+                # ran a FULL form_elements scan PER NODE; on a wide include_triggers
+                # tree (dozens of nodes) over a big config (~250K form_elements) that
+                # was O(nodes × rows) → seconds-to-minutes. Most expanded nodes resolve
+                # to common/object modules, so this skip removes the dominant cost.
+                handlers = []
+                _form_resolved = False
+            else:
+                # Truly unknown target (no exact key): name-narrow in SQL via the
+                # Cyrillic-aware py_lower UDF (returns ONLY name-matches), NOT a
+                # fetch-all + Python loop. resolved=False (recall path).
+                try:
+                    handlers = self._conn.execute(
+                        "SELECT object_name, category, form_name, element_name, event, handler, file "
+                        "FROM form_elements WHERE kind = 'handler' AND py_lower(handler) = py_lower(?)",
+                        (proc_name,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    handlers = []
+                _form_resolved = False
+            for h in handlers:
+                if (h["handler"] or "").casefold() != proc_cf:
+                    continue
+                elem = h["element_name"] or "[form]"
+                edges.append(
+                    {
+                        "edge_type": "form_event",
+                        "source_name": h["form_name"],
+                        "source_kind": "Form",
+                        "detail": f"{elem}.{h['event']}",
+                        "file": h["file"],
+                        "line": None,
+                        "caller_name": h["handler"],
+                        "object_name": h["object_name"],
+                        "category": h["category"],
+                        "target_key": exact_key if _form_resolved else None,
+                        "resolved": _form_resolved,
+                    }
+                )
+
+            # --- (3)+(4) subscription / scheduled_job — FORWARD resolve (cheaper) ---
+            # handler_module is the common module's object_name (not rel_path);
+            # handler_procedure is BARE. Resolve forward with one LEFT JOIN. The
+            # filter is handler_procedure<>'' (NOT handler_module<>'' — that would
+            # drop dotless handlers, builder allows handler_module=""); the module
+            # condition lives in the ON clause so a non-resolving module yields a
+            # NULL rel_path row instead of a dropped one (recall). Forward cleanly
+            # distinguishes same-named handlers in different common modules, so a
+            # row that provably resolves to a DIFFERENT module is dropped.
+            #
+            # PERF (v1.19.0 fix): the handler_procedure name-match is pushed into the
+            # SQL WHERE via py_lower(...) — WITHOUT it the LEFT JOIN computed
+            # py_lower(object_name) over every CommonModule for EVERY subscription
+            # (then filtered by name in Python), ~4s per call on ERP → ~250s across a
+            # 60-node include_triggers tree. Now only the 0–few subscriptions whose
+            # handler_procedure matches get joined. Cyrillic-aware (py_lower, not
+            # COLLATE NOCASE). The Python casefold check below stays as cheap safety.
+            for edge_type, source_kind, table, alias in (
+                ("subscription", "EventSubscription", "event_subscriptions", "es"),
+                ("scheduled_job", "ScheduledJob", "scheduled_jobs", "sj"),
+            ):
+                detail_col = "es.event" if alias == "es" else "''"
+                try:
+                    rows = self._conn.execute(
+                        f"SELECT {alias}.name AS name, {detail_col} AS detail, "  # noqa: S608
+                        f"{alias}.handler_module AS handler_module, "
+                        f"{alias}.handler_procedure AS handler_procedure, "
+                        f"{alias}.file AS file, mod.rel_path AS rel_path "
+                        f"FROM {table} {alias} "
+                        "LEFT JOIN modules mod ON mod.category='CommonModules' "
+                        "  AND mod.module_type='Module' "
+                        f"  AND {alias}.handler_module <> '' "
+                        f"  AND py_lower(mod.object_name)=py_lower({alias}.handler_module) "
+                        f"WHERE {alias}.handler_procedure <> '' "
+                        f"  AND py_lower({alias}.handler_procedure)=py_lower(?)",
+                        (proc_name,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+                for r in rows:
+                    if (r["handler_procedure"] or "").casefold() != proc_cf:
+                        continue
+                    rel_path = r["rel_path"]
+                    cand_key = _make_callee_key(rel_path, r["handler_procedure"]) if rel_path else None
+                    if exact_key is not None and cand_key is not None and cand_key != exact_key:
+                        # Provably a DIFFERENT module's handler → not our target.
+                        continue
+                    resolved = bool(exact_key is not None and cand_key is not None and cand_key == exact_key)
+                    edges.append(
+                        {
+                            "edge_type": edge_type,
+                            "source_name": r["name"],
+                            "source_kind": source_kind,
+                            "detail": r["detail"] or "",
+                            "file": r["file"],
+                            "line": None,
+                            "caller_name": r["handler_procedure"],
+                            "object_name": r["handler_module"],
+                            "category": "CommonModules" if rel_path else None,
+                            "target_key": cand_key if resolved else None,
+                            "resolved": resolved,
+                        }
+                    )
+        return edges
 
     def get_exports_by_path(self, rel_path: str) -> list[dict] | None:
         """Get exported methods for a given module path.
@@ -9057,6 +9292,65 @@ class IndexReader:
                     "used_in, path, line FROM metadata_references "
                     f"WHERE {where} "  # noqa: S608
                     f"ORDER BY {priority_expr}, path, used_in "
+                    "LIMIT ?"
+                )
+                params.append(limit)
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            return [
+                {
+                    "source_object": r["source_object"],
+                    "source_category": r["source_category"],
+                    "ref_object": r["ref_object"],
+                    "ref_kind": r["ref_kind"],
+                    "used_in": r["used_in"],
+                    "path": r["path"],
+                    "line": r["line"],
+                }
+                for r in rows
+            ]
+
+    def find_metadata_refs_from(
+        self,
+        source_object: str,
+        source_category: str | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict] | None:
+        """OUTBOUND metadata references FROM ``source_object`` (v1.19.0).
+
+        The reverse direction of ``find_metadata_references``: "which objects does
+        ``source_object`` reference?" (its attribute types, owner, based-on, …).
+        Mirrors that method's pattern, INCLUDING its perf profile — ``source_object``
+        is stored **bare** (e.g. ``"РеализацияТоваровУслуг"``) and matched via
+        ``py_lower(...)``, which is a SCAN, not an ``idx_mref_src`` point-lookup
+        (a UDF expression index would need a ``BUILDER_VERSION`` bump — forbidden).
+        ``metadata_references`` is object-level (orders of magnitude smaller than
+        ``calls``), so the scan is cheap; ``find_data_path`` additionally caps node
+        expansion. ``source_category`` (e.g. ``"Documents"``) disambiguates a bare
+        name shared by two categories (``Catalog.X`` vs ``Document.X``) and narrows
+        the scan via ``idx_mref_category``.
+
+        ``ref_object`` is returned in CANONICAL form (e.g. ``"Catalog.Контрагенты"``).
+        Returns None if the table is missing (pre-v9 index) → caller may fall back.
+        """
+        with self._lock:
+            try:
+                conditions = ["py_lower(source_object) = py_lower(?)"]
+                params: list = [source_object]
+                if source_category:
+                    conditions.append("source_category = ?")
+                    params.append(source_category)
+                if kinds:
+                    placeholders = ",".join("?" for _ in kinds)
+                    conditions.append(f"ref_kind IN ({placeholders})")
+                    params.extend(kinds)
+                where = " AND ".join(conditions)
+                sql = (
+                    "SELECT source_object, source_category, ref_object, ref_kind, "
+                    "used_in, path, line FROM metadata_references "
+                    f"WHERE {where} "  # noqa: S608
                     "LIMIT ?"
                 )
                 params.append(limit)

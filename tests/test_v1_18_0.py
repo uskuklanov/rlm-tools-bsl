@@ -713,3 +713,56 @@ def test_sandbox_params_hint_skipped_without_params_in_code():
     out = Sandbox._add_error_hints(error, code)
 
     assert "list[str]" not in out
+
+
+# === v1.19.0 tolerant-contract sandbox hints ===
+
+
+def test_sandbox_hint_safe_grep_wrong_kwarg():
+    """safe_grep(path=...) / safe_grep(hint=...) → подсказка про name_hint."""
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "TypeError: safe_grep() got an unexpected keyword argument 'path'"
+    code = "r = safe_grep('Pattern', path='SomeModule')"
+    out = Sandbox._add_error_hints(error, code)
+    assert "name_hint" in out
+
+
+def test_sandbox_hint_dict_sliced_as_list():
+    """d[:N] на dict → KeyError: slice(...) → подсказка взять список по ключу."""
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "KeyError: slice(None, 10, None)"
+    code = "flow = analyze_document_flow('X')\nprint(flow[:10])"
+    out = Sandbox._add_error_hints(error, code)
+    assert "dict" in out and "[:N]" in out
+
+
+def test_sandbox_hint_read_procedure_returns_str():
+    """read_procedure(...).get() → подсказка, что вернулась строка-тело, не dict."""
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "AttributeError: 'str' object has no attribute 'get'"
+    code = "body = read_procedure(path, 'M')\nprint(body.get('x'))"
+    out = Sandbox._add_error_hints(error, code)
+    assert "read_procedure" in out and ("СТРОКУ" in out or "строк" in out)
+
+
+def test_sandbox_hint_detect_extensions_iterated_as_list():
+    """detect_extensions() итерируют как список → подсказка про nearby_extensions."""
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "AttributeError: 'str' object has no attribute 'get'"
+    code = "exts = detect_extensions()\nfor e in exts:\n    print(e.get('name'))"
+    out = Sandbox._add_error_hints(error, code)
+    assert "nearby_extensions" in out
+
+
+def test_sandbox_hint_detect_extensions_indexed_as_list():
+    """detect_extensions()[0] на dict → KeyError: 0 → та же подсказка."""
+    from rlm_tools_bsl.sandbox import Sandbox
+
+    error = "KeyError: 0"
+    code = "first = detect_extensions()[0]"
+    out = Sandbox._add_error_hints(error, code)
+    assert "nearby_extensions" in out

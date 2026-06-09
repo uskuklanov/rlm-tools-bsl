@@ -356,6 +356,54 @@ class Sandbox:
                 "к элементу params (extract_procedures / find_exports / search_methods)."
             )
 
+        # v1.19.0 — tolerant-contract hints for deterministic agent guesses (e2e).
+        # Wrong kwarg name on a helper (observed: safe_grep(path=...) / safe_grep(hint=...);
+        # the parameter is name_hint). Turn the dead-end TypeError into a correction.
+        if "unexpected keyword argument" in error:
+            if "safe_grep" in code:
+                hints.append(
+                    "HINT: safe_grep(pattern, name_hint='', max_files=20) — второй параметр "
+                    "называется name_hint (имя/фрагмент модуля для сужения), НЕ path и НЕ hint."
+                )
+            else:
+                hints.append(
+                    "HINT: неподдерживаемый именованный аргумент. Сверь сигнатуру через "
+                    "help('имя_хелпера') / rlm_help(helpers=['имя_хелпера']); у хелпера может "
+                    "не быть такого параметра-фильтра — отбирай поля вывода в Python."
+                )
+
+        # Slicing a dict like a list: d[:N] → KeyError: slice(None, N, None). Several
+        # helpers return a dict, not a list.
+        if "KeyError" in error and "slice(" in error:
+            hints.append(
+                "HINT: похоже, вы срезаете dict как список ([:N]). Ряд хелперов возвращают "
+                "dict, а не list: analyze_document_flow → {event_subscriptions, "
+                "register_movements, ...}; get_overrides → {overrides, total, source}; "
+                "find_register_movements → {code_registers, erp_mechanisms, ...}; "
+                "find_path/find_data_path → {found, path:[...], _meta}. "
+                "Сначала возьми нужный СПИСОК по ключу (напр. res['path']), потом срезай."
+            )
+
+        # read_procedure returns the procedure BODY as a string, not a dict.
+        if "AttributeError" in error and "'str' object has no attribute" in error and "read_procedure" in code:
+            hints.append(
+                "HINT: read_procedure(path, name) возвращает СТРОКУ (тело метода с номерами "
+                "строк), не dict. Не вызывай .get()/[ключ] на результате — это уже текст."
+            )
+
+        # detect_extensions() returns a dict; agents recurrently treat it as a list
+        # (iterate → str keys → .get/.attr; or [0] → KeyError). The list lives under
+        # the 'nearby_extensions' key. (sig+recipe are correct — this is a reactive
+        # nudge, not a contract fix.)
+        if "detect_extensions" in code and (
+            "'str' object has no attribute" in error or "KeyError: 0" in error or "list indices" in error
+        ):
+            hints.append(
+                "HINT: detect_extensions() возвращает dict {config_role, config_name, "
+                "config_prefix, warnings, nearby_extensions, nearby_main}, НЕ список. "
+                "Расширения — это список ctx['nearby_extensions']; роль — ctx['config_role']."
+            )
+
         if "import" in error.lower() and "restricted" in error.lower():
             hints.append(
                 "HINT: Only standard library modules are allowed. Use built-in helpers instead of external libraries."

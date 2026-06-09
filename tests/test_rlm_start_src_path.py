@@ -59,6 +59,14 @@ def test_rlm_start_accepts_src_parent(tmp_path):
     assert data["extension_context"]["config_role"] == "main"
     nearby_names = {e["name"] for e in data["extension_context"]["nearby_extensions"]}
     assert "Ext1" in nearby_names
+    # v1.19.0: rlm_start surfaces only the override COUNT, not the full per-override
+    # dump (the inline dump was unused noise, ~30K on extension-heavy configs).
+    ec = data["extension_context"]
+    for e in ec["nearby_extensions"]:
+        assert isinstance(e.get("overrides_count"), int)
+        assert "overrides" not in e
+    assert "own_overrides_count" in ec
+    assert "own_overrides" not in ec
     _rlm_end(data["session_id"])
 
 

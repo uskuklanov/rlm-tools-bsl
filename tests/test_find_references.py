@@ -1004,3 +1004,182 @@ class TestLiveSiblingExtDedup:
         assert len(attr_refs) == 1, f"expected 1 attribute_type ref, got {len(attr_refs)}"
         # by_kind must reflect the deduplicated set
         assert result["by_kind"].get("attribute_type") == 1
+
+
+# ---------------------------------------------------------------------------
+# find_metadata_refs_from (outbound reader) + find_data_path (metagraph BFS)
+#   v1.19.0, step 4b
+# ---------------------------------------------------------------------------
+
+
+def _catalog_xml(name: str, attr_types: list[str]) -> str:
+    attrs = "".join(
+        f"<Attribute><Properties><Name>Реквизит{i}</Name><Type><v8:Type>{t}</v8:Type></Type></Properties></Attribute>"
+        for i, t in enumerate(attr_types)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">\n'
+        f"  <Catalog><Properties><Name>{name}</Name></Properties>"
+        f"<ChildObjects>{attrs}</ChildObjects></Catalog>\n"
+        "</MetaDataObject>\n"
+    )
+
+
+def _document_xml(name: str, attr_types: list[str]) -> str:
+    attrs = "".join(
+        f"<Attribute><Properties><Name>Реквизит{i}</Name><Type><v8:Type>{t}</v8:Type></Type></Properties></Attribute>"
+        for i, t in enumerate(attr_types)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">\n'
+        f"  <Document><Properties><Name>{name}</Name></Properties>"
+        f"<ChildObjects>{attrs}</ChildObjects></Document>\n"
+        "</MetaDataObject>\n"
+    )
+
+
+def _write_catalog(base: Path, name: str, attr_types: list[str]) -> None:
+    xml = _catalog_xml(name, attr_types)
+    _write(base / "Catalogs" / name / "Ext" / "Catalog.xml", xml)
+    _write(base / "Catalogs" / f"{name}.xml", xml)
+
+
+def _write_document(base: Path, name: str, attr_types: list[str]) -> None:
+    xml = _document_xml(name, attr_types)
+    _write(base / "Documents" / name / "Ext" / "Document.xml", xml)
+    _write(base / "Documents" / f"{name}.xml", xml)
+
+
+@pytest.fixture
+def datapath_fixture(tmp_path, monkeypatch):
+    """Controlled metadata graph: chain А→Б→В + a bare-name category collision
+    (Catalog.Дубль vs Document.Дубль with DIFFERENT outgoing refs)."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    base = tmp_path / "cf"
+    _write(base / "Configuration.xml", _CF_CONFIG_XML)
+    _write(base / "CommonModules" / "Test" / "Ext" / "Module.bsl", "Процедура Тест() Экспорт КонецПроцедуры")
+
+    # Chain: А --attr--> Б --attr--> В
+    _write_catalog(base, "А", ["CatalogRef.Б"])
+    _write_catalog(base, "Б", ["CatalogRef.В"])
+    _write_catalog(base, "В", [])
+
+    # Category collision on bare name "Дубль".
+    _write_catalog(base, "Дубль", ["CatalogRef.ЦельК"])
+    _write_document(base, "Дубль", ["CatalogRef.ЦельД"])
+    _write_catalog(base, "ЦельК", [])
+    _write_catalog(base, "ЦельД", [])
+
+    builder = IndexBuilder()
+    db_path = builder.build(
+        str(base),
+        build_calls=False,
+        build_metadata=True,
+        build_fts=False,
+        build_synonyms=True,
+    )
+    reader = IndexReader(db_path)
+    yield reader, str(base), db_path
+    reader.close()
+
+
+class TestFindMetadataRefsFrom:
+    def test_outbound_refs(self, datapath_fixture):
+        reader, _base, _db = datapath_fixture
+        rows = reader.find_metadata_refs_from("А", source_category="Catalogs")
+        assert rows is not None
+        refs = {r["ref_object"] for r in rows if r["ref_kind"] == "attribute_type"}
+        assert "Catalog.Б" in refs
+
+    def test_category_collision_isolated(self, datapath_fixture):
+        reader, _base, _db = datapath_fixture
+        cat_rows = reader.find_metadata_refs_from("Дубль", source_category="Catalogs")
+        doc_rows = reader.find_metadata_refs_from("Дубль", source_category="Documents")
+        cat_refs = {r["ref_object"] for r in cat_rows}
+        doc_refs = {r["ref_object"] for r in doc_rows}
+        assert "Catalog.ЦельК" in cat_refs and "Catalog.ЦельД" not in cat_refs
+        assert "Catalog.ЦельД" in doc_refs and "Catalog.ЦельК" not in doc_refs
+
+    def test_none_on_missing_table(self, datapath_fixture):
+        _reader, _base, db = datapath_fixture
+        conn = sqlite3.connect(str(db))
+        conn.execute("DROP TABLE metadata_references")
+        conn.commit()
+        conn.close()
+        reader2 = IndexReader(db)
+        try:
+            assert reader2.find_metadata_refs_from("А", source_category="Catalogs") is None
+        finally:
+            reader2.close()
+
+
+class TestFindDataPath:
+    def test_one_hop(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        res = helpers["find_data_path"]("Catalog.А", "Catalog.Б")
+        assert res["found"] is True
+        assert res["depth"] == 1
+        assert res["path"][0]["from"] == "Catalog.А"
+        assert res["path"][0]["to"] == "Catalog.Б"
+        assert res["path"][0]["kind"] == "attribute_type"
+
+    def test_two_hop(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        res = helpers["find_data_path"]("Catalog.А", "Catalog.В")
+        assert res["found"] is True
+        assert res["depth"] == 2
+        chain = [(e["from"], e["to"]) for e in res["path"]]
+        assert chain == [("Catalog.А", "Catalog.Б"), ("Catalog.Б", "Catalog.В")]
+
+    def test_ru_en_normalization(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        ru = helpers["find_data_path"]("Справочник.А", "Справочник.В")
+        en = helpers["find_data_path"]("Catalog.А", "Catalog.В")
+        assert ru["found"] is en["found"] is True
+        assert ru["depth"] == en["depth"] == 2
+
+    def test_kinds_filter(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        # Only attribute_type edges exist → filtering to 'owner' finds nothing.
+        res = helpers["find_data_path"]("Catalog.А", "Catalog.Б", kinds=["owner"])
+        assert res["found"] is False
+
+    def test_category_collision_no_cross_edges(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        # Walking from Catalog.Дубль must NOT pick up Document.Дубль's edges.
+        hit = helpers["find_data_path"]("Catalog.Дубль", "Catalog.ЦельК")
+        miss = helpers["find_data_path"]("Catalog.Дубль", "Catalog.ЦельД")
+        assert hit["found"] is True
+        assert miss["found"] is False
+
+    def test_bare_endpoint_returns_hint(self, datapath_fixture):
+        reader, base, _db = datapath_fixture
+        helpers = _stub_helpers(base, reader)
+        res = helpers["find_data_path"]("Дубль", "Catalog.ЦельК")  # bare `from`
+        assert res["found"] is False
+        assert "hint" in res
+        assert res["_meta"]["nodes_expanded"] == 0  # traversal not started
+
+    def test_partial_without_table(self, datapath_fixture):
+        _reader, base, db = datapath_fixture
+        conn = sqlite3.connect(str(db))
+        conn.execute("DROP TABLE metadata_references")
+        conn.commit()
+        conn.close()
+        reader2 = IndexReader(db)
+        try:
+            helpers = _stub_helpers(base, reader2)
+            res = helpers["find_data_path"]("Catalog.А", "Catalog.В")
+            assert res["found"] is False
+            assert res["partial"] is True
+        finally:
+            reader2.close()

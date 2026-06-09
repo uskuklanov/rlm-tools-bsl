@@ -1656,6 +1656,38 @@ def test_strip_meta_prefix_find_module(bsl_env):
     assert r1[0]["object_name"] == r2[0]["object_name"]
 
 
+def test_find_module_optional_filters(bsl_env):
+    """v1.19.0 tolerant contract: find_module accepts optional module_type/category
+    filters (instead of raising on the kwarg) and applies them case-insensitively."""
+    fm = bsl_env.bsl["find_module"]
+    all_mods = fm("МойМодуль")
+    assert all_mods, "fixture must yield at least one module"
+    mt = all_mods[0]["module_type"]
+    cat = all_mods[0]["category"]
+
+    # Filter by the actual module_type → every row matches it.
+    filtered = fm("МойМодуль", module_type=mt)
+    assert filtered
+    assert all(m["module_type"] == mt for m in filtered)
+    # Case-insensitive.
+    assert len(fm("МойМодуль", module_type=mt.upper())) == len(filtered)
+    # Nonexistent type → empty (no error).
+    assert fm("МойМодуль", module_type="НесуществующийТип") == []
+
+    # Category filter likewise.
+    by_cat = fm("МойМодуль", category=cat)
+    assert by_cat and all(m["category"] == cat for m in by_cat)
+    assert fm("МойМодуль", category="НетТакойКатегории") == []
+
+    # Filter-only call WITHOUT a positional name must NOT raise (Codex finding):
+    # find_module(module_type=...) is the exact agent guess. name is optional.
+    no_name = fm(module_type=mt)
+    assert no_name and all(m["module_type"] == mt for m in no_name)
+    assert fm(category=cat) and all(m["category"] == cat for m in fm(category=cat))
+    # No args at all → browse (bounded), never a TypeError.
+    assert isinstance(fm(), list)
+
+
 def test_strip_meta_prefix_find_register_movements():
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)

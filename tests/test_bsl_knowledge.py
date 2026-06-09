@@ -182,7 +182,8 @@ def test_rlm_start_description():
 def test_business_recipes_structure():
     """All domains must have compact and full keys."""
     # v1.11.0+: 12 prior + 'иерархия вызовов' + 'расширения' = 14
-    assert len(_BUSINESS_RECIPES) == 14
+    # v1.19.0+: + 'достижимость' + 'путь данных' = 16
+    assert len(_BUSINESS_RECIPES) == 16
     short_full_allowed = {
         "тип реквизита": 3,
         "ссылки": 3,

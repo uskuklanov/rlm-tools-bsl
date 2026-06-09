@@ -17,6 +17,7 @@ from rlm_tools_bsl.bsl_knowledge import (
     _normalize_method_params,
     _split_params,
 )
+from rlm_tools_bsl.bsl_index import _make_callee_key
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
 
@@ -45,6 +46,18 @@ _RE_METACHARS = frozenset(r"\^$.|?*+()[]{}")
 # handful of nodes); only bounds the pathological wide-root case. Read as a module
 # global at call time so tests can monkeypatch it.
 _HIERARCHY_VISITED_CAP = 2000
+
+# Separate, modest node budget for find_data_path: every expanded node is one
+# py_lower scan of metadata_references (same cost profile as find_metadata_references),
+# so it is capped much tighter than the call-graph BFS. Read as a module global at
+# call time so tests can monkeypatch it.
+_DATA_PATH_NODE_BUDGET = 400
+
+# Per-node callers page size for find_path's reverse-BFS (mirrors find_call_hierarchy).
+# A node with MORE callers than this is only partially expanded → find_path flags
+# the search as truncated (budget_exceeded) so a found=False stays inconclusive
+# instead of silently dropping caller #N+1. Module global so tests can monkeypatch.
+_FIND_PATH_NODE_LIMIT = 200
 
 
 def _is_literal_pattern(pattern: str) -> bool:
@@ -550,13 +563,22 @@ def make_bsl_helpers(
             "recipe": recipe,
         }
 
-    def find_module(name: str) -> list[dict]:
+    def find_module(name: str = "", module_type: str = "", category: str = "") -> list[dict]:
         """Find BSL modules by name fragment (case-insensitive).
+
+        v1.19.0 — tolerant contract: ``name`` is OPTIONAL and ``module_type`` /
+        ``category`` are optional filters (matched case-insensitively against the
+        output fields). Agents naturally try both ``find_module(name,
+        module_type='ObjectModule')`` AND filter-only ``find_module(module_type=
+        'ObjectModule')`` (no name) — instead of raising, both work: an empty
+        ``name`` means "any module", narrowed by the filters and capped at 50.
 
         Returns: list of dicts {path, category, object_name, module_type, form_name}."""
         name = _strip_meta_prefix(name)
         _ensure_index()
         name_lower = name.lower()
+        mt_lower = module_type.lower() if module_type else ""
+        cat_lower = category.lower() if category else ""
         results = []
         for relative_path, info in _index_state:
             matched = False
@@ -564,6 +586,11 @@ def make_bsl_helpers(
                 matched = True
             if not matched and name_lower in relative_path.lower():
                 matched = True
+            # Optional filters applied BEFORE the cap so up to 50 FILTERED rows return.
+            if matched and mt_lower and (info.module_type or "").lower() != mt_lower:
+                matched = False
+            if matched and cat_lower and (info.category or "").lower() != cat_lower:
+                matched = False
             if matched:
                 results.append(_info_to_dict(relative_path, info))
             if len(results) >= 50:
@@ -1296,6 +1323,7 @@ def make_bsl_helpers(
         direction: str = "callers",
         depth: int = 2,
         module_hint: str = "",
+        include_triggers: bool = False,
     ) -> dict:
         """Build multi-level call hierarchy. Only direction='callers'
         (uses idx_calls_callee). callees/both → structured error-dict.
@@ -1304,6 +1332,15 @@ def make_bsl_helpers(
             name: Target procedure/function name.
             direction: 'callers' only.
             depth: Levels to traverse (1..3, default 2).
+            include_triggers: when True, annotate each tree node with a `triggers`
+                list — the NON-call inbound edges into that method (event
+                subscriptions, form-event handlers, scheduled jobs, CFE overrides)
+                via get_inbound_edges. Default False keeps the output byte-for-byte
+                identical (the `triggers` key is added ONLY when True). Triggers are
+                a leaf annotation, NOT new BFS targets — a subscription/job/form is
+                an ENTRY POINT, not a caller. Each trigger:
+                {edge_type, source_name, source_kind, detail, file, line,
+                 caller_name, object_name, category, target_key, resolved}.
             module_hint: Optional disambiguator for the ROOT target — enables the
                 exact (resolved) call-graph mode for same-named object methods
                 (e.g. ОбработкаПроведения in many Documents). Forms:
@@ -1457,15 +1494,28 @@ def make_bsl_helpers(
                 "exact_available": exact_available,
                 "target_exact": target_exact,
             }
-            result["tree"].append(
-                {
-                    "name": target_name,
-                    "target_hint": hint or None,
-                    "target_key": target_key,
-                    "meta": node_meta,
-                    "callers": node_callers,
-                }
-            )
+            node = {
+                "name": target_name,
+                "target_hint": hint or None,
+                "target_key": target_key,
+                "meta": node_meta,
+                "callers": node_callers,
+            }
+            # Opt-in leaf annotation: non-call inbound edges (subscriptions, form
+            # events, scheduled jobs, CFE overrides). Reuse the SAME hint as the
+            # callers query (on descent = caller's rel_path → exact mode for free).
+            # Added ONLY under the flag so the default output is byte-for-byte prior;
+            # under the flag the key is ALWAYS present (=[] on the FS/no-index path)
+            # so the opt-in shape is reliable for consumers.
+            if include_triggers:
+                if idx_reader is not None:
+                    try:
+                        node["triggers"] = idx_reader.get_inbound_edges(target_name, module_hint=hint)
+                    except Exception:
+                        node["triggers"] = []
+                else:
+                    node["triggers"] = []
+            result["tree"].append(node)
 
         # Top-level aggregates from per-target meta.
         for node in result["tree"]:
@@ -1479,6 +1529,222 @@ def make_bsl_helpers(
         result["truncated_targets"] = list(per_target_truncation.values())
 
         return result
+
+    def find_path(
+        from_name: str,
+        to_name: str,
+        max_depth: int = 4,
+        from_hint: str = "",
+        to_hint: str = "",
+        include_triggers: bool = False,
+    ) -> dict:
+        """Reachability over the CALL graph: can ``from_name`` transitively reach
+        ``to_name`` through calls (``from → … → to``)?
+
+        Implemented as an INDEXED reverse-BFS of callers starting at ``to_name``
+        (forward callees would be a full scan — ``idx_calls_caller`` was dropped to
+        save ~56MB). A callers chain ``to ← X ← … ← from`` IS the forward path
+        ``from → … → to``; on a hit it is unrolled into forward order.
+
+        Args:
+            from_name: source method (the start of the forward path).
+            to_name: target method (the end of the forward path).
+            max_depth: max edges in the path (clamped 1..8, default 4).
+            from_hint / to_hint: optional module disambiguators (rel_path |
+                'Документ.X'/'Document.X' | bare object_name) — pin a same-named
+                method to one module. ``to_hint`` enables the exact-mode root;
+                ``from_hint`` makes the hit test pin ``from`` to its module.
+            include_triggers: annotate each path node with its non-call inbound
+                edges via get_inbound_edges (see find_call_hierarchy).
+
+        Returns:
+            {found, from, to, path:[{name, module_path, call_line, triggers?}]|None,
+             depth, _meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded,
+             from_key, to_exact, to_key, precision:'exact'|'heuristic',
+             direction:'callers-reverse'}}
+
+            ``call_line`` is EDGE metadata — the line where THIS node calls the NEXT
+            (forward) node, NOT the line of the method definition; the terminal node
+            (``to``) has no outgoing edge → ``call_line=None``.
+
+            ``precision='exact'`` ⇔ ``to`` resolved exactly AND every edge of the
+            path matched a stable ``callee_key`` (``edge_exact``); otherwise
+            ``'heuristic'`` — on an old index (no ``callee_key``) or the FS fallback
+            ``found=True`` is NAME-based reachability, not a proven resolved path.
+            ``found=False`` with ``budget_exceeded=True`` means the search was
+            truncated (widen scope / add a hint), NOT a proven absence — either the
+            visited cap was hit OR some expanded node had more callers than one page
+            (so a reaching edge may have been skipped). Only ``found=False`` with
+            ``budget_exceeded=False`` is a conclusive "not reachable".
+        """
+        try:
+            max_depth_int = int(max_depth)
+        except (TypeError, ValueError):
+            max_depth_int = 4
+        max_depth_int = max(1, min(8, max_depth_int))
+
+        # Resolve target identities once (LOCKED public wrapper — find_path runs
+        # outside the reader lock, so it must NOT touch the lockless internal).
+        to_key = None
+        from_key = None
+        if idx_reader is not None:
+            try:
+                to_key = idx_reader.resolve_target_identity(to_name, to_hint or "")
+            except Exception:
+                to_key = None
+            if from_hint:
+                try:
+                    from_key = idx_reader.resolve_target_identity(from_name, from_hint)
+                except Exception:
+                    from_key = None
+        to_exact = to_key is not None
+        to_module_path = to_key.rsplit("::", 1)[0] if to_key else ""
+
+        from_cf = from_name.casefold()
+
+        def _matches_from(caller_name: str, caller_file: str) -> bool:
+            # With a resolved from_key, pin to module (disambiguates namesakes);
+            # else (no hint / unresolved) fall back to name match — same recall as
+            # the name-based callers branch.
+            if from_key is not None:
+                return _make_callee_key(caller_file, caller_name) == from_key
+            return caller_name.casefold() == from_cf
+
+        # nodes[id] = {name, module_path, call_line, edge_exact, parent_id}.
+        # call_line/edge_exact describe the FORWARD edge from this node to its
+        # parent (the node it calls); the start node (to) has parent_id=None.
+        nodes: dict[int, dict] = {
+            0: {
+                "name": to_name,
+                "module_path": to_module_path,
+                "call_line": None,
+                "edge_exact": None,
+                "parent_id": None,
+            }
+        }
+        counter = 0
+        hit_id: int | None = None
+
+        # Trivial self-path (from resolves to to).
+        if _matches_from(to_name, to_module_path):
+            hit_id = 0
+
+        visited: set[tuple[str, str]] = set()
+        queue: list[tuple[str, str, int, int]] = [(to_name, to_hint or "", 0, 0)]
+        nodes_expanded = 0
+        budget_exceeded = False
+        # Set when an expanded node has MORE callers than one page (has_more) — that
+        # branch is only partially walked, so a final found=False is inconclusive
+        # (we may have skipped the caller that reaches `from`). Folded into
+        # budget_exceeded ONLY on a miss (a hit is conclusive regardless).
+        callers_truncated = False
+
+        while queue and hit_id is None:
+            if nodes_expanded >= _HIERARCHY_VISITED_CAP:
+                budget_exceeded = True
+                break
+            cur_name, cur_hint, depth, cur_id = queue.pop(0)
+            if depth >= max_depth_int:
+                continue
+            try:
+                ctx = find_callers_context(cur_name, module_hint=cur_hint, offset=0, limit=_FIND_PATH_NODE_LIMIT)
+            except Exception:
+                continue
+            if not isinstance(ctx, dict):
+                continue
+            meta = ctx.get("_meta", {}) or {}
+            target_exact = bool(meta.get("target_exact", False))
+            target_key = meta.get("target_key") if target_exact else None
+            vkey = (cur_name.casefold(), target_key or "")
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            nodes_expanded += 1
+            if meta.get("has_more"):
+                callers_truncated = True
+
+            for c in ctx.get("callers", []) or []:
+                c_name = c.get("caller_name", "")
+                if not c_name:
+                    continue
+                c_file = c.get("file", "")
+                counter += 1
+                cid = counter
+                nodes[cid] = {
+                    "name": c_name,
+                    "module_path": c_file,
+                    "call_line": c.get("line"),
+                    "edge_exact": bool(c.get("edge_exact", False)),
+                    "parent_id": cur_id,
+                }
+                if _matches_from(c_name, c_file):
+                    hit_id = cid
+                    break
+                queue.append((c_name, c_file, depth + 1, cid))
+
+        _meta = {
+            "max_depth": max_depth_int,
+            "nodes_expanded": nodes_expanded,
+            "visited_cap": _HIERARCHY_VISITED_CAP,
+            "budget_exceeded": budget_exceeded,
+            "from_key": from_key,
+            "to_exact": to_exact,
+            "to_key": to_key,
+            "precision": "heuristic",
+            "direction": "callers-reverse",
+        }
+        if hit_id is None:
+            # A miss is only conclusive if the whole reachable frontier was walked.
+            # Either the visited cap (budget_exceeded) or a per-node caller-page
+            # overflow (callers_truncated) means we may have skipped the edge.
+            _meta["budget_exceeded"] = budget_exceeded or callers_truncated
+            return {
+                "found": False,
+                "from": from_name,
+                "to": to_name,
+                "path": None,
+                "depth": 0,
+                "_meta": _meta,
+            }
+
+        # Reconstruct forward path [from → … → to] by walking parent_id from the
+        # hit node (= from) up to the start node (= to). parent_id of a caller
+        # points at the node it CALLS, so the walk already yields forward order.
+        chain: list[dict] = []
+        nid: int | None = hit_id
+        while nid is not None:
+            chain.append(nodes[nid])
+            nid = nodes[nid]["parent_id"]
+
+        all_edges_exact = True
+        path: list[dict] = []
+        for n in chain:
+            elem: dict = {
+                "name": n["name"],
+                "module_path": n["module_path"],
+                "call_line": n["call_line"],
+            }
+            if include_triggers:
+                if idx_reader is not None:
+                    try:
+                        elem["triggers"] = idx_reader.get_inbound_edges(n["name"], module_hint=n["module_path"] or "")
+                    except Exception:
+                        elem["triggers"] = []
+                else:
+                    elem["triggers"] = []
+            path.append(elem)
+            if n["parent_id"] is not None and not n["edge_exact"]:
+                all_edges_exact = False
+
+        _meta["precision"] = "exact" if (to_exact and all_edges_exact) else "heuristic"
+        return {
+            "found": True,
+            "from": from_name,
+            "to": to_name,
+            "path": path,
+            "depth": len(path) - 1,
+            "_meta": _meta,
+        }
 
     # XML file names by metadata category (CF format: Ext/<name>.xml)
     _CATEGORY_XML_NAMES = {
@@ -5089,7 +5355,11 @@ def make_bsl_helpers(
     def get_overrides(object_name: str = "", method_name: str = "") -> dict:
         """Перехваченные методы из индекса (мгновенно).
         object_name/method_name — фильтры ('' = все).
-        Возвращает: {overrides: [...], total: N, source: "index"|"live"|"unavailable"}"""
+        Возвращает: {overrides: [...], total: N, source: "index"|"live"|"unavailable"}.
+        Каждый перехват ГАРАНТИРОВАННО несёт ключ ``extension_name`` (имя расширения)
+        во всех ветках источника — index, live из main-сессии и live из сессии,
+        открытой прямо на расширении (нормализуется из идентичности текущего
+        расширения)."""
         # Try index first
         if idx_reader is not None:
             result = idx_reader.get_extension_overrides(object_name, method_name)
@@ -5115,6 +5385,13 @@ def make_bsl_helpers(
         all_overrides: list[dict] = []
         if ctx.current.role == ConfigRole.EXTENSION:
             all_overrides = _feo(base_path, object_name or None)
+            # Contract normalization: raw _feo rows lack extension_name/extension_root
+            # (unlike index rows and the MAIN-session branch below). Fill them from
+            # the current extension's own identity so EVERY override carries
+            # extension_name regardless of source — consumers/recipes rely on it.
+            for ov in all_overrides:
+                ov.setdefault("extension_name", ctx.current.name or "")
+                ov.setdefault("extension_root", ctx.current.path or base_path)
         elif ctx.current.role == ConfigRole.MAIN and ctx.nearby_extensions:
             for ext in ctx.nearby_extensions:
                 try:
@@ -5303,6 +5580,203 @@ def make_bsl_helpers(
             all_refs = all_refs[:limit]
         result["references"] = all_refs
         return _finish(result)
+
+    def find_data_path(
+        from_object: str,
+        to_object: str,
+        max_depth: int = 4,
+        kinds: list[str] | None = None,
+    ) -> dict:
+        """N-hop reachability over the METADATA reference graph (declarative links).
+
+        Answers "is ``to_object`` reachable from ``from_object`` by following
+        metadata references?" — a forward BFS over ``find_metadata_refs_from``
+        (attribute types, owner, based-on, subsystem content, …). Distinct from
+        find_path, which walks the CODE call graph.
+
+        Contract (R2 №3): BOTH endpoints MUST carry a recognized metadata-type
+        prefix (``Справочник.X``/``Catalog.X``, ``Документ.Y``/``Document.Y``). A
+        bare name without a prefix is NOT canonicalized (so a bare ``to`` could
+        never match the always-canonical ``ref_object``, and a bare ``from`` loses
+        its category) → we return a structural hint instead of walking. A
+        bare→canonical resolver (via synonyms) is intentionally out of scope (YAGNI).
+
+        Args:
+            from_object / to_object: prefixed refs (RU or EN prefix accepted).
+            max_depth: max edges in the path (clamped 1..8, default 4).
+            kinds: optional ref_kind filter (see find_references_to_object).
+
+        Returns:
+            {found, from:from_canon, to:to_canon,
+             path:[{from, to, kind, used_in, path, line}]|None, depth, partial,
+             _meta:{max_depth, nodes_expanded, node_budget, budget_exceeded, kinds}}
+
+            Each path element is an EDGE (``from`` references ``to``). ``partial=True``
+            ⇔ the index lacks metadata_references (no live fallback) or a scan hit
+            the table-missing guard mid-walk. ``budget_exceeded=True`` ⇔ the node
+            budget was reached (widen scope / lower depth), NOT a proven absence.
+        """
+        # Builder-internal category↔prefix map — lazy import + one-shot local
+        # inversion (no module-level coupling, R2 №5). Values are singular prefixes
+        # matching the canonical ref_object prefix.
+        from rlm_tools_bsl.bsl_index import _CATEGORY_TO_TYPE_PREFIX as _cat2prefix
+
+        prefix_to_category = {prefix: category for category, prefix in _cat2prefix.items()}
+
+        try:
+            max_depth_int = int(max_depth)
+        except (TypeError, ValueError):
+            max_depth_int = 4
+        max_depth_int = max(1, min(8, max_depth_int))
+
+        from_canon, _ = _normalize_object_ref(from_object)
+        to_canon, _ = _normalize_object_ref(to_object)
+
+        def _prefix_category(canon: str) -> str | None:
+            if not canon or "." not in canon:
+                return None
+            return prefix_to_category.get(canon.split(".", 1)[0])
+
+        base_meta = {
+            "max_depth": max_depth_int,
+            "nodes_expanded": 0,
+            "node_budget": _DATA_PATH_NODE_BUDGET,
+            "budget_exceeded": False,
+            "kinds": kinds,
+        }
+
+        # Contract guard: both endpoints must carry a recognized prefix.
+        if _prefix_category(from_canon) is None or _prefix_category(to_canon) is None:
+            return {
+                "found": False,
+                "from": from_canon,
+                "to": to_canon,
+                "path": None,
+                "depth": 0,
+                "partial": False,
+                "error": "endpoints must carry a recognized metadata-type prefix",
+                "hint": (
+                    "укажите префикс для ОБОИХ концов: Справочник./Документ./РегистрНакопления./… "
+                    "(или Catalog./Document./AccumulationRegister./…)"
+                ),
+                "_meta": base_meta,
+            }
+
+        to_canon_cf = to_canon.casefold()
+
+        # Trivial self-path.
+        if from_canon.casefold() == to_canon_cf:
+            return {
+                "found": True,
+                "from": from_canon,
+                "to": to_canon,
+                "path": [],
+                "depth": 0,
+                "partial": False,
+                "_meta": base_meta,
+            }
+
+        if idx_reader is None:
+            # No index → no metadata graph (no live fallback by design).
+            return {
+                "found": False,
+                "from": from_canon,
+                "to": to_canon,
+                "path": None,
+                "depth": 0,
+                "partial": True,
+                "_meta": base_meta,
+            }
+
+        # nodes[id] = {canon, in_edge: {from,to,kind,used_in,path,line}|None, parent_id}.
+        # Cycle-detection in CANONICAL space (Catalog.X ≠ Document.X).
+        nodes: dict[int, dict] = {0: {"canon": from_canon, "in_edge": None, "parent_id": None}}
+        counter = 0
+        hit_id: int | None = None
+        visited: set[str] = set()
+        queue: list[tuple[str, int, int]] = [(from_canon, 0, 0)]
+        nodes_expanded = 0
+        budget_exceeded = False
+        partial = False
+
+        while queue and hit_id is None:
+            if nodes_expanded >= _DATA_PATH_NODE_BUDGET:
+                budget_exceeded = True
+                break
+            cur_canon, depth, cur_id = queue.pop(0)
+            cur_cf = cur_canon.casefold()
+            if cur_cf in visited:
+                continue
+            visited.add(cur_cf)
+            if depth >= max_depth_int:
+                continue
+
+            bare = cur_canon.split(".", 1)[-1]
+            cat = _prefix_category(cur_canon)
+            rows = idx_reader.find_metadata_refs_from(bare, source_category=cat, kinds=kinds)
+            nodes_expanded += 1
+            if rows is None:
+                partial = True
+                continue
+
+            for r in rows:
+                next_canon = r.get("ref_object") or ""
+                if not next_canon:
+                    continue
+                edge = {
+                    "from": cur_canon,
+                    "to": next_canon,
+                    "kind": r.get("ref_kind"),
+                    "used_in": r.get("used_in"),
+                    "path": r.get("path"),
+                    "line": r.get("line"),
+                }
+                counter += 1
+                cid = counter
+                nodes[cid] = {"canon": next_canon, "in_edge": edge, "parent_id": cur_id}
+                if next_canon.casefold() == to_canon_cf:
+                    hit_id = cid
+                    break
+                if next_canon.casefold() not in visited:
+                    queue.append((next_canon, depth + 1, cid))
+
+        meta = {
+            "max_depth": max_depth_int,
+            "nodes_expanded": nodes_expanded,
+            "node_budget": _DATA_PATH_NODE_BUDGET,
+            "budget_exceeded": budget_exceeded,
+            "kinds": kinds,
+        }
+        if hit_id is None:
+            return {
+                "found": False,
+                "from": from_canon,
+                "to": to_canon,
+                "path": None,
+                "depth": 0,
+                "partial": partial,
+                "_meta": meta,
+            }
+
+        # Reconstruct forward edge path [from→…→to]: walk parent_id from the hit
+        # node back to start, collecting incoming edges, then reverse.
+        edges_rev: list[dict] = []
+        nid: int | None = hit_id
+        while nid is not None:
+            n = nodes[nid]
+            if n["in_edge"] is not None:
+                edges_rev.append(n["in_edge"])
+            nid = n["parent_id"]
+        path = list(reversed(edges_rev))
+        return {
+            "found": True,
+            "from": from_canon,
+            "to": to_canon,
+            "path": path,
+            "depth": len(path),
+            "partial": partial,
+            "_meta": meta,
+        }
 
     def find_code_usages(
         object_ref: str,
@@ -5785,7 +6259,12 @@ def make_bsl_helpers(
     # category (for grouping), keywords (for help search), recipe (code example).
     # Adding a new helper = define function above + add _reg() here.
 
-    _reg("find_module", find_module, "find_module(name) -> [{path, category, object_name, module_type}]", "discovery")
+    _reg(
+        "find_module",
+        find_module,
+        "find_module(name='', module_type='', category='') -> [{path, category, object_name, module_type}]  # name — опц. фрагмент имени (пусто = любой модуль); опц. фильтры module_type (напр. 'ObjectModule'/'ManagerModule') и category (напр. 'Documents'), в т.ч. без name; cap 50",
+        "discovery",
+    )
     _reg(
         "find_by_type",
         find_by_type,
@@ -5864,14 +6343,15 @@ def make_bsl_helpers(
     _reg(
         "find_call_hierarchy",
         find_call_hierarchy,
-        "find_call_hierarchy(name, direction='callers', depth=2, module_hint='') -> "
+        "find_call_hierarchy(name, direction='callers', depth=2, module_hint='', include_triggers=False) -> "
         "{root, direction, depth, tree:[{name, target_hint, target_key, "
         "meta:{exact_rows, fallback_rows, exact_available, target_exact}, "
-        "callers:[{caller_name, module_path, category, object_name, line, is_export, level}]}], "
+        "callers:[{caller_name, module_path, category, object_name, line, is_export, level}], "
+        "triggers:[{edge_type, source_name, source_kind, detail, file, line, caller_name, object_name, category, target_key, resolved}]}], "
         "visited:int, truncated_targets:[{name, level, total, returned}], "
         "_meta:{exact_available, root_exact, exact_targets, fallback_targets, exact_rows, fallback_rows, "
         "node_budget_exceeded, visited_cap}} "
-        "| {error, hint, supported_directions}",
+        "| {error, hint, supported_directions}  # triggers: ключ есть ТОЛЬКО при include_triggers=True (не-call рёбра: подписки/события форм/рег.задания/CFE-перехваты)",
         "code",
         [
             "иерархия вызовов",
@@ -5910,12 +6390,51 @@ def make_bsl_helpers(
         "  # Одноимённые методы без hint возвращают список носителей — выбирай по object_name/category.\n"
         "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
         "  #     (по уровням): передай module_hint, чтобы и сузить, и ускорить обход.\n"
-        "  # Для глубины 1 эффективнее обычный find_callers_context().",
+        "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
+        "  # ТРИГГЕРЫ (include_triggers=True): метод вызывается не только из кода. Подмешивает на\n"
+        "  #   КАЖДЫЙ узел node['triggers'] — не-call рёбра (подписки/события форм/рег.задания/CFE):\n"
+        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.X', include_triggers=True)\n"
+        "  for node in res['tree']:\n"
+        "      for t in node.get('triggers', []):\n"
+        "          print(f\"  TRIGGER {t['edge_type']}: {t['source_name']} ({t['detail']}) resolved={t['resolved']}\")\n"
+        "  #   resolved=True — привязан по стабильному target_key; False — совпал по имени (recall).",
+    )
+    _reg(
+        "find_path",
+        find_path,
+        "find_path(from_name, to_name, max_depth=4, from_hint='', to_hint='', include_triggers=False) -> "
+        "{found, from, to, path:[{name, module_path, call_line, triggers?}]|None, depth, "
+        "_meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded, from_key, to_exact, to_key, "
+        "precision:'exact'|'heuristic', direction:'callers-reverse'}}  "
+        "# ДОСТИЖИМОСТЬ по графу ВЫЗОВОВ (from → … → to). call_line = строка РЕБРА к следующему узлу (НЕ определения); у терминального (to) None",
+        "code",
+        [
+            "путь вызовов",
+            "find_path",
+            "достижимость",
+            "reachability",
+            "доходит ли",
+            "вызывает ли",
+            "путь между методами",
+        ],
+        "FIND PATH (достижим ли to_name из from_name по графу ВЫЗОВОВ):\n"
+        "  res = find_path('НизкоуровневыйМетод', 'ОбработчикUI')\n"
+        "  if res['found']:\n"
+        "      for el in res['path']:  # forward: [from → … → to]\n"
+        "          print(f\"  {el['name']} ({el['module_path']}) call_line={el['call_line']}\")\n"
+        "      # call_line — строка ВЫЗОВА к СЛЕДУЮЩЕМУ узлу (ребро), НЕ определения; у to call_line=None\n"
+        "  else:\n"
+        "      print('путь не найден' if not res['_meta']['budget_exceeded'] else 'обход обрезан — сузь hint/уменьши max_depth')\n"
+        "  # ТОЧНОСТЬ: _meta.precision='exact' ⇔ to разрешён точно И все рёбра пути по callee_key;\n"
+        "  #   'heuristic' (старый индекс/FS/имя) → found=True = достижимость ПО ИМЕНИ, не доказанный путь.\n"
+        "  # Одноимённые методы: from_hint/to_hint (rel_path | 'Документ.X' | object_name) пинят к модулю.\n"
+        "  # _meta.budget_exceeded=True → обход обрезан (visited_cap ИЛИ у узла >одной страницы callers),\n"
+        "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False — точно «не достижим».",
     )
     _reg(
         "find_callers",
         find_callers,
-        "find_callers(proc, hint, max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE: thin wrapper над find_callers_context, default limit=20, без _meta/has_more — quick view; для полного аудита callers — find_callers_context",
+        "find_callers(proc, module_hint='', max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE: thin wrapper над find_callers_context, default limit=20, без _meta/has_more — quick view; для полного аудита callers — find_callers_context",
         "code",
         ["compact callers", "плоский список вызовов", "только пути вызовов"],
         "COMPACT FIRST PAGE OF CALLERS (для quick view: 3 поля вместо 7, без пагинации):\n"
@@ -5933,7 +6452,7 @@ def make_bsl_helpers(
     _reg(
         "safe_grep",
         safe_grep,
-        "safe_grep(pattern, hint, max_files=20) -> [{file, line, text}]",
+        "safe_grep(pattern, name_hint='', max_files=20) -> [{file, line, text}]",
         "code",
         ["search", "grep", "поиск", "искать", "найти", "pattern", "шаблон"],
         "SEARCH FOR CODE:\n"
@@ -5981,7 +6500,7 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers, commands, attributes}]",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers, commands, attributes:[{name, types, main, main_table, query_text}]}]  # атрибуты формы используют ключ types (list типов), НЕ attr_type (это поле find_attributes)",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
@@ -6125,7 +6644,7 @@ def make_bsl_helpers(
     _reg(
         "analyze_document_flow",
         analyze_document_flow,
-        "analyze_document_flow(doc_name) -> metadata + subscriptions + register movements + jobs",
+        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # dict (+ is_postable/hint для непроводимых); register_movements — сам dict (см. find_register_movements), event_subscriptions/related_scheduled_jobs — списки",
         "composite",
         ["lifecycle", "жизненн", "flow", "end-to-end", "полный анализ", "как работает"],
         "FULL DOCUMENT LIFECYCLE:\n"
@@ -6205,7 +6724,7 @@ def make_bsl_helpers(
     _reg(
         "find_register_movements",
         find_register_movements,
-        "find_register_movements(doc_name) -> {code_registers, erp_mechanisms, manager_tables, adapted_registers}",
+        "find_register_movements(doc_name) -> {code_registers:[{name, source, file}], erp_mechanisms:[str], manager_tables:[str], adapted_registers:[str]}  # ВНИМАНИЕ: только code_registers — список словарей; erp_mechanisms/manager_tables/adapted_registers — списки ИМЁН-строк",
         "business",
         ["движени", "movement", "регистр", "register", "проведен", "posting"],
         "TRACE DOCUMENT REGISTER MOVEMENTS:\n"
@@ -6284,7 +6803,7 @@ def make_bsl_helpers(
     _reg(
         "find_roles",
         find_roles,
-        "find_roles(obj_name) -> {roles: [{role_name, rights}]}",
+        "find_roles(obj_name) -> {roles: [{role_name, rights: [str], object, file}]}  # rights — список ИМЁН прав (str), не dict",
         "business",
         ["роль", "role", "прав", "right", "доступ", "access", "разрешен"],
         "FIND ROLES AND RIGHTS:\n"
@@ -6484,6 +7003,37 @@ def make_bsl_helpers(
         "  full = find_references_to_object('Документ.X', include_code=True)\n"
         "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
         "  # On v11 indexes (no metadata_references table) — partial=True via live scan",
+    )
+
+    _reg(
+        "find_data_path",
+        find_data_path,
+        "find_data_path(from_object, to_object, max_depth=4, kinds=None) -> "
+        "{found, from, to, path:[{from, to, kind, used_in, path, line}]|None, depth, partial, "
+        "_meta:{max_depth, nodes_expanded, node_budget, budget_exceeded, kinds}} "
+        "| {found:False, error, hint, ...}  "
+        "# N-hop BFS по графу МЕТАДАННЫХ (ссылки). endpoints — С ПРЕФИКСОМ (Справочник.X/Документ.Y)",
+        "navigation",
+        [
+            "путь данных",
+            "find_data_path",
+            "граф данных",
+            "как связаны",
+            "data path",
+            "цепочка ссылок",
+            "связь объектов",
+        ],
+        "FIND DATA PATH (достижим ли to_object из from_object по ссылкам МЕТАДАННЫХ):\n"
+        "  res = find_data_path('Документ.РеализацияТоваровУслуг', 'РегистрНакопления.Продажи')\n"
+        "  if res.get('error'):\n"
+        "      print(res['hint'])  # endpoints ОБЯЗАНЫ быть с префиксом: Справочник./Документ./…\n"
+        "  elif res['found']:\n"
+        "      for e in res['path']:  # forward: [from → … → to], каждый элемент = РЕБРО\n"
+        "          print(f\"  {e['from']} --{e['kind']}--> {e['to']} ({e['used_in']})\")\n"
+        "  else:\n"
+        "      print('partial — нет таблицы metadata_references' if res['partial'] else 'путь не найден')\n"
+        "  # Фильтр по виду ссылки: find_data_path('Документ.X', 'Справочник.Y', kinds=['attribute_type'])\n"
+        "  # RU/EN-префикс принимается; _meta.budget_exceeded=True → обход обрезан (сузь max_depth).",
     )
 
     _reg(

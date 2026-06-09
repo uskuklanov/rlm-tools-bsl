@@ -939,6 +939,7 @@ class TestRecipesSearchObjects:
         # v1.10.0 adds: перечисления (find_enum_values), ввод на основании (find_based_on_documents),
         # структура объекта (get_object_full_structure).
         # v1.11.0+ adds: иерархия вызовов (find_call_hierarchy), расширения (get_overrides).
+        # v1.19.0+ adds: достижимость (find_path), путь данных (find_data_path).
         _NO_SEARCH_OBJECTS = {
             "тип реквизита",
             "ссылки",
@@ -947,6 +948,8 @@ class TestRecipesSearchObjects:
             "структура объекта",
             "иерархия вызовов",
             "расширения",
+            "достижимость",
+            "путь данных",
         }
         for domain, recipe in _BUSINESS_RECIPES.items():
             if domain in _NO_SEARCH_OBJECTS:

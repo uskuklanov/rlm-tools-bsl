@@ -298,7 +298,7 @@ Step 2 — READ: understand the code
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
   find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
-  safe_grep(pattern, hint) → search code patterns
+  safe_grep(pattern, name_hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
 Step 4 — ANALYZE: get the full picture
@@ -757,18 +757,51 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "read_file/grep/glob_files на путях с '../' дадут PermissionError (sandbox base-only)",
         ],
         "code_hint": (
-            "all_ov = get_overrides()\n"
-            "print(f\"total={len(all_ov)} from {len({o['extension'] for o in all_ov})} extensions\")\n"
-            "# Группировка по аннотациям:\n"
+            "res = get_overrides()  # -> {overrides:[...], total, source}; перехваты в res['overrides']\n"
+            "all_ov = res['overrides']\n"
             "from collections import Counter\n"
+            "print(f\"total={res['total']} source={res['source']} from {len({o['extension_name'] for o in all_ov})} extensions\")\n"
+            "# Группировка по аннотациям (ключ перехвата — extension_name, НЕ extension):\n"
             "print(Counter(o['annotation'] for o in all_ov))\n"
             "# Топ-объект:\n"
             "top = Counter(o['object_name'] for o in all_ov).most_common(1)[0]\n"
             'print(f"top object: {top[0]} ({top[1]} overrides)")\n'
-            "obj_ov = get_overrides(top[0])\n"
+            "obj_ov = get_overrides(top[0])['overrides']\n"
             "for o in obj_ov[:5]:\n"
-            "    print(f\"  {o['annotation']} {o['target_method']} ← {o['extension']}\")"
+            "    print(f\"  {o['annotation']} {o['target_method']} ← {o['extension_name']}\")"
         ),
+    },
+    "достижимость": {
+        "compact": [
+            "find_path('МетодА', 'МетодБ') → есть ли путь вызовов from→to (forward)",
+            "found=False + _meta.budget_exceeded → обход обрезан, сузь max_depth/дай hint",
+            "find_call_hierarchy('Метод', include_triggers=True) → callers + триггеры (подписки/формы/рег.задания/CFE)",
+        ],
+        "full": [
+            "find_path('НизкоуровневыйМетод', 'ОбработчикUI', max_depth=4) → достижимость по графу ВЫЗОВОВ (forward path from→…→to)",
+            "проверь _meta.precision: 'exact' = путь доказан по callee_key; 'heuristic' = по имени (старый индекс/FS/однофамильцы)",
+            "одноимённые методы → from_hint/to_hint ('Документ.X' | rel_path | object_name) пинят концы к модулю",
+            "call_line элемента пути = строка ВЫЗОВА к СЛЕДУЮЩЕМУ узлу (ребро), НЕ определения; у терминального (to) None",
+            "find_call_hierarchy('Метод', module_hint='Документ.X', include_triggers=True) → дерево callers + не-call триггеры на КАЖДОМ узле",
+            "_meta.budget_exceeded=True → обход упёрся в visited_cap, found=False НЕ доказывает отсутствие пути",
+            "ALT: find_callers_context('Метод') для одного уровня callers с контекстом строк и file:line",
+        ],
+    },
+    "путь данных": {
+        "compact": [
+            "find_data_path('Документ.X', 'РегистрНакопления.Y') → цепочка ссылок метаданных from→to",
+            "endpoints ОБЯЗАНЫ быть с префиксом (Справочник./Документ./…), иначе error+hint",
+            "kinds=['attribute_type'] → фильтр по виду ссылки",
+        ],
+        "full": [
+            "find_data_path('Документ.РеализацияТоваровУслуг', 'РегистрНакопления.Продажи') → N-hop путь по графу МЕТАДАННЫХ (атрибуты/владелец/основание/...)",
+            "endpoints С ПРЕФИКСОМ для ОБОИХ концов (Справочник.X/Catalog.X, Документ.Y/Document.Y); bare-имя → структурный hint без обхода",
+            "каждый элемент path = РЕБРО {from, to, kind, used_in, path, line}",
+            "kinds=[...] → ограничить виды ссылок (attribute_type, owner, based_on, subsystem_content, ...)",
+            "partial=True → нет таблицы metadata_references (старый индекс) — нужен ребилд",
+            "_meta.budget_exceeded=True → обход упёрся в node_budget (~400), сузь max_depth",
+            "ALT: find_references_to_object('Справочник.X') → все ВХОДЯЩИЕ ссылки на объект (обратное направление, 1 уровень)",
+        ],
     },
 }
 
@@ -887,6 +920,19 @@ _RECIPE_ALIASES: dict[str, str] = {
     "&перед": "расширения",
     "&после": "расширения",
     "&вместо": "расширения",
+    # «достижимость»
+    "reachability": "достижимость",
+    "путь вызовов": "достижимость",
+    "доходит ли": "достижимость",
+    "вызывает ли": "достижимость",
+    "find_path": "достижимость",
+    # «путь данных»
+    "data path": "путь данных",
+    "как связаны": "путь данных",
+    "граф данных": "путь данных",
+    "цепочка ссылок": "путь данных",
+    "связь объектов": "путь данных",
+    "find_data_path": "путь данных",
 }
 
 _STRATEGY_IO_SECTION = """\
@@ -930,7 +976,7 @@ def _git_search_routing(registry: dict | None) -> str:
         "including raw XML/forms/rights/DCS/queries that name-based helpers and the index never see.\n"
         "Pick the tool by intent (avoid tool-oscillation):\n"
         "  - by NAME (object/procedure/attribute) → search / find_module / find_attributes\n"
-        "  - inside a KNOWN module → safe_grep(pattern, hint)   (scoped, fast)\n"
+        "  - inside a KNOWN module → safe_grep(pattern, name_hint)   (scoped, fast)\n"
         "  - ANY substring ANYWHERE, incl. XML/forms/query text → git_search(pattern[, path, file_types])\n"
         "Anti-noise on common tokens: git_search(tok, mode='files') first (which files), or narrow\n"
         "file_types/path, then drill down. Mind max_results / the {'_truncated': True} sentinel."
@@ -1664,7 +1710,7 @@ def _format_overrides_summary(overrides: list[dict], max_lines: int = 30) -> lis
     for obj, obj_annotations in sorted(by_object.items()):
         lines.append(f"  {obj}: {', '.join(obj_annotations)}")
         if len(lines) >= max_lines:
-            lines.append("  ... and more (see extension_context.own_overrides or nearby_extensions[].overrides)")
+            lines.append("  ... and more — full list via get_overrides('ИмяОбъекта')")
             break
     return lines
 

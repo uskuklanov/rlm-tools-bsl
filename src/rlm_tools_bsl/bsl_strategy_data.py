@@ -54,7 +54,7 @@ Step 2 — READ: understand the code
 Step 3 — TRACE: follow the call chains
   find_callers_context(proc, module_hint) → who calls this procedure (1 уровень + контекст вызова)
   find_call_hierarchy(name, direction='callers', depth=2, module_hint='') → транзитивные вызывающие 2-3 уровня в одном вызове (вместо итерации find_callers_context). depth=1 → используй find_callers_context. Для одноимённого объектного метода передай module_hint='Документ.X' (exact-режим, точные рёбра).
-  safe_grep(pattern, hint) → search code patterns
+  safe_grep(pattern, name_hint) → search code patterns
   find_event_subscriptions(object_name) → what fires on write/post
 
 Step 4 — ANALYZE: get the full picture
