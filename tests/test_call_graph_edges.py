@@ -234,8 +234,11 @@ def test_cfe_override_edge_resolved(built):
     reader, _cf, db = built
     # Resolve the document object module rel_path for the exact hint.
     with _conn(db) as c:
+        # is_form=0 disambiguates: the document object module (override target),
+        # NOT the form module — both share object_name/category, so an unfiltered
+        # fetchone() picks whichever the build inserted first (FS-order flaky).
         row = c.execute(
-            "SELECT rel_path FROM modules WHERE object_name=? AND category='Documents'",
+            "SELECT rel_path FROM modules WHERE object_name=? AND category='Documents' AND is_form=0",
             ("ТестовыйДокумент",),
         ).fetchone()
     assert row is not None
