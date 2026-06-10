@@ -120,15 +120,24 @@ rlm-tools-bsl service start
 # --- Step 4: Verify ---
 echo ""
 echo "=== Step 4: Verify ==="
-echo "Waiting for server to start..."
-sleep 3
+echo "Waiting for server to start (up to ~40s total on slower machines: 4 attempts x 10s)..."
 
 # /health is lightweight (no MCP session); /mcp is the real endpoint shown in config.
 HEALTH_URL="http://${BIND_HOST}:${PORT}/health"
 MCP_URL="http://${BIND_HOST}:${PORT}/mcp"
 echo "Checking $HEALTH_URL ..."
 
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+HTTP_CODE="000"
+for attempt in 1 2 3 4; do
+    sleep 10
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+    if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "000" ]; then
+        break
+    fi
+    if [ "$attempt" -lt 4 ]; then
+        echo "  Attempt $attempt/4: not ready yet, retrying..."
+    fi
+done
 
 if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" != "000" ]; then
     echo "Server is responding (HTTP $HTTP_CODE). OK."

@@ -204,13 +204,13 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "=== Step 5: Verify ===" -ForegroundColor Cyan
-Write-Host "Waiting for server to start (watchdog may need up to 10s)..."
+Write-Host "Waiting for server to start (up to ~40s total on slower machines: 4 attempts x 10s)..."
 
 # Use /health (lightweight, does not create an MCP session) instead of /mcp.
 $url = "http://${BindHost}:${Port}/health"
 $ok = $false
 for ($attempt = 1; $attempt -le 4; $attempt++) {
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 10
     try {
         $response = Invoke-WebRequest -Uri $url -Method GET -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         Write-Host "Server responding (HTTP $($response.StatusCode)). OK." -ForegroundColor Green
