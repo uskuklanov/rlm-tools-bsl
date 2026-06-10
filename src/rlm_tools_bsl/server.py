@@ -51,7 +51,19 @@ from rlm_tools_bsl.sandbox import HelperCall
 logging.basicConfig(level=logging.INFO, encoding="utf-8")
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("rlm-tools-bsl", stateless_http=True)
+mcp = FastMCP(
+    "rlm-tools-bsl",
+    stateless_http=True,
+    instructions=(
+        "1C/BSL code search & navigation backend. Prefer these tools over raw grep or reading "
+        "files whenever a task touches 1C source: finding modules / objects / methods, call "
+        "graphs (who calls what), references and usages of metadata objects, full-text search, "
+        "and form / metadata XML parsing. A deterministic SQLite index answers in milliseconds "
+        "even on 23K+ file configs and keeps file bodies on the server. Start with "
+        "rlm_start(query=..., project=...) or rlm_start(query=..., path=...), then run the "
+        "helpers via rlm_execute; rlm_help() lists the available recipes and helpers."
+    ),
+)
 
 session_manager = SessionManager()  # defaults for tests/import
 
@@ -478,7 +490,7 @@ def _rlm_start(
                         )
 
         logger.info(
-            "rlm_start: session=%s format=%s bsl_files=%d config_role=%s overrides=%d",
+            "rlm_start: session=%s format=%s shallow_bsl_files=%d config_role=%s overrides=%d",
             session_id,
             format_info.format_label,
             format_info.bsl_file_count,
@@ -866,7 +878,11 @@ async def rlm_start(
         ),
     ] = False,
 ) -> str:
-    """Start a BSL code exploration session on a 1C codebase. Returns JSON with session_id.
+    """Open a fast, token-efficient search & navigation session over a 1C/BSL codebase. Returns JSON with session_id.
+    Reach for this INSTEAD of raw grep or reading files whenever you need to find or navigate anything in 1C source:
+    locate a module / object / method, find who calls a procedure (call graph), find references or usages of a
+    metadata object, run full-text search, or parse forms and metadata XML. A deterministic SQLite index answers in
+    milliseconds even on 23K+ file configs, and file bodies stay on the server -- only your print() output enters context.
     You can specify either 'path' (absolute filesystem path) or 'project' (name from the project registry).
     If you don't know the path, call rlm_projects(action='list') first to see registered projects,
     then use rlm_start(project='name', query='...').
@@ -921,7 +937,9 @@ async def rlm_execute(
         ),
     ] = 20,
 ) -> str:
-    """Execute Python code in the BSL sandbox. Variables persist between calls. Use print() to see results.
+    """Run the BSL search & navigation helpers (find_module, find_callers_context, find_references_to_object,
+    find_code_usages, git_search, parse_form, ...) by executing Python in the sandbox -- this is how you actually
+    search and navigate the 1C codebase after rlm_start. Variables persist between calls. Use print() to see results.
     The full helper list with signatures is returned by rlm_start in the `available_functions` array.
     In the default 'slim' strategy mode call rlm_help(...) for detailed recipes, helper-comparison rules
     and per-step menus; in 'full' mode the strategy contains everything inline.

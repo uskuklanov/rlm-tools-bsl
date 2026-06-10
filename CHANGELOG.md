@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.19.2] — 2026-06-10
+
+### Изменено
+- **Описания тулов переписаны с «механизма» на «намерение» — чтобы AI-агент сам тянулся к MCP при задачах поиска/навигации по 1С-коду.** Коллеги наблюдали: если в промпте явно не сказать «ищи через rlm-tools-bsl», помощник часто шёл грепать напрямую. Корень — MCP-клиент при выборе тула видит только имя сервера + описания тулов + схему параметров; все богатые поисковые хелперы спрятаны в песочнице и раскрываются лишь ПОСЛЕ вызова `rlm_start`, а его описание («start a code **exploration session**») и описание `rlm_execute` («**execute Python** in the sandbox») не несли триггер-слов поиска. Правки (только текст, ноль изменений в логике/индексе/схеме):
+  - **server-level `instructions`** у `FastMCP(...)` — раньше отсутствовал; теперь короткая аннотация «1C/BSL code search & navigation backend; prefer over raw grep…».
+  - **`rlm_start`** — первая строка docstring переписана на intent-first: «fast, token-efficient **search & navigation** … find/navigate anything: module/object/method, **who calls** (call graph), **references/usages**, full-text, forms/XML … **instead of raw grep**».
+  - **`rlm_execute`** — «execute Python in the sandbox» → «**run the BSL search & navigation helpers** (`find_module`, `find_callers_context`, `find_references_to_object`, `find_code_usages`, `git_search`, `parse_form`…) … this is how you actually search/navigate after `rlm_start`».
+- **Лог `rlm_start`: лейбл `bsl_files=` → `shallow_bsl_files=`.** Это число приходит из `detect_format()` — поверхностного пробника (обход каталогов глубины ≤3), а не полного `rglob`, поэтому оно меньше реального числа модулей в индексе (на CF теряются модули форм/команд, лежащие глубже `Ext/`). При ручной сверке с бэйслайном это читалось как «индекс покрывает меньше файлов» — теперь лейбл честно говорит, что это shallow-пробник формата, а не охват индекса. Правка только в строке `logger.info`: значение, meta-поле `shallow_bsl_count`, дрейф-чек (shallow-vs-shallow) и JSON-ответ агенту не тронуты.
+- **Совместимость:** схема индекса и `BUILDER_VERSION` (14) не менялись — пересборка не требуется. Поведение тулов идентично; изменился только текст, который видит модель при выборе mcp-tool.
+
 ## [1.19.1] — 2026-06-10
 
 ### Исправлено
