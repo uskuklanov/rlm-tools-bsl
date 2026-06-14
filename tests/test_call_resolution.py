@@ -984,3 +984,214 @@ class TestCallsEmptinessCheck:
             assert reader.get_callers("ОбщийМетод") is not None
         finally:
             reader.close()
+
+
+# ===========================================================================
+# callee_key drift fix — incremental re-resolve of qualified callers keeps the
+# strict  update ≡ build  invariant (H1); batch-narrowed lookups (H2).
+# ===========================================================================
+
+# Minimal project: a common module target + a non-common (Document) caller that
+# references it via qualified calls. The caller is NEVER edited in the drift
+# scenarios, so its stored callee_key can only stay correct via the re-resolve.
+_CM_TARGET = (
+    "Функция Создать() Экспорт\n    Возврат 1;\nКонецФункции\n\n"
+    "Функция Прочитать() Экспорт\n    Возврат 2;\nКонецФункции\n"
+)
+_CALLER = "Процедура Обработка()\n    ЦелевойМодуль.Создать();\n    ЦелевойМодуль.Прочитать();\nКонецПроцедуры\n"
+_DRIFT_BASE = {
+    "CommonModules/ЦелевойМодуль/Ext/Module.bsl": _CM_TARGET,
+    "Documents/Потребитель/Ext/ObjectModule.bsl": _CALLER,
+}
+
+
+def _edge_tuples(db_path):
+    """Per-edge identity (caller_path, caller_name, callee_name, line, callee_key).
+
+    All fields are rel_path-based / textual, so the multiset is comparable across
+    two independently built DBs — a mis-bound key with a coinciding value is
+    caught (unlike a bare callee_key multiset)."""
+    with _conn(db_path) as c:
+        return sorted(
+            (r["cp"], r["cn"], r["callee_name"], r["line"], r["callee_key"])
+            for r in c.execute(
+                "SELECT mod.rel_path AS cp, m.name AS cn, cl.callee_name AS callee_name, "
+                "cl.line AS line, cl.callee_key AS callee_key "
+                "FROM calls cl JOIN methods m ON cl.caller_id=m.id "
+                "JOIN modules mod ON m.module_id=mod.id"
+            )
+        )
+
+
+def _fresh_build(tmp_path_factory, files, name="fresh"):
+    d = tmp_path_factory.mktemp(name)
+    _write_project(d, files)
+    return IndexBuilder().build(str(d), build_calls=True)
+
+
+def _apply_changes(root, files_old, files_new):
+    for rel, content in files_new.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8-sig")
+    for rel in set(files_old) - set(files_new):
+        (root / rel).unlink()
+
+
+def _assert_update_equals_build(tmp_path_factory, files_a, files_b):
+    """Build A, mutate on disk to B, incremental update; the per-edge tuples must
+    equal a fresh full build of B (strict update ≡ build)."""
+    da = tmp_path_factory.mktemp("upd")
+    _write_project(da, files_a)
+    db_a = IndexBuilder().build(str(da), build_calls=True)
+    _apply_changes(da, files_a, files_b)
+    IndexBuilder().update(str(da))
+    db_b = _fresh_build(tmp_path_factory, files_b, "fresh")
+    assert _edge_tuples(db_a) == _edge_tuples(db_b)
+    return db_a
+
+
+class TestCalleeKeyDriftReresolve:
+    def test_rename_export_method_orphans_unchanged_caller(self, tmp_path_factory):
+        files_b = dict(_DRIFT_BASE)
+        files_b["CommonModules/ЦелевойМодуль/Ext/Module.bsl"] = _CM_TARGET.replace(
+            "Функция Создать()", "Функция Создать_v2()"
+        )
+        db = self._roundtrip(tmp_path_factory, _DRIFT_BASE, files_b)
+        # The Создать edge from the unchanged caller is now orphan (NULL).
+        with _conn(db) as c:
+            row = c.execute("SELECT callee_key FROM calls WHERE callee_name='ЦелевойМодуль.Создать'").fetchone()
+            assert row is not None and row["callee_key"] is None
+            row2 = c.execute("SELECT callee_key FROM calls WHERE callee_name='ЦелевойМодуль.Прочитать'").fetchone()
+            assert row2["callee_key"] is not None  # untouched target still resolves
+
+    def test_add_common_module_resolves_prior_reference(self, tmp_path_factory):
+        # Caller references a module that does not exist yet → NULL; adding it heals.
+        files_a = {
+            "Documents/Потребитель/Ext/ObjectModule.bsl": ("Процедура П()\n    НовыйОбщий.Старт();\nКонецПроцедуры\n"),
+        }
+        files_b = dict(files_a)
+        files_b["CommonModules/НовыйОбщий/Ext/Module.bsl"] = "Функция Старт() Экспорт\n    Возврат 1;\nКонецФункции\n"
+        db = self._roundtrip(tmp_path_factory, files_a, files_b)
+        with _conn(db) as c:
+            row = c.execute("SELECT callee_key FROM calls WHERE callee_name='НовыйОбщий.Старт'").fetchone()
+            assert row is not None and row["callee_key"] is not None  # stale_null healed
+
+    def test_export_flip_orphans_caller(self, tmp_path_factory):
+        files_b = dict(_DRIFT_BASE)
+        files_b["CommonModules/ЦелевойМодуль/Ext/Module.bsl"] = _CM_TARGET.replace(
+            "Функция Создать() Экспорт", "Функция Создать()"
+        )
+        db = self._roundtrip(tmp_path_factory, _DRIFT_BASE, files_b)
+        with _conn(db) as c:
+            row = c.execute("SELECT callee_key FROM calls WHERE callee_name='ЦелевойМодуль.Создать'").fetchone()
+            assert row["callee_key"] is None  # non-exported common method → unresolved
+
+    def test_delete_common_module_orphans_caller(self, tmp_path_factory):
+        files_b = {"Documents/Потребитель/Ext/ObjectModule.bsl": _CALLER}
+        db = self._roundtrip(tmp_path_factory, _DRIFT_BASE, files_b)
+        with _conn(db) as c:
+            for name in ("ЦелевойМодуль.Создать", "ЦелевойМодуль.Прочитать"):
+                row = c.execute("SELECT callee_key FROM calls WHERE callee_name=?", (name,)).fetchone()
+                assert row["callee_key"] is None
+
+    def test_rename_common_module_itself(self, tmp_path_factory):
+        # Path changes → old removed + new added; caller still names the old module.
+        files_b = {
+            "CommonModules/ЦелевойМодульНов/Ext/Module.bsl": _CM_TARGET,
+            "Documents/Потребитель/Ext/ObjectModule.bsl": _CALLER,
+        }
+        db = self._roundtrip(tmp_path_factory, _DRIFT_BASE, files_b)
+        with _conn(db) as c:
+            row = c.execute("SELECT callee_key FROM calls WHERE callee_name='ЦелевойМодуль.Создать'").fetchone()
+            assert row["callee_key"] is None  # old module gone → orphan
+
+    def _roundtrip(self, tmp_path_factory, files_a, files_b):
+        return _assert_update_equals_build(tmp_path_factory, files_a, files_b)
+
+
+class TestQualifiedReresolveOnceMigration:
+    def test_legacy_drift_healed_on_next_update(self, tmp_path_factory):
+        d = tmp_path_factory.mktemp("legacy")
+        _write_project(d, _DRIFT_BASE)
+        db = IndexBuilder().build(str(d), build_calls=True)
+        fresh = _edge_tuples(db)  # correct reference (build sets the flag)
+
+        # Simulate a legacy index: corrupt a resolved key + clear the one-time flag.
+        with _conn(db) as c:
+            c.execute("UPDATE calls SET callee_key='LEGACY/STALE::создать' WHERE callee_name='ЦелевойМодуль.Создать'")
+            c.execute("DELETE FROM index_meta WHERE key='qualified_callers_reresolved'")
+            c.commit()
+
+        # A no-op update (no file changes) must run the one-time GLOBAL migration.
+        IndexBuilder().update(str(d))
+        assert _edge_tuples(db) == fresh
+        with _conn(db) as c:
+            flag = c.execute("SELECT value FROM index_meta WHERE key='qualified_callers_reresolved'").fetchone()
+            assert flag is not None and flag["value"] == "1"
+
+    def test_fresh_build_sets_flag(self, tmp_path_factory):
+        db = _fresh_build(tmp_path_factory, _DRIFT_BASE, "flagcheck")
+        with _conn(db) as c:
+            flag = c.execute("SELECT value FROM index_meta WHERE key='qualified_callers_reresolved'").fetchone()
+            assert flag is not None and flag["value"] == "1"
+
+    def test_migration_is_idempotent(self, tmp_path_factory):
+        # Once the flag is set, the one-time global migration no longer fires:
+        # a manual corruption survives an unrelated no-op update.
+        d = tmp_path_factory.mktemp("idem")
+        _write_project(d, _DRIFT_BASE)
+        db = IndexBuilder().build(str(d), build_calls=True)
+        with _conn(db) as c:
+            c.execute("UPDATE calls SET callee_key='STALE::x' WHERE callee_name='ЦелевойМодуль.Создать'")
+            c.commit()
+        IndexBuilder().update(str(d))  # flag already '1' → migration skipped
+        with _conn(db) as c:
+            row = c.execute("SELECT callee_key FROM calls WHERE callee_name='ЦелевойМодуль.Создать'").fetchone()
+            assert row["callee_key"] == "STALE::x"  # NOT healed → proves one-time
+
+
+class TestReresolveRegressionAndUnit:
+    def test_empty_set_is_noop(self, built):
+        db_path, _ = built
+        with sqlite3.connect(str(db_path)) as c:
+            assert IndexBuilder._reresolve_qualified_callers(c, set()) == 0
+
+    def test_noncommon_change_keeps_invariant(self, tmp_path_factory):
+        # Editing only a non-common (Document) module must not perturb other edges;
+        # with the flag already set the global migration does not run either.
+        files_b = dict(_DRIFT_BASE)
+        files_b["Documents/Потребитель/Ext/ObjectModule.bsl"] = (
+            "Процедура Обработка()\n"
+            "    ЦелевойМодуль.Создать();\n"
+            "    ЦелевойМодуль.Прочитать();\n"
+            "    // comment-only addition\n"
+            "КонецПроцедуры\n"
+        )
+        _assert_update_equals_build(tmp_path_factory, _DRIFT_BASE, files_b)
+
+    def test_build_common_exported_mapping(self, built):
+        db_path, _ = built
+        from rlm_tools_bsl.bsl_index import _build_common_exported
+
+        with sqlite3.connect(str(db_path)) as c:
+            mapping = _build_common_exported(c)
+        # exported method of a common module is present (casefolded key)
+        assert (("общиймодуль", "общийметод")) in mapping
+        assert mapping[("общиймодуль", "общийметод")] == OBSHIY_PATH
+        # a non-exported / non-common method is absent
+        assert ("общиймодуль", "внутренняялогика") not in mapping
+
+    def test_batch_methods_query_uses_index(self, built):
+        # H2: the batch-narrowed methods_by_module query must hit idx_meth_module,
+        # not full-scan all methods.
+        db_path, _ = built
+        with _conn(db_path) as c:
+            mid = c.execute("SELECT id FROM modules LIMIT 1").fetchone()[0]
+            blob = _plan_blob(
+                c,
+                "SELECT id, module_id FROM methods WHERE module_id IN (?) ORDER BY module_id, line",
+                [mid],
+            )
+            assert "idx_meth_module" in blob, blob
+            assert "SCAN methods" not in blob, blob

@@ -350,6 +350,32 @@ def _make_callee_key(rel_path: str, method_name: str) -> str:
     return f"{norm_path}::{method_name.casefold()}"
 
 
+def _build_common_exported(conn: sqlite3.Connection) -> dict[tuple[str, str], str | None]:
+    """``(object_name_cf, method_cf) -> rel_path | None`` (None = ambiguous).
+
+    The DB-wide lookup for resolving qualified ``A.B`` call edges: exported methods
+    of common modules. Uses an SQL filter (CommonModules / Module / exported) instead
+    of scanning every method in the DB — the only tier that needs whole-DB visibility
+    (a target may live in an unchanged common module). Shared by ``_bulk_insert``'s
+    resolver and ``_reresolve_qualified_callers`` so build / increment / re-resolve
+    produce byte-identical keys. Value ``None`` marks an ambiguous key (collision).
+    """
+    common: dict[tuple[str, str], str | None] = {}
+    for row in conn.execute(
+        "SELECT mod.rel_path, mod.object_name, me.name "
+        "FROM methods me JOIN modules mod ON me.module_id = mod.id "
+        "WHERE mod.category='CommonModules' AND mod.module_type='Module' "
+        "AND me.is_export=1 AND mod.object_name IS NOT NULL"
+    ):
+        if isinstance(row, sqlite3.Row):
+            rel_path, object_name, mname = row["rel_path"], row["object_name"], row["name"]
+        else:
+            rel_path, object_name, mname = row
+        ck = (object_name.casefold(), mname.casefold())
+        common[ck] = None if ck in common else rel_path
+    return common
+
+
 def _callee_short_expr(col: str = "callee_name") -> str:
     """SQL expression yielding the bare method name (suffix after the dot).
 
@@ -5947,6 +5973,10 @@ class IndexBuilder:
         with conn:
             self._ensure_callee_short_index(conn)
             self._ensure_meth_module_index(conn)
+            # Guarantee calls.callee_key exists before the delta-independent
+            # re-resolve migration below (the BSL-delta branches do this too, but
+            # the once-migration runs even on a no-op update).
+            self._ensure_callee_key_column(conn)
 
         # One-time in-place cleanup of bare-global call noise for legacy indexes
         # built before the extraction filter existed. Idempotent (meta flag),
@@ -5958,6 +5988,17 @@ class IndexBuilder:
             logger.info(
                 "Purged %d bare-global noise rows from calls (legacy index migration)",
                 purged,
+            )
+
+        # One-time GLOBAL re-resolve of qualified callee_key for legacy v14 indexes
+        # that accumulated drift before the per-delta re-resolve existed. Idempotent
+        # (meta flag), delta-independent (same rationale as the noise purge above),
+        # no schema change. Per-delta re-resolve below prevents NEW drift going forward.
+        reresolved = self._reresolve_qualified_callers_once(conn)
+        if reresolved:
+            logger.info(
+                "Re-resolved %d stale qualified callee_key (legacy index migration)",
+                reresolved,
             )
 
         # --- Git fast path attempt ---
@@ -6114,12 +6155,35 @@ class IndexBuilder:
                         if result is not None:
                             results.append(result)
 
+            # Casefolded names of common modules touched by this delta — drives the
+            # per-delta re-resolve of qualified callee_key on UNCHANGED callers.
+            # NEW names from results; OLD names queried from the DB before delete.
+            changed_common_cf: set[str] = {
+                r.info.object_name.casefold()
+                for r in results
+                if r.info.category == "CommonModules" and r.info.module_type == "Module" and r.info.object_name
+            }
+
             with conn:
                 # Delete old data for removed + changed
                 if to_remove:
                     # metadata_code_usages has no module_id index (weight) — batch
                     # delete by chunk to stay under the SQLite variable limit.
                     removed_ids = [db_modules[rel]["id"] for rel in to_remove if rel in db_modules]
+                    # Old common-module names for the call-graph re-resolve — only
+                    # needed when calls are built; chunk to stay under the SQLite
+                    # variable limit (like the metadata_code_usages delete below).
+                    if build_calls and removed_ids:
+                        for chunk in _chunked(removed_ids):
+                            ph = ",".join("?" * len(chunk))
+                            for row in conn.execute(
+                                f"SELECT object_name FROM modules WHERE id IN ({ph}) "  # noqa: S608
+                                "AND category='CommonModules' AND module_type='Module' "
+                                "AND object_name IS NOT NULL",
+                                chunk,
+                            ):
+                                old_name = row[0] if not isinstance(row, sqlite3.Row) else row["object_name"]
+                                changed_common_cf.add(old_name.casefold())
                     for chunk in _chunked(removed_ids):
                         placeholders = ",".join("?" * len(chunk))
                         try:
@@ -6163,6 +6227,10 @@ class IndexBuilder:
                 # Insert new data
                 self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
+                # Re-resolve qualified callee_key on unchanged callers of common
+                # modules touched by this delta (keeps update ≡ build).
+                if build_calls:
+                    self._reresolve_qualified_callers(conn, changed_common_cf)
                 self._refresh_call_resolution_stats(conn)
 
                 # Update FTS for newly inserted methods
@@ -6606,11 +6674,33 @@ class IndexBuilder:
                         if result is not None:
                             results.append(result)
 
+            # Casefolded names of common modules touched by this delta (NEW from
+            # results, OLD queried before delete) — drives per-delta re-resolve.
+            changed_common_cf: set[str] = {
+                r.info.object_name.casefold()
+                for r in results
+                if r.info.category == "CommonModules" and r.info.module_type == "Module" and r.info.object_name
+            }
+
             with conn:
                 if to_remove:
                     # metadata_code_usages has no module_id index (weight) — batch
                     # delete by chunk to stay under the SQLite variable limit.
                     removed_ids = [db_modules[rel]["id"] for rel in to_remove if rel in db_modules]
+                    # Old common-module names for the call-graph re-resolve — only
+                    # needed when calls are built; chunk to stay under the SQLite
+                    # variable limit (like the metadata_code_usages delete below).
+                    if build_calls and removed_ids:
+                        for chunk in _chunked(removed_ids):
+                            ph = ",".join("?" * len(chunk))
+                            for row in conn.execute(
+                                f"SELECT object_name FROM modules WHERE id IN ({ph}) "  # noqa: S608
+                                "AND category='CommonModules' AND module_type='Module' "
+                                "AND object_name IS NOT NULL",
+                                chunk,
+                            ):
+                                old_name = row[0] if not isinstance(row, sqlite3.Row) else row["object_name"]
+                                changed_common_cf.add(old_name.casefold())
                     for chunk in _chunked(removed_ids):
                         placeholders = ",".join("?" * len(chunk))
                         try:
@@ -6652,6 +6742,10 @@ class IndexBuilder:
 
                 self._ensure_callee_key_column(conn)
                 self._bulk_insert(conn, results, build_calls)
+                # Re-resolve qualified callee_key on unchanged callers of common
+                # modules touched by this delta (keeps update ≡ build).
+                if build_calls:
+                    self._reresolve_qualified_callers(conn, changed_common_cf)
                 self._refresh_call_resolution_stats(conn)
 
                 if has_fts and results:
@@ -7059,6 +7153,64 @@ class IndexBuilder:
         )
 
     @staticmethod
+    def _reresolve_qualified_callers(conn: sqlite3.Connection, changed_common_cf: set[str] | None) -> int:
+        """Re-resolve ``callee_key`` of qualified ``A.B`` edges against current DB.
+
+        The incremental update only re-resolves edges of REPROCESSED modules, so a
+        qualified edge from an UNCHANGED caller keeps a stale key when its target
+        common module ``A`` changed (rename / delete / export-flip / add). This pass
+        recomputes such keys with the SAME resolver as build (``_build_common_exported``
+        + ``_make_callee_key`` + ``casefold``) so ``update`` matches a fresh build.
+
+        ``changed_common_cf`` — casefolded names of common modules touched by the
+        delta; only edges ``A.B`` with ``A`` in this set are recomputed. ``None`` =
+        GLOBAL mode (every qualified edge), for the one-time legacy migration. An
+        empty set is a no-op (returns 0). Returns the number of updated edges.
+
+        A correctness-first single scan (not ``LIKE 'A.%'``): the resolver matches
+        module names via ``casefold()``, but LIKE/NOCASE does not fold Cyrillic, so an
+        indexed prefix would miss differently-cased callers and break ``update ≡ build``.
+        """
+        if changed_common_cf is not None and not changed_common_cf:
+            return 0
+        common = _build_common_exported(conn)
+        updates: list[tuple[str | None, int]] = []
+        # Positional access (row[i]) — works for both sqlite3.Row and tuple
+        # factories, and ``rowid`` is not always addressable by name.
+        for row in conn.execute("SELECT rowid, callee_name, callee_key FROM calls WHERE instr(callee_name,'.')>0"):
+            rowid, callee_name, stored = row[0], row[1], row[2]
+            a, _, b = callee_name.partition(".")
+            if changed_common_cf is not None and a.casefold() not in changed_common_cf:
+                continue
+            rel = common.get((a.casefold(), b.casefold()))
+            new_key = _make_callee_key(rel, b) if rel else None
+            if new_key != stored:
+                updates.append((new_key, rowid))
+        if updates:
+            conn.executemany("UPDATE calls SET callee_key=? WHERE rowid=?", updates)
+        return len(updates)
+
+    @staticmethod
+    def _reresolve_qualified_callers_once(conn: sqlite3.Connection) -> int:
+        """One-time GLOBAL re-resolve of qualified ``callee_key`` for legacy v14 DBs.
+
+        Idempotent via the ``qualified_callers_reresolved`` meta flag — heals drift
+        accumulated by updates made BEFORE the per-delta re-resolve existed. New builds
+        set the flag in ``_write_meta`` (already consistent), so this fires only once,
+        on the next update of a pre-existing index. No schema change / BUILDER_VERSION
+        bump. ``_ensure_callee_key_column`` first keeps it self-sufficient for a
+        malformed v14 DB lacking the column. Returns rows updated (0 if already done).
+        """
+        IndexBuilder._ensure_callee_key_column(conn)
+        if IndexBuilder._meta_get(conn, "qualified_callers_reresolved"):
+            return 0
+        with conn:
+            n = IndexBuilder._reresolve_qualified_callers(conn, None)
+            IndexBuilder._refresh_call_resolution_stats(conn)
+            IndexBuilder._meta_set(conn, "qualified_callers_reresolved", "1")
+        return n
+
+    @staticmethod
     def _meta_get(conn: sqlite3.Connection, key: str) -> str | None:
         """Read a single ``index_meta`` value (k/v store; None if missing)."""
         row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
@@ -7196,47 +7348,66 @@ class IndexBuilder:
 
         # Insert calls — need to resolve method_idx to method_id
         if build_calls and call_pending:
-            # Build (rel_path) -> sorted list of method IDs by line
+            # Module ids of the CURRENT batch (the only callers we resolve here).
+            # NOTE: path_to_id spans the WHOLE DB, so take ids from ``results``.
+            batch_ids = [path_to_id[r.info.relative_path] for r in results if r.info.relative_path in path_to_id]
+            # On a small increment, narrow the two batch-local lookups to the batch
+            # (indexed IN scan) instead of scanning every method in the DB. The
+            # threshold keeps the IN list under SQLITE_MAX_VARIABLE_NUMBER and lets
+            # large batches / full builds keep the plain full scan. ``common_exported``
+            # always needs whole-DB visibility (handled by _build_common_exported).
+            narrow = 0 < len(batch_ids) <= 900
+
+            # Build module_id -> method IDs ORDERED BY line (method_idx in raw_calls
+            # indexes this list; the ORDER BY MUST be preserved or caller_id drifts).
             methods_by_module: dict[int, list[int]] = {}
-            for row in conn.execute("SELECT id, module_id FROM methods ORDER BY module_id, line"):
+            if narrow:
+                ph = ",".join("?" * len(batch_ids))
+                mbm_cur = conn.execute(
+                    f"SELECT id, module_id FROM methods WHERE module_id IN ({ph}) "  # noqa: S608
+                    "ORDER BY module_id, line",
+                    batch_ids,
+                )
+            else:
+                mbm_cur = conn.execute("SELECT id, module_id FROM methods ORDER BY module_id, line")
+            for row in mbm_cur:
                 if isinstance(row, sqlite3.Row):
                     mid, modid = row["id"], row["module_id"]
                 else:
                     mid, modid = row[0], row[1]
                 methods_by_module.setdefault(modid, []).append(mid)
 
-            # Build callee resolution lookups over the WHOLE DB (an incremental
-            # target may live in an unchanged module, so we cannot restrict to
-            # the current batch). Two provably-safe tiers only:
+            # Resolution lookups. Two provably-safe tiers only:
             #   local           — bare ``B()`` → a method of the caller's own module
+            #                      (caller ∈ batch, so batch-local lookup suffices)
             #   common_exported — ``A.B()`` → an exported method of common module A
+            #                      (target may be in an UNCHANGED module → whole-DB)
             # Object/manager qualified calls (Справочники.X.Метод / Объект.Метод)
             # are intentionally NOT resolved (ambiguous variable/manager method).
             # Value ``None`` marks an ambiguous key (multiple candidates) → NULL.
             local_lookup: dict[tuple[int, str], str | None] = {}
-            common_exported: dict[tuple[str, str], str | None] = {}
-            for row in conn.execute(
-                "SELECT mod.id AS module_id, mod.rel_path AS rel_path, mod.category AS category, "
-                "mod.object_name AS object_name, mod.module_type AS module_type, "
-                "me.name AS name, me.is_export AS is_export "
-                "FROM methods me JOIN modules mod ON me.module_id = mod.id"
-            ):
+            if narrow:
+                ph = ",".join("?" * len(batch_ids))
+                ll_cur = conn.execute(
+                    "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
+                    "FROM methods me JOIN modules mod ON me.module_id = mod.id "
+                    f"WHERE mod.id IN ({ph})",  # noqa: S608
+                    batch_ids,
+                )
+            else:
+                ll_cur = conn.execute(
+                    "SELECT mod.id AS module_id, mod.rel_path AS rel_path, me.name AS name "
+                    "FROM methods me JOIN modules mod ON me.module_id = mod.id"
+                )
+            for row in ll_cur:
                 if isinstance(row, sqlite3.Row):
-                    module_id = row["module_id"]
-                    rel_path = row["rel_path"]
-                    category = row["category"]
-                    object_name = row["object_name"]
-                    module_type = row["module_type"]
-                    mname = row["name"]
-                    is_export = row["is_export"]
+                    module_id, rel_path, mname = row["module_id"], row["rel_path"], row["name"]
                 else:
-                    module_id, rel_path, category, object_name, module_type, mname, is_export = row
-                name_cf = mname.casefold()
-                lk = (module_id, name_cf)
+                    module_id, rel_path, mname = row
+                lk = (module_id, mname.casefold())
                 local_lookup[lk] = None if lk in local_lookup else rel_path
-                if is_export and category == "CommonModules" and module_type == "Module" and object_name:
-                    ck = (object_name.casefold(), name_cf)
-                    common_exported[ck] = None if ck in common_exported else rel_path
+
+            common_exported = _build_common_exported(conn)
 
             def _resolve_callee_key(caller_module_id: int, callee: str) -> str | None:
                 if "." in callee:
@@ -7337,6 +7508,10 @@ class IndexBuilder:
             # A full build produces clean data (extraction filter applied), so the
             # legacy in-place purge in update() can skip straight away.
             ("calls_noise_cleaned", "1"),
+            # A full build resolves every qualified callee_key in one pass against
+            # the final DB state, so the one-time global re-resolve migration in
+            # update() can skip straight away (no accumulated drift to heal).
+            ("qualified_callers_reresolved", "1"),
         ]
         # Level-1: Configuration metadata
         if config_meta:
