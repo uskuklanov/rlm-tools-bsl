@@ -1590,3 +1590,142 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Ошибки контрактов (KeyError/AttributeError на get_overrides/find_roles/find_register_movements/parse_form/safe_grep) | 0 |
 | Traceback в серверном логе | 0 |
 
+---
+
+# Navigation Primitives Prompt — E2E Test for v1.20.0 Helpers
+
+Use this prompt to verify the three navigation primitives added in v1.20.0:
+`find_definition` (go-to-definition / «где определён метод»), `get_module_outline`
+(дешёвый скелет модуля — дерево `#Область` + агрегаты) и `git_search(exclude_path=...)`
+(полнотекст с отсечением шумовых зон). Read-only слой поверх индекса — requires index v14,
+**реиндекс НЕ нужен**. Для пункта `git_search` источник должен быть **git work-tree**
+(иначе хелпер не зарегистрирован и пункт 4 пропускается). Замени `<path>` на путь к исходникам;
+имена методов/документов агент подбирает сам по выдаче.
+
+---
+
+## Prompt
+
+```
+Мне нужно изучить структуру и определения методов конфигурации, опираясь на навигационные
+примитивы: «где определён метод», «скелет модуля» и полнотекстовый поиск без шума.
+Путь: <путь к каталогу исходников 1С>
+
+Используй ТОЛЬКО MCP-сервер rlm-tools-bsl (rlm_start / rlm_execute / rlm_end).
+Не используй встроенные инструменты чтения файлов — всё делай через песочницу.
+
+Мне нужно проверить:
+
+1. Диагностика индекса:
+   - get_index_info() → builder_version, config_name, has_regions. Если builder_version < 14 — сообщи.
+
+2. find_definition — переход к ОПРЕДЕЛЕНИЮ метода (форвард-навигация, комплемент find_callers_context):
+   - Уникальный экспортный метод: через find_exports()/search_methods() возьми экспортную функцию
+     общего модуля и вызови find_definition('ИмяМетода'). Ожидается ровно 1 определение,
+     _meta.unique=True, _meta.hint_applied=False. Покажи file, line, type, is_export, params.
+   - Одноимённый объектный метод: find_definition('ОбработкаПроведения') БЕЗ hint → много кандидатов
+     в разных документах (_meta.unique=False; truncated=True если total > limit). Покажи total и
+     первые 5 (file, object_name). (Если ОбработкаПроведения в конфигурации редок — возьми другой
+     явно одноимённый метод: ПередЗаписью / ПриЗаписи.)
+   - Сужение module_hint: find_definition('ОбработкаПроведения', 'Документ.<документ_из_выдачи>') →
+     ровно 1 определение, _meta.hint_applied=True, _meta.unique=True. module_hint принимает 3 формы:
+     rel_path | 'Документ.X'/'Document.X' | голое имя объекта — проверь хотя бы две.
+   - Регистронезависимость кириллицы: тот же метод в НИЖНЕМ регистре ('обработкапроведения') →
+     find_definition всё равно находит определения, _meta.slow_fallback=True (медленный py_lower-проход
+     ТОЛЬКО на промахе NOCASE для кириллицы — это норма, не ошибка).
+   - Границы: find_definition('ТакогоМетодаНетВообще') → total=0, definitions=[] (это НЕ ошибка,
+     _meta.index_used=True). Пустое имя find_definition('') → {error, hint}.
+   - Контракт записи: params — это list[str] (не строка); в каждой записи заполнены
+     category, object_name, module_type.
+
+3. get_module_outline — дешёвый СКЕЛЕТ модуля (дерево #Область + агрегаты, первый хоп перед чтением тел):
+   - Выбери крупный модуль (ManagerModule большого документа или общий модуль): через find_module()
+     возьми path.
+   - get_module_outline(path) → totals {methods, exports, regions, loc}. Покажи области верхнего
+     уровня (region + totals), найди самую «населённую» область (max totals.methods) и выведи её
+     вложенные children (дерево). Покажи orphan_methods (методы вне любой #Область), если есть.
+   - get_module_outline(path, include_methods=False) → только дерево областей + агрегаты. Убедись,
+     что ключей methods/orphan_methods НЕТ, а totals на каждом узле есть (это «карта верхнего уровня»,
+     ещё дешевле и компактнее).
+   - _meta.index_used должно быть True (модуль в индексе); если False — покажи fallback_reason.
+   - Поясни в отчёте, что даёт get_module_outline сверх extract_procedures: ИЕРАРХИЮ областей и
+     агрегаты, тогда как extract_procedures — плоский список процедур.
+
+4. git_search с exclude_path — полнотекст без шумовых зон (только если источник под git):
+   - Выбери бизнес-токен (имя справочника/документа). git_search(token, mode='files') → сколько ВСЕГО
+     файлов; сколько из них в путях с сегментом /Forms/ и /Templates/.
+   - git_search(token, mode='files', exclude_path='Forms,Templates') → подтверди, что файлы из
+     */Forms/* и */Templates/* ИСЧЕЗЛИ (на любой глубине вложенности!), а прочие на месте. Покажи
+     число файлов до и после и процент сокращения.
+   - git_search(token, mode='files', exclude_path='ConfigDumpInfo.xml') → отсечение конкретного файла
+     на любой глубине.
+   - Валидация: git_search(token, exclude_path='a*') (glob-метасимвол во входе) → должно вернуть
+     [{error: ...}] (вход exclude_path — литеральный, поиск НЕ расширяется молча).
+   - Если git_search недоступен (в Navigation нет git_search, источник не под git) — явно сообщи и
+     пропусти пункт 4.
+
+5. Связка примитивов — реальный навигационный сценарий (новое дополняет старое):
+   - git_search(бизнес-токен, exclude_path='Forms,Templates') → найди упоминание в .bsl-коде, возьми
+     имя метода и путь модуля. (Если git_search недоступен — стартуй цепочку с search_methods.)
+   - find_definition(метод) → где он определён (file, line, object_name).
+   - get_module_outline(file) → в какой #Область лежит этот метод и какие у него соседи по области.
+   - read_procedure(file, метод) → тело; find_callers_context(метод) → кто его зовёт.
+   - Покажи цельную цепочку: полнотекст → определение → область модуля → тело → вызывающие.
+
+6. Статистика и сводка:
+   - find_definition: total у самого «многоместного» метода; сработал ли slow_fallback на кириллице.
+   - get_module_outline: у выбранного модуля methods/exports/regions/loc и максимальная глубина
+     вложенности областей; выигрыш include_methods=False (компактнее).
+   - git_search: эффект exclude_path (на сколько % сократилась выдача), сколько Forms/Templates отсечено.
+
+Начни с get_index_info(), затем rlm_help(helpers=['find_definition','get_module_outline','git_search'])
+для рецептов и сигнатур.
+
+Дай итоговую сводку со всеми цифрами. Сохрани файл с анализом в текущий рабочий каталог своими
+инструментами (НЕ через rlm_execute).
+
+## ВАЖНЫЕ ПРАВИЛА
+1. Каждый rlm_execute должен батчить несколько связанных операций. Плохо: один вызов на один хелпер.
+2. Переменные сохраняются между вызовами rlm_execute.
+3. Используй print() для вывода результатов (только сводки/счётчики, не дампы).
+4. В конце ОБЯЗАТЕЛЬНО вызови rlm_end.
+```
+
+---
+
+## What it covers
+
+| Аспект | Helper / поле |
+|--------|----------------|
+| Где определён метод (1 кандидат) | `find_definition`, `_meta.unique=True` |
+| Одноимённые объектные методы (N кандидатов) | `find_definition` без hint, `total`, `truncated`, `_meta.unique=False` |
+| Сужение по модулю/объекту | `find_definition(name, module_hint)`, `_meta.hint_applied=True` |
+| Регистронезависимость кириллицы | `_meta.slow_fallback=True` (py_lower-проход на промахе NOCASE) |
+| Пустой/несуществующий | `total=0` (валидно) / `{error, hint}` для пустого имени |
+| Контракт записи | `params` = list[str]; `category`/`object_name`/`module_type` |
+| Скелет модуля (дерево #Область) | `get_module_outline`, `outline[].children`, `totals` |
+| Карта верхнего уровня (без тел) | `get_module_outline(include_methods=False)` |
+| Методы вне областей | `orphan_methods` |
+| Источник данных дерева | `_meta.index_used` / `fallback_reason` |
+| Полнотекст без шума (любая глубина) | `git_search(exclude_path='Forms,Templates')` |
+| Отсечение файла на глубине | `exclude_path='ConfigDumpInfo.xml'` |
+| Валидация exclude (литерал) | `exclude_path='a*'` → `[{error}]` |
+| Связка примитивов | `git_search` → `find_definition` → `get_module_outline` → `read_procedure` → `find_callers_context` |
+
+## Expected results
+
+Числа зависят от конфигурации; важна ФОРМА результата (read-only слой, builder_version=14, реиндекс НЕ нужен):
+
+| Metric | Expected |
+|--------|----------|
+| `find_definition('ОбработкаПроведения')` (или иной одноимённый) | `total` ≫ 1 (десятки-сотни), `_meta.unique=False`; `truncated=True` при `total > limit` |
+| `find_definition(name, 'Документ.X')` | `total=1`, `_meta.unique=True`, `_meta.hint_applied=True` |
+| lowercase-кириллица | находит определения, `_meta.slow_fallback=True` |
+| `find_definition('')` / несуществующий | `{error}` / `total=0` (НЕ ошибка) |
+| `definitions[].params` | `list[str]` |
+| `get_module_outline(big_module)` | `totals.regions` ≥ 2, дерево с вложенностью (`children`), `_meta.index_used=True` |
+| `include_methods=False` | нет ключей `methods`/`orphan_methods`, есть `totals` |
+| `git_search(token, exclude_path='Forms,Templates')` | файлы из `*/Forms/*` и `*/Templates/*` отсутствуют; число файлов уменьшается |
+| `git_search(token, exclude_path='a*')` | `[{error: ...}]` (без молчаливого расширения) |
+| git_search недоступен | источник не под git → пункт 4 пропущен (это нормально) |
+

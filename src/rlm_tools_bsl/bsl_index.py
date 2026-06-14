@@ -1547,12 +1547,47 @@ def _sanitize_grep_file_types(file_types) -> list[str] | None:
     return out
 
 
+def _sanitize_grep_excludes(exclude_path) -> list[str] | None:
+    """Normalise a user-supplied ``exclude_path`` filter into a list of literal
+    subtrees/files to drop from the search.
+
+    Accepts a comma-separated string (``"Forms,Templates"``) or an iterable of
+    strings. Returns:
+      * ``[]`` — empty/unset → no exclusion.
+      * a list of cleaned literal paths (no leading/trailing ``/``) — valid.
+      * ``None`` — at least one element is malformed/unsafe. We reject the whole
+        call rather than silently dropping the bad element, because a silent drop
+        could widen the result set past what the caller asked to exclude.
+
+    Each element runs through :func:`_sanitize_grep_path` (same safety rules:
+    backslashes, pathspec magic, drive prefixes, ``..``/``.``, glob metachars are
+    all rejected). The input stays **literal** — glob is used only internally, by
+    :func:`_git_grep`, to expand each name into an "at any depth" exclusion.
+    """
+    raw = exclude_path or ""
+    if isinstance(raw, str):
+        items = [t.strip() for t in raw.split(",")]
+    else:
+        items = [str(t).strip() for t in raw]
+    items = [t for t in items if t]
+    if not items:
+        return []  # unset → no exclusion
+    out: list[str] = []
+    for it in items:
+        cleaned = _sanitize_grep_path(it)  # reuse the same safety rules as ``path``
+        if not cleaned:  # None (malformed) or "" (empty) — both invalid for exclude
+            return None
+        out.append(cleaned)
+    return out
+
+
 def _git_grep(
     base_path: str,
     pattern: str,
     *,
     path: str | None = None,
     file_types=None,
+    exclude_path: str | None = None,
     literal_files: list[str] | None = None,
     regex: bool = False,
     ignore_case: bool = False,
@@ -1574,6 +1609,14 @@ def _git_grep(
         ``-F``/``-E`` only; ``-P``/PCRE is avoided (optional git build feature).
       * *path* / *file_types* — scoped pathspec filter (composed as
         ``{path}/*.{ext}`` so multiple file types don't OR-leak outside *path*).
+      * *exclude_path* — comma-separated list of **literal** directory/file names
+        to drop from the search. Each name is expanded to an "at any depth"
+        exclusion via ``:(glob,exclude)**/{name}/**`` (dir contents) plus
+        ``:(glob,exclude)**/{name}`` (the node itself), so a nested ``Forms`` is
+        excluded just like a top-level one. Applied only on the *path*/*file_types*
+        (non-``literal_files``) branch; a malformed element → ``None`` (whole call
+        fails rather than silently widening). When the positive scope is the whole
+        config, an explicit ``.`` is added so git has a positive set to subtract from.
       * *literal_files* — a trusted, exact list of base-relative files (from the
         index) to restrict the search to; passed via ``:(literal)`` magic so a
         filename containing ``*`` or ``:`` can't act as a glob. When provided,
@@ -1609,6 +1652,8 @@ def _git_grep(
     if literal_files is not None:
         if not literal_files:
             return []  # explicit empty candidate set → nothing to search
+        # literal_files is an exact, trusted set → exclude_path does not apply here
+        # (it is sanitised/applied only on the path/file_types branch below).
         pathspecs = [f":(literal){f}" for f in literal_files]
     else:
         san_path = _sanitize_grep_path(path)
@@ -1617,6 +1662,9 @@ def _git_grep(
         exts = _sanitize_grep_file_types(file_types)
         if exts is None:
             return None  # malformed file_types
+        exclude_specs = _sanitize_grep_excludes(exclude_path)
+        if exclude_specs is None:
+            return None  # malformed exclude filter → error, not silent widening
         if san_path and exts:
             pathspecs = [f"{san_path}/*.{ext}" for ext in exts]
         elif exts:
@@ -1625,6 +1673,17 @@ def _git_grep(
             pathspecs = [san_path]
         else:
             pathspecs = []  # whole config
+        # Exclude zones: literal names expanded to "any depth" via glob pathspec.
+        # A magic-free ``:(exclude)Forms`` anchors at the repo root and would NOT
+        # drop a nested ``*/Forms/*``; ``:(glob,exclude)**/Forms/**`` does. Git's
+        # exclude magic only subtracts from a positive set, so when the scope is
+        # the whole config (no positive pathspec) add an explicit ``.`` first.
+        if exclude_specs:
+            if not pathspecs:
+                pathspecs = ["."]
+            for e in exclude_specs:
+                pathspecs.append(f":(glob,exclude)**/{e}/**")  # dir contents, any depth
+                pathspecs.append(f":(glob,exclude)**/{e}")  # file/dir node, any depth
 
     output_flag = "-l" if mode == "files" else "-n"
     grep_cmd = [*cmd, "grep", "-z", "--untracked", "--no-color", "-I", output_flag]
@@ -7460,6 +7519,176 @@ class IndexReader:
                 }
                 for r in rows
             ]
+
+    def get_definitions(self, name: str, module_hint: str = "", limit: int = 50) -> dict | None:
+        """Find every place a method ``name`` is defined (forward go-to-definition).
+
+        The forward complement of the reverse call-graph lookup: a direct
+        ``methods JOIN modules`` seek by name, optionally narrowed by
+        ``module_hint`` (the same three forms ``find_callers`` accepts: rel_path,
+        ``Документ.X`` / ``Document.X``, or a bare object name). Unlike
+        ``_resolve_target_key`` this does NOT force a single result — a same-named
+        method in many objects (``ОбработкаПроведения``) is the norm in 1С, so all
+        candidates are returned, capped by ``limit``.
+
+        Returns:
+            ``{"rows": [...], "total": int, "truncated": bool, "slow_fallback": bool}``
+            — ``rows`` capped to ``limit`` (each a raw dict; ``params`` is the
+            stored string, normalised to ``list[str]`` at the helper border);
+            ``total`` is **exact**; ``truncated`` flags the ``limit+1`` probe;
+            ``slow_fallback`` flags the rare Cyrillic ``py_lower`` rescan.
+
+            ``None`` on ``OperationalError`` (corrupt/missing core tables) —
+            distinct from a valid empty result ``{"rows": [], "total": 0, ...}``
+            ("no such method"). The helper routes ``None`` to live fallback rather
+            than reporting a silent false-negative.
+
+        Perf (EXPLAIN, builder v14, production-sized ERP indexes): the name predicate is
+        ``= ? COLLATE NOCASE`` → ``SEARCH m USING idx_meth_name`` (~3 ms seek), NOT
+        ``py_lower(m.name)`` which disables the index → SCAN ~700 ms.
+        """
+        rel_hint, category, object_name = _normalize_module_hint(module_hint)
+
+        base = (
+            "SELECT mod.rel_path, mod.category, mod.object_name, mod.module_type, "
+            "m.name, m.type, m.is_export, m.line, m.end_line, m.params "
+            "FROM methods m JOIN modules mod ON mod.id = m.module_id "
+        )
+
+        def _where(name_pred: str) -> tuple[str, list]:
+            # Shared WHERE builder: the name predicate (``name_pred``) plus the
+            # optional module_hint filter (same forms as ``_resolve_target_key``).
+            # ``name`` is always the first bound param of ``name_pred``.
+            clauses = [name_pred]
+            params: list = [name]
+            if rel_hint is not None:
+                clauses.append("mod.rel_path = ?")
+                params.append(rel_hint)
+            elif category is not None and object_name is not None:
+                clauses.append("mod.category = ? AND py_lower(mod.object_name) = py_lower(?)")
+                params.extend([category, object_name])
+            elif object_name is not None:
+                clauses.append("py_lower(mod.object_name) = py_lower(?)")
+                params.append(object_name)
+            return " AND ".join(clauses), params
+
+        with self._lock:
+            try:
+                # Primary: NOCASE index seek (~3 ms).
+                where, params = _where("m.name = ? COLLATE NOCASE")
+                sql = base + "WHERE " + where + " ORDER BY mod.rel_path, m.line LIMIT ?"
+                rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+
+                slow_fallback = False
+                # Cyrillic rescan: NOCASE folds only ASCII, so a lowercase Cyrillic
+                # input misses the canonical PascalCase name. Pay one py_lower SCAN
+                # ONLY on an empty result with a non-ASCII name (rare). No casefold
+                # gate (it would suppress the rescan for already-lowercase input).
+                if not rows and not name.isascii():
+                    # Flag marks that the SCAN was PAID — set it whether or not the
+                    # rescan finds rows (a missing Cyrillic name still pays the SCAN).
+                    slow_fallback = True
+                    where, params = _where("py_lower(m.name) = py_lower(?)")
+                    sql = base + "WHERE " + where + " ORDER BY mod.rel_path, m.line LIMIT ?"
+                    rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+
+                truncated = len(rows) > limit
+                kept = rows[:limit]
+                if truncated:
+                    # Exact total via COUNT with the SAME predicate/hint (NOCASE
+                    # seek ~3 ms) — only in the rare truncated case.
+                    name_pred = "py_lower(m.name) = py_lower(?)" if slow_fallback else "m.name = ? COLLATE NOCASE"
+                    cwhere, cparams = _where(name_pred)
+                    csql = (
+                        "SELECT COUNT(*) AS c FROM methods m JOIN modules mod ON mod.id = m.module_id WHERE " + cwhere
+                    )
+                    total = self._conn.execute(csql, cparams).fetchone()["c"]
+                else:
+                    total = len(kept)
+            except sqlite3.OperationalError:
+                return None
+
+        return {
+            "rows": [
+                {
+                    "rel_path": r["rel_path"],
+                    "category": r["category"],
+                    "object_name": r["object_name"],
+                    "module_type": r["module_type"],
+                    "name": r["name"],
+                    "type": r["type"],
+                    "is_export": bool(r["is_export"]),
+                    "line": r["line"],
+                    "end_line": r["end_line"],
+                    "params": r["params"],
+                }
+                for r in kept
+            ],
+            "total": total,
+            "truncated": truncated,
+            "slow_fallback": slow_fallback,
+        }
+
+    def get_outline_data(self, rel_path: str) -> dict | None:
+        """Atomically read everything needed to build a module outline tree.
+
+        One lock, three reads (module row + regions + methods **incl. ``loc``**) so
+        the helper can rebuild the ``#Область`` tree without touching
+        ``get_methods_by_path`` (whose contract omits ``loc``).
+
+        Returns:
+            ``{"module": {category, object_name, module_type} | None,
+               "regions": [{name, line, end_line}],
+               "methods": [{name, type, is_export, line, end_line, loc}]}``
+
+            * ``module`` is ``None`` when ``rel_path`` is not in ``modules`` (a
+              valid "not indexed" answer — the helper routes it to live fallback).
+            * ``regions`` ``end_line`` may be NULL (unclosed ``#Область``).
+
+            ``None`` (sentinel) when ``regions`` is missing/unreadable
+            (``OperationalError`` on an old pre-v8 index, or corrupt core) —
+            distinct from a valid empty ``regions`` list ("flat module, 0
+            regions"). The helper routes the sentinel to live fallback so it never
+            builds a silently-incomplete outline.
+        """
+        with self._lock:
+            try:
+                mod_row = self._conn.execute(
+                    "SELECT id, category, object_name, module_type FROM modules WHERE rel_path = ?",
+                    (rel_path,),
+                ).fetchone()
+                if mod_row is None:
+                    return {"module": None, "regions": [], "methods": []}
+                mid = mod_row["id"]
+                reg_rows = self._conn.execute(
+                    "SELECT name, line, end_line FROM regions WHERE module_id = ? ORDER BY line",
+                    (mid,),
+                ).fetchall()
+                meth_rows = self._conn.execute(
+                    "SELECT name, type, is_export, line, end_line, loc FROM methods WHERE module_id = ? ORDER BY line",
+                    (mid,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None  # regions table absent (old index) or corrupt core → go live
+            return {
+                "module": {
+                    "category": mod_row["category"],
+                    "object_name": mod_row["object_name"],
+                    "module_type": mod_row["module_type"],
+                },
+                "regions": [{"name": r["name"], "line": r["line"], "end_line": r["end_line"]} for r in reg_rows],
+                "methods": [
+                    {
+                        "name": r["name"],
+                        "type": r["type"],
+                        "is_export": bool(r["is_export"]),
+                        "line": r["line"],
+                        "end_line": r["end_line"],
+                        "loc": r["loc"],
+                    }
+                    for r in meth_rows
+                ],
+            }
 
     def _resolve_target_key(self, proc_name: str, module_hint: str) -> str | None:
         """Resolve a query target to a single stable ``callee_key`` (or None).

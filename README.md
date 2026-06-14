@@ -207,7 +207,7 @@ rlm_start(project="My Config", query="find module...")
 
 ## Как работает (под капотом)
 
-Шесть MCP-инструментов (`rlm_projects`, `rlm_index`, `rlm_start` → `rlm_help` → `rlm_execute` → `rlm_end`), песочница с **59 хелперами** (49 BSL-специфичных + 8 стандартных + 2 LLM), сессионные кэши, таймауты, безопасность, пример построения графа вызовов на крупной конфигурации (23K+ файлов) — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+Шесть MCP-инструментов (`rlm_projects`, `rlm_index`, `rlm_start` → `rlm_help` → `rlm_execute` → `rlm_end`), песочница с **61 хелпером** (51 BSL-специфичных + 8 стандартных + 2 LLM), сессионные кэши, таймауты, безопасность, пример построения графа вызовов на крупной конфигурации (23K+ файлов) — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 Полный список хелперов — **[docs/HELPERS.md](docs/HELPERS.md)** | Совместное использование с RAG — **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#совместное-использование-с-rag)**
 

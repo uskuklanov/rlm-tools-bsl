@@ -17,6 +17,7 @@ import pytest
 import rlm_tools_bsl.bsl_index as bsl_index_mod
 from rlm_tools_bsl.bsl_index import (
     _git_grep,
+    _sanitize_grep_excludes,
     _sanitize_grep_file_types,
     _sanitize_grep_path,
 )
@@ -478,3 +479,135 @@ def test_strategy_routing_note_gated_by_registry():
     assert _git_search_routing({"safe_grep": {}}) == ""
     note = _git_search_routing({"git_search": {}})
     assert "git_search" in note and "FULL-TEXT SEARCH" in note
+
+
+# ---------------------------------------------------------------------------
+# exclude_path (v1.20.0)
+# ---------------------------------------------------------------------------
+
+
+def _add_nested_form(repo: Path, tok: str = TOK) -> str:
+    """A form XML nested under a ``Forms/`` segment at depth (not top-level)."""
+    d = repo / "Documents" / "ДокС" / "Forms" / "ФормаС" / "Ext"
+    d.mkdir(parents=True)
+    (d / "Form.xml").write_text(f"<Form><DataPath>{tok}</DataPath></Form>\n", encoding="utf-8")
+    return "Documents/ДокС/Forms/ФормаС/Ext/Form.xml"
+
+
+def test_sanitize_excludes():
+    assert _sanitize_grep_excludes("") == []
+    assert _sanitize_grep_excludes(None) == []
+    assert _sanitize_grep_excludes("Forms") == ["Forms"]
+    assert _sanitize_grep_excludes("Forms,Templates") == ["Forms", "Templates"]
+    assert _sanitize_grep_excludes(["Forms", "Templates"]) == ["Forms", "Templates"]
+    assert _sanitize_grep_excludes("Forms, Templates ,ConfigDumpInfo.xml") == [
+        "Forms",
+        "Templates",
+        "ConfigDumpInfo.xml",
+    ]
+    # Any malformed element rejects the whole call (no silent narrowing-away).
+    for bad in ("../x", "a*", "Forms,a*", ":(top)", "C:/Win", "a\\b", "/"):
+        assert _sanitize_grep_excludes(bad) is None, bad
+
+
+def test_git_grep_exclude_nested_forms(repo):
+    """Codex #2: a nested ``*/Forms/*`` must be excluded (a magic-free literal
+    ``:(exclude)Forms`` would NOT drop it — it anchors at the repo root)."""
+    nested = _add_nested_form(repo)
+    base = {h["file"] for h in _git_grep(str(repo), TOK, mode="files")}
+    assert nested in base  # present without exclude
+    excluded = {h["file"] for h in _git_grep(str(repo), TOK, mode="files", exclude_path="Forms")}
+    assert nested not in excluded  # dropped at depth
+    # Non-Forms matches survive…
+    assert any(f.endswith("Module.bsl") for f in excluded)
+    # …including a top-level Form.xml that is NOT under a Forms/ dir (segment-exact,
+    # not a "Form" substring match).
+    assert any(f.endswith("ТестовыйДокумент/Ext/Form.xml") for f in excluded)
+
+
+def test_git_grep_exclude_whole_config(repo):
+    """exclude over the whole config (no positive path) still applies (the
+    internal positive '.' makes git's exclude magic subtract from everything)."""
+    nested = _add_nested_form(repo)
+    out = {h["file"] for h in _git_grep(str(repo), TOK, mode="files", exclude_path="Forms")}
+    assert out and nested not in out
+
+
+def test_git_grep_exclude_with_path(repo):
+    nested = _add_nested_form(repo)
+    out = {h["file"] for h in _git_grep(str(repo), TOK, path="Documents", mode="files", exclude_path="Forms")}
+    assert nested not in out
+    assert out and all(f.startswith("Documents/") for f in out)
+
+
+def test_git_grep_exclude_with_file_types(repo):
+    _add_nested_form(repo)
+    out = {h["file"] for h in _git_grep(str(repo), TOK, file_types="xml", mode="files", exclude_path="Forms")}
+    assert out and all(f.endswith(".xml") for f in out)
+    assert not any("/Forms/" in f for f in out)
+
+
+def test_git_grep_exclude_file_at_any_depth(repo):
+    """A bare filename excludes that file at any depth (e.g. ConfigDumpInfo.xml)."""
+    d = repo / "Sub" / "Deep"
+    d.mkdir(parents=True)
+    (d / "ConfigDumpInfo.xml").write_text(f"<x>{TOK}</x>\n", encoding="utf-8")
+    full = {h["file"] for h in _git_grep(str(repo), TOK, mode="files")}
+    assert "Sub/Deep/ConfigDumpInfo.xml" in full
+    out = {h["file"] for h in _git_grep(str(repo), TOK, mode="files", exclude_path="ConfigDumpInfo.xml")}
+    assert out and "Sub/Deep/ConfigDumpInfo.xml" not in out
+
+
+def test_git_grep_exclude_multiple(repo):
+    nested = _add_nested_form(repo)
+    tdir = repo / "Documents" / "ДокТ" / "Templates" / "Макет" / "Ext"
+    tdir.mkdir(parents=True)
+    (tdir / "Template.xml").write_text(f"<x>{TOK}</x>\n", encoding="utf-8")
+    tpath = "Documents/ДокТ/Templates/Макет/Ext/Template.xml"
+    out = {h["file"] for h in _git_grep(str(repo), TOK, mode="files", exclude_path="Forms,Templates")}
+    assert out and nested not in out and tpath not in out
+
+
+def test_git_grep_exclude_malformed_returns_none(repo):
+    assert _git_grep(str(repo), TOK, exclude_path="../x") is None
+    assert _git_grep(str(repo), TOK, exclude_path="a*") is None
+    assert _git_grep(str(repo), TOK, exclude_path="Forms,:(top)") is None
+
+
+def test_git_grep_literal_files_ignores_exclude(repo):
+    """The literal_files branch is exact; exclude_path is NOT applied there, so
+    safe_grep (which always uses literal_files) is unaffected by exclude."""
+    nested = _add_nested_form(repo)
+    hits = _git_grep(str(repo), TOK, literal_files=[nested], mode="files", exclude_path="Forms")
+    assert [h["file"] for h in hits] == [nested]
+
+
+def test_git_grep_literal_files_ignores_even_malformed_exclude(repo):
+    """exclude_path is sanitised/applied ONLY on the non-literal_files branch, so
+    even a malformed exclude_path must be ignored (not → None) with literal_files."""
+    target = "CommonModules/МойМодуль/Ext/Module.bsl"
+    hits = _git_grep(str(repo), TOK, literal_files=[target], mode="files", exclude_path="a*")
+    assert [h["file"] for h in hits] == [target]  # malformed exclude ignored, not an error
+
+
+def test_git_search_exclude_path_helper(repo):
+    bsl = _make_bsl(repo)
+    nested = _add_nested_form(repo)
+    out = bsl["git_search"](TOK, exclude_path="Forms")
+    files = {h.get("file") for h in out if "file" in h}
+    assert nested not in files
+    assert any(str(f).endswith("Module.bsl") for f in files)
+
+
+def test_git_search_exclude_malformed_error(repo):
+    bsl = _make_bsl(repo)
+    assert bsl["git_search"](TOK, exclude_path="a*") == [{"error": "git grep failed or timed out"}]
+
+
+def test_git_search_positional_compat_unchanged(repo):
+    """exclude_path added at the END → the 4th positional is still ``regex`` (Codex #1)."""
+    bsl = _make_bsl(repo)
+    hits = bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", True, mode="files")
+    assert any(str(h.get("file", "")).endswith("Module.bsl") for h in hits)
+    # Same positional call with regex=False → the metachar pattern matches nothing literally.
+    assert bsl["git_search"]("VIN.OKEN", "CommonModules", "bsl", False, mode="files") == []

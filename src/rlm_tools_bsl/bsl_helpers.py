@@ -166,6 +166,151 @@ def build_helper_metadata_snapshot() -> dict[str, dict]:
         return snapshot
 
 
+def _module_meta_from_path(rel_path: str, base_path: str) -> dict:
+    """Best-effort module identity ``{category, object_name, module_type}`` derived
+    structurally from a rel_path via ``parse_bsl_path`` — no index / ``_index_state``
+    needed. Used by the live (no-index) paths of ``find_definition`` /
+    ``get_module_outline`` so their declared metadata fields are filled even on a
+    direct call where the live file index has not been populated yet.
+    """
+    try:
+        from rlm_tools_bsl.format_detector import parse_bsl_path
+
+        info = parse_bsl_path(rel_path, base_path)
+        return {
+            "category": info.category,
+            "object_name": info.object_name,
+            "module_type": info.module_type,
+        }
+    except Exception:
+        return {"category": None, "object_name": None, "module_type": None}
+
+
+def _build_outline_tree(
+    regions: list[dict], methods: list[dict], include_methods: bool = True
+) -> tuple[list[dict], list[dict]]:
+    """Rebuild the ``#Область`` tree from flat ``[line, end_line]`` intervals (pure).
+
+    The index stores regions/methods flat (no parent links), but every region and
+    method carries ``[line, end_line]``, so nesting is reconstructed on the fly by
+    interval containment — no BUILDER_VERSION bump.
+
+    Args:
+        regions: ``[{name, line, end_line}]`` — ``end_line`` may be ``None`` for an
+            unclosed ``#Область``.
+        methods: ``[{name, type, is_export, line, end_line, loc?}]``.
+        include_methods: when ``False``, leaf methods/orphans are dropped from the
+            output (only the region tree + per-region totals remain).
+
+    Returns ``(outline, orphan_methods)``:
+        * ``outline`` — list of root region nodes, each
+          ``{region, line, end_line, totals:{methods, exports}, children:[...],
+          methods:[...]}`` (``methods`` present only when *include_methods*).
+          Per-region ``totals`` are aggregated bottom-up (descendants included).
+        * ``orphan_methods`` — methods outside every region (same method shape);
+          empty when *include_methods* is ``False``.
+
+    Determinism: stable sorts with index tie-breaks → identical input yields an
+    identical tree. ``end_line=None`` is treated as ``+inf`` for **containment
+    only** (an unclosed region spans to EOF); the reported ``end_line`` stays
+    ``None``. Crossing (non-nested) intervals → the inner one is treated as a root.
+    """
+    inf = float("inf")
+
+    def _eff_end(end) -> float:
+        return end if end is not None else inf
+
+    # Region node scaffold (private keys stripped before return).
+    nodes: list[dict] = [
+        {
+            "region": r["name"],
+            "line": r["line"],
+            "end_line": r["end_line"],
+            "_eff_end": _eff_end(r["end_line"]),
+            "children": [],
+            "methods": [],
+            "_own_methods": 0,
+            "_own_exports": 0,
+        }
+        for r in regions
+    ]
+
+    # --- Build the tree via a stack over (line asc, span desc, idx) order ---
+    # Outer region precedes an inner one starting on the same line; the stack
+    # holds the current ancestor chain. A region that the stack-top does NOT
+    # contain pops ancestors until a container is found (or it becomes a root) —
+    # this also degrades crossing intervals to roots, deterministically.
+    order = sorted(range(len(nodes)), key=lambda i: (nodes[i]["line"], -nodes[i]["_eff_end"], i))
+    roots: list[dict] = []
+    stack: list[dict] = []
+    for idx in order:
+        node = nodes[idx]
+        while stack and not (stack[-1]["line"] <= node["line"] and node["_eff_end"] <= stack[-1]["_eff_end"]):
+            stack.pop()
+        if stack:
+            stack[-1]["children"].append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+
+    # --- Assign each method to the innermost containing region (or orphan) ---
+    orphan_methods: list[dict] = []
+    for m in methods:
+        m_eff_end = _eff_end(m.get("end_line"))
+        host: dict | None = None
+        host_key = None
+        for i, node in enumerate(nodes):
+            if node["line"] <= m["line"] and m_eff_end <= node["_eff_end"]:
+                # innermost = largest line, then smallest span; idx tie-break = determinism
+                key = (node["line"], -node["_eff_end"], i)
+                if host is None or key > host_key:
+                    host, host_key = node, key
+        mrow = {
+            "name": m["name"],
+            "type": m.get("type"),
+            "is_export": bool(m.get("is_export")),
+            "line": m.get("line"),
+            "end_line": m.get("end_line"),
+            "loc": m.get("loc"),
+        }
+        if host is None:
+            orphan_methods.append(mrow)
+        else:
+            host["methods"].append(mrow)
+            host["_own_methods"] += 1
+            if mrow["is_export"]:
+                host["_own_exports"] += 1
+
+    # --- Bottom-up totals (a parent's totals include all descendants') ---
+    def _aggregate(node: dict) -> tuple[int, int]:
+        tm, te = node["_own_methods"], node["_own_exports"]
+        for ch in node["children"]:
+            cm, ce = _aggregate(ch)
+            tm += cm
+            te += ce
+        node["totals"] = {"methods": tm, "exports": te}
+        return tm, te
+
+    for root in roots:
+        _aggregate(root)
+
+    # --- Strip private keys; honor include_methods ---
+    def _clean(node: dict) -> dict:
+        out = {
+            "region": node["region"],
+            "line": node["line"],
+            "end_line": node["end_line"],
+            "totals": node["totals"],
+            "children": [_clean(ch) for ch in node["children"]],
+        }
+        if include_methods:
+            out["methods"] = node["methods"]
+        return out
+
+    outline = [_clean(r) for r in roots]
+    return outline, (orphan_methods if include_methods else [])
+
+
 def make_bsl_helpers(
     base_path: str,
     resolve_safe,  # callable: str -> pathlib.Path
@@ -873,6 +1018,7 @@ def make_bsl_helpers(
         ignore_case: bool = False,
         mode: str = "lines",
         max_results: int = 200,
+        exclude_path: str = "",
     ) -> list[dict]:
         """Full-text search across ALL files under git (opt-in, only when the
         sources are a git work-tree).
@@ -896,6 +1042,14 @@ def make_bsl_helpers(
                 (cheap overview — use first on common tokens, then drill down).
             max_results: cap; when hit, the last element is
                 ``{"_truncated": True, "shown": max_results}``.
+            exclude_path: optional comma-separated list of **literal** directory/
+                file names to drop from the search (e.g. ``"Forms,Templates"`` or
+                ``"ConfigDumpInfo.xml"``). Matched at **any depth** — a nested
+                ``*/Forms/*`` is excluded just like a top-level ``Forms``. Glob
+                metachars are rejected (literal only, like *path*); a malformed
+                element → ``[{"error": ...}]`` rather than a silently widened
+                search. Applied on top of the positive scope; with no positive
+                scope the exclusion spans the whole tree.
 
         Returns the hit list, or ``[{"error": ...}]`` if git grep failed / timed
         out / a filter was malformed (distinct from ``[]`` = nothing found).
@@ -919,6 +1073,7 @@ def make_bsl_helpers(
             pattern,
             path=path,
             file_types=file_types,
+            exclude_path=exclude_path,
             regex=regex,
             ignore_case=ignore_case,
             mode=mode,
@@ -1745,6 +1900,256 @@ def make_bsl_helpers(
             "depth": len(path) - 1,
             "_meta": _meta,
         }
+
+    def find_definition(name: str, module_hint: str = "", limit: int = 50) -> dict:
+        """Where a method is defined — forward complement of find_callers_context.
+
+        Lists every module that defines a procedure/function ``name`` (case-
+        insensitive), optionally narrowed by ``module_hint`` (the same three forms
+        find_callers_context accepts: rel_path, ``Документ.X``/``Document.X``, or a
+        bare object name). Same-named methods across many objects
+        (``ОбработкаПроведения`` in every document) are the norm in 1С, so all
+        candidates are returned (capped by ``limit``) — narrow with ``module_hint``
+        to pin a single one.
+
+        Returns:
+            {
+              "name": <queried name>,
+              "definitions": [{file, line, end_line, type, is_export,
+                               params (list[str]), category, object_name,
+                               module_type}],
+              "total": int, "truncated": bool,
+              "_meta": {"index_used", "unique", "hint_applied", "slow_fallback"}
+            }
+            Empty result → ``definitions: [], total: 0`` (NOT an error). A blank
+            ``name`` → ``{"error", "hint"}`` (git_search style). ``hint_applied``
+            means "a module_hint filter WAS applied to the query" (deterministic),
+            not "the hint changed the row count". Without an index, a hint giving a
+            module/object is required (live via extract_procedures); no hint →
+            ``{"error": "no index", ...}``.
+        """
+        if not name or not name.strip():
+            return {
+                "error": "empty name",
+                "hint": "задайте имя метода (без скобок); для поиска по тексту — git_search / safe_grep.",
+            }
+        name = name.strip()
+
+        from rlm_tools_bsl.bsl_index import _normalize_module_hint
+
+        rel_hint, category, object_name = _normalize_module_hint(module_hint)
+        # hint_applied = "фильтр по hint применён к запросу" (детерминировано),
+        # а НЕ "hint изменил число результатов" (последнее без доп. запроса не узнать).
+        hint_applied = bool(rel_hint or category or object_name)
+
+        def _live_row(proc: dict, file_path: str, mod: dict | None) -> dict:
+            # rel_path branch passes mod=None → derive identity structurally from
+            # the path so category/object_name/module_type are filled (parity with
+            # the index path and the object-name fallback, which carry a mod dict).
+            meta = mod if mod is not None else _module_meta_from_path(file_path, base_path)
+            return {
+                "file": file_path,
+                "line": proc.get("line"),
+                "end_line": proc.get("end_line"),
+                "type": proc.get("type"),
+                "is_export": bool(proc.get("is_export")),
+                "params": proc.get("params") if isinstance(proc.get("params"), list) else [],
+                "category": meta.get("category"),
+                "object_name": meta.get("object_name"),
+                "module_type": meta.get("module_type"),
+            }
+
+        # --- Index path ---
+        if idx_reader is not None:
+            res = idx_reader.get_definitions(name, module_hint, limit)
+            if res is not None:
+                # res is a valid result (possibly empty) — NOT a broken index.
+                _normalize_method_params(res["rows"])  # str params -> list[str] in place
+                definitions = [
+                    {
+                        "file": r["rel_path"],
+                        "line": r["line"],
+                        "end_line": r["end_line"],
+                        "type": r["type"],
+                        "is_export": r["is_export"],
+                        "params": r["params"],
+                        "category": r["category"],
+                        "object_name": r["object_name"],
+                        "module_type": r["module_type"],
+                    }
+                    for r in res["rows"]
+                ]
+                total = res["total"]
+                return {
+                    "name": name,
+                    "definitions": definitions,
+                    "total": total,
+                    "truncated": res["truncated"],
+                    "_meta": {
+                        "index_used": True,
+                        "unique": total == 1,
+                        "hint_applied": hint_applied,
+                        "slow_fallback": res["slow_fallback"],
+                    },
+                }
+            # res is None → corrupt/missing core tables → fall through to live.
+
+        # --- Live fallback (no index, or broken core index) ---
+        # Без индекса нет глобального списка методов: live-поиск возможен только
+        # при подсказке, дающей конкретный модуль (rel_path) или объект.
+        if rel_hint is not None:
+            try:
+                procs = extract_procedures(rel_hint)
+            except Exception:
+                procs = []
+            definitions = [_live_row(p, rel_hint, None) for p in procs if p["name"].casefold() == name.casefold()]
+        elif object_name is not None:
+            definitions = []
+            for mod in find_module(object_name):
+                if category is not None and (mod.get("category") or "").casefold() != category.casefold():
+                    continue
+                mpath = mod["path"]
+                try:
+                    procs = extract_procedures(mpath)
+                except Exception:
+                    continue
+                definitions.extend(_live_row(p, mpath, mod) for p in procs if p["name"].casefold() == name.casefold())
+        else:
+            return {
+                "error": "no index",
+                "hint": "уточните module_hint (Документ.X / rel_path / имя объекта) или соберите индекс (rlm_index build).",
+            }
+
+        return {
+            "name": name,
+            "definitions": definitions,
+            "total": len(definitions),
+            "truncated": False,
+            "_meta": {
+                "index_used": False,
+                "unique": len(definitions) == 1,
+                "hint_applied": hint_applied,
+                "slow_fallback": False,
+            },
+        }
+
+    def get_module_outline(path: str, include_methods: bool = True) -> dict:
+        """Cheap structural 'skeleton' of a module — the ``#Область`` tree plus
+        aggregates — as a first hop before reading bodies.
+
+        Where ``extract_procedures`` returns a flat method list, this shows the
+        region hierarchy (which method lives in which ``#Область``, nested), and
+        per-region/per-module aggregates ({methods, exports, regions, loc}) so the
+        agent can decide where to drill without reading a 5–15K-line module.
+
+        Args:
+            path: rel_path of the module (e.g. from ``find_module(...)[i]['path']``).
+            include_methods: ``True`` (default) → include leaf methods + orphans;
+                ``False`` → region tree + totals only (even cheaper top-level map).
+
+        Returns:
+            {
+              "path", "category", "object_name", "module_type",
+              "totals": {"methods", "exports", "regions", "loc"},
+              "outline": [{region, line, end_line, totals:{methods, exports},
+                           children:[...], methods:[...]}],   # methods iff include_methods
+              "orphan_methods": [...],                        # present iff include_methods
+              "_meta": {"index_used": bool, "fallback_reason": str | None}
+            }
+
+        ``_meta`` mirrors ``get_object_full_structure``: ``index_used=True`` → tree
+        built from the index; otherwise ``fallback_reason`` is one of
+        ``'index_unavailable_or_table_missing'`` (no/old index, missing regions
+        table, or module not indexed), ``'index_empty_for_module'`` (module row
+        present but no methods — live safety net), or ``'parse_failed: …'``.
+        """
+
+        def _resolve_meta_live() -> dict:
+            # Best-effort module identity. Prefer the live file index when it is
+            # already populated (it matches the index path); otherwise derive the
+            # identity structurally from the path so a DIRECT call (no prior
+            # find_module → ``_index_state`` still empty, since the live path does
+            # not call ``_ensure_index``) still fills category/object_name/module_type.
+            for rp, info in _index_state:
+                if rp == path:
+                    return {
+                        "category": info.category,
+                        "object_name": info.object_name,
+                        "module_type": info.module_type,
+                    }
+            return _module_meta_from_path(path, base_path)
+
+        def _assemble(regions: list, methods: list, meta: dict, index_used: bool, fallback_reason) -> dict:
+            outline, orphans = _build_outline_tree(regions, methods, include_methods)
+            totals = {
+                "methods": len(methods),
+                "exports": sum(1 for m in methods if m.get("is_export")),
+                "regions": len(regions),
+                "loc": sum((m.get("loc") or 0) for m in methods),
+            }
+            resp = {
+                "path": path,
+                "category": meta.get("category"),
+                "object_name": meta.get("object_name"),
+                "module_type": meta.get("module_type"),
+                "totals": totals,
+                "outline": outline,
+                "_meta": {"index_used": index_used, "fallback_reason": fallback_reason},
+            }
+            if include_methods:
+                resp["orphan_methods"] = orphans
+            return resp
+
+        def _live(reason: str) -> dict:
+            # extract_procedures is self-healing; _parse_regions over raw lines.
+            from rlm_tools_bsl.bsl_index import _parse_regions
+
+            try:
+                procs = extract_procedures(path)
+                regions = _parse_regions(_ext_read_file(path).splitlines())
+            except Exception as exc:
+                resp = {
+                    "path": path,
+                    "category": None,
+                    "object_name": None,
+                    "module_type": None,
+                    "totals": {"methods": 0, "exports": 0, "regions": 0, "loc": 0},
+                    "outline": [],
+                    "_meta": {"index_used": False, "fallback_reason": f"parse_failed: {exc}"},
+                }
+                if include_methods:
+                    resp["orphan_methods"] = []
+                return resp
+            # Live methods carry no stored loc — approximate from the line span.
+            meths = []
+            for p in procs:
+                ln, el = p.get("line"), p.get("end_line")
+                loc = (el - ln + 1) if isinstance(ln, int) and isinstance(el, int) and el >= ln else None
+                meths.append(
+                    {
+                        "name": p.get("name"),
+                        "type": p.get("type"),
+                        "is_export": bool(p.get("is_export")),
+                        "line": ln,
+                        "end_line": el,
+                        "loc": loc,
+                    }
+                )
+            return _assemble(regions, meths, _resolve_meta_live(), False, reason)
+
+        # --- Routing (codex round-3: explicit branches, no silently-empty outline) ---
+        data = idx_reader.get_outline_data(path) if idx_reader is not None else None
+        if data is None:
+            # idx_reader is None, OR regions table missing / corrupt core → live.
+            return _live("index_unavailable_or_table_missing")
+        if data["module"] is None:
+            # Module not in the index (valid 'not indexed') → live.
+            return _live("index_unavailable_or_table_missing")
+        if not data["methods"]:
+            # Module row present but no methods (stale) → live safety net.
+            return _live("index_empty_for_module")
+        # Index path.
+        return _assemble(data["regions"], data["methods"], data["module"], True, None)
 
     # XML file names by metadata category (CF format: Ext/<name>.xml)
     _CATEGORY_XML_NAMES = {
@@ -6432,6 +6837,68 @@ def make_bsl_helpers(
         "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False — точно «не достижим».",
     )
     _reg(
+        "find_definition",
+        find_definition,
+        "find_definition(name, module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, type, "
+        "is_export, params, category, object_name, module_type}], total, truncated, "
+        "_meta:{index_used, unique, hint_applied, slow_fallback}}  "
+        "# ГДЕ ОПРЕДЕЛЁН метод (форвард-комплемент find_callers_context). Одноимённые в N объектах — норма 1С: "
+        "вернёт всех кандидатов, сужай module_hint",
+        "code",
+        [
+            "definition",
+            "определение",
+            "где определён",
+            "где определена",
+            "где объявлен метод",
+            "go to definition",
+            "find_definition",
+            "где находится метод",
+            "перейти к определению",
+        ],
+        "FIND DEFINITION (где определён метод — форвард-комплемент find_callers_context):\n"
+        "  d = find_definition('ПересчитатьИтоги')\n"
+        "  for x in d['definitions']:\n"
+        "      print(x['file'], x['line'], x['type'], 'export' if x['is_export'] else '')\n"
+        "  # Одноимённые методы (ОбработкаПроведения есть в каждом документе — 600+ кандидатов):\n"
+        "  #   сузь module_hint (rel_path | 'Документ.X' | имя объекта) → _meta.unique=True:\n"
+        "  d = find_definition('ОбработкаПроведения', 'Документ.РеализацияТоваровУслуг')\n"
+        "  # дальше: read_procedure(d['definitions'][0]['file'], 'ОбработкаПроведения')  # тело\n"
+        "  #         find_callers_context('ОбработкаПроведения', 'Документ.РеализацияТоваровУслуг')  # обратные ссылки\n"
+        "  # _meta.hint_applied — фильтр по hint применён к запросу (НЕ «hint изменил счёт»);\n"
+        "  #   total/truncated — потолок limit; _meta.slow_fallback=True — был кириллический py_lower-rescan\n"
+        "  #   (имя передано в нижнем регистре). Пустой результат → definitions:[], total:0 (не ошибка).",
+    )
+    _reg(
+        "get_module_outline",
+        get_module_outline,
+        "get_module_outline(path, include_methods=True) -> {path, category, object_name, module_type, "
+        "totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, exports}, "
+        "children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason}}  "
+        "# ДЕШЁВЫЙ СКЕЛЕТ модуля (дерево #Область + агрегаты) — первый хоп перед чтением тел",
+        "code",
+        [
+            "оглавление",
+            "структура модуля",
+            "области",
+            "outline",
+            "карта модуля",
+            "#Область",
+            "skeleton",
+            "get_module_outline",
+            "скелет модуля",
+        ],
+        "MODULE OUTLINE (дешёвая структурная карта ДО чтения тел):\n"
+        "  mods = find_module('Расчёты')\n"
+        "  if mods:\n"
+        "      o = get_module_outline(mods[0]['path'], include_methods=False)  # только области + агрегаты\n"
+        "      for r in o['outline']:\n"
+        "          print(r['region'], r['totals'])  # {'methods': N, 'exports': M}\n"
+        "      # затем нырнуть в нужную область с include_methods=True или read_procedure(path, name)\n"
+        "  # totals модуля: {methods, exports, regions, loc}; orphan_methods — код вне любой #Область.\n"
+        "  # _meta.index_used=False + fallback_reason — индекс недоступен/устарел (отработал live-парсинг).",
+    )
+    _reg(
         "find_callers",
         find_callers,
         "find_callers(proc, module_hint='', max_files=20) -> [{file, line, text}]  # COMPACT FIRST PAGE: thin wrapper над find_callers_context, default limit=20, без _meta/has_more — quick view; для полного аудита callers — find_callers_context",
@@ -7136,8 +7603,9 @@ def make_bsl_helpers(
         _reg(
             "git_search",
             git_search,
-            "git_search(pattern, path='', file_types='', regex=False, ignore_case=False, mode='lines', max_results=200)"
+            "git_search(pattern, path='', file_types='', regex=False, ignore_case=False, mode='lines', max_results=200, exclude_path='')"
             " -> [{file,line,text}] | [{file}] (mode='files'). FULL-TEXT over ALL files incl. raw XML/forms/queries."
+            " exclude_path drops noisy zones (literal names at any depth, e.g. 'Forms,Templates')."
             " Only available when sources are under git.",
             "navigation",
             [
@@ -7155,6 +7623,7 @@ def make_bsl_helpers(
             "  hits = git_search('VIN')                       # substring anywhere\n"
             "  hits = git_search('VIN', file_types='xml')     # narrow to a file type\n"
             "  hits = git_search('VIN', path='Catalogs', mode='files')  # overview: which files\n"
+            "  hits = git_search('VIN', exclude_path='Forms,Templates')  # drop noisy XML zones (any depth)\n"
             "  for h in hits:\n"
             "      print(h.get('file'), h.get('line'), h.get('text', ''))\n"
             "  # Searches CURRENT on-disk state (incl. uncommitted + new untracked); .gitignore'd skipped.\n"
