@@ -258,6 +258,39 @@ EFFORT_LEVELS = {
     ),
 }
 
+# Маркеры «сложного» (многоаспектного) запроса → effort=high при effort='auto'.
+# casefold-подстроки. НАМЕРЕННО специфичные: общие слова вроде «полный/полное/
+# целиком/по всей» исключены — они дают ложный high на простых лукапах («полный
+# список реквизитов», «полный текст процедуры», «полное имя объекта»). Это лишь
+# ДЕФОЛТ — агент может передать явный тир, админ — RLM_FORCE_EFFORT.
+_COMPLEX_QUERY_MARKERS = (
+    "жизненн",
+    "сквозн",
+    "поток данных",
+    "механизм",
+    "цепочк",
+    "иерарх",
+    "архитект",
+    "интеграц",
+    "сценари",
+    "взаимосвяз",
+    "влияни",
+    "влияет",
+    "трассир",
+    "lifecycle",
+    "data flow",
+    "end-to-end",
+    "end to end",
+)
+
+
+def _auto_effort(query: str) -> str:
+    """Глубина по тексту запроса: 'high' для многоаспектных задач, иначе 'medium'.
+    Используется когда effort='auto' (дефолт тула) и не задан RLM_FORCE_EFFORT."""
+    q = (query or "").casefold()
+    return "high" if any(m in q for m in _COMPLEX_QUERY_MARKERS) else "medium"
+
+
 _STRATEGY_HEADER = """\
 You are exploring a 1C BSL codebase via Python sandbox.
 Write Python code in rlm_execute. Use print() to output results.
@@ -1011,8 +1044,9 @@ def get_strategy(
 
     Modes:
       - ``slim`` (default, production): condensed strategy + ``rlm_help`` MCP tool.
-      - ``full``: byte-for-byte legacy strategy (safe fallback for weak models
-        and a regression baseline).
+      - ``full``: legacy strategy (safe fallback for weak models). Byte-for-byte
+        with the historical output EXCEPT the shared _extension_strategy() block,
+        which is token-bounded in both modes (see _build_full_strategy).
 
     Unknown values fall back to ``slim``.
     """
@@ -1050,7 +1084,13 @@ def _build_full_strategy(
     idx_warnings: list[str] | None = None,
     query: str = "",
 ) -> str:
-    """Legacy ("full") strategy — kept byte-for-byte as a safe fallback."""
+    """Legacy ("full") strategy — safe fallback for weak models.
+
+    NB: kept byte-for-byte EXCEPT the shared _extension_strategy() block, which is
+    now token-bounded in both modes (per-extension override counts + on-demand
+    pointer; detail via RLM_EXT_OVERRIDE_DETAIL). The old per-extension dump cost
+    ~64K chars on extension-heavy configs — unacceptable even as a fallback.
+    """
     config = EFFORT_LEVELS.get(effort, EFFORT_LEVELS["medium"])
 
     has_extensions = (
@@ -1641,6 +1681,19 @@ def list_categories() -> list[str]:
     return [k for k, _ in _CATEGORY_ORDER]
 
 
+def _ext_override_detail_budget() -> int:
+    """Сколько строк поимённых перехватов расширений включать в стратегию
+    СУММАРНО по всем расширениям. 0 (по умолчанию) — только счётчики +
+    указатель на get_overrides(). Регулируется env RLM_EXT_OVERRIDE_DETAIL."""
+    raw = os.environ.get("RLM_EXT_OVERRIDE_DETAIL", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def _extension_strategy(ext_context, ext_overrides: dict) -> str:
     """Build strategy text for extension context."""
     from rlm_tools_bsl.extension_detector import ConfigRole
@@ -1662,12 +1715,42 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             "to high-level BSL helpers (read_procedure, extract_procedures, parse_object_xml, find_attributes,\n"
             "find_predefined, search). They read extensions internally. For overrides use get_overrides/find_ext_overrides."
         )
-        # Include auto-scanned overrides per extension
+        # Per-extension COUNTS only by default. The full per-method dump used to be
+        # inlined here (max_lines=30 PER extension, no global cap) — on extension-heavy
+        # configs (УТ 11.5: 14 ext / 1258 overrides) it ballooned the strategy to ~64K
+        # chars / ~37K tokens and was re-paid on EVERY rlm_start, in BOTH slim and full.
+        # Mirror the nearby_extensions count-only decision (server.py). Detail is opt-in
+        # via RLM_EXT_OVERRIDE_DETAIL: a SINGLE loop with a GLOBAL `detail_used` budget
+        # (not per-extension); detail rows stay grouped UNDER each extension's count line
+        # (provenance). Omission is tracked GLOBALLY and signalled by ONE pointer at the
+        # end (round-4) — the per-extension "... and more" marker is stripped so later
+        # extensions whose detail was dropped aren't silently count-only.
+        budget = _ext_override_detail_budget()
+        detail_used = 0
+        omitted_detail = False
         for e in ext_context.nearby_extensions:
             overrides = ext_overrides.get(e.path, [])
-            if overrides:
-                lines.append(f"\nOverrides by {e.name or '?'} ({len(overrides)} total):")
-                lines.extend(_format_overrides_summary(overrides))
+            if not overrides:
+                continue
+            lines.append(f"\n{e.name or '?'}: {len(overrides)} overrides")
+            if not budget:
+                continue
+            remaining = budget - detail_used
+            if remaining <= 0:
+                omitted_detail = True  # later extension's detail dropped entirely
+                continue
+            detail = _format_overrides_summary(overrides, max_lines=remaining)
+            # Strip the helper's LOCAL truncation marker — a single GLOBAL pointer is
+            # emitted at the end instead (so omission is unambiguous across all exts).
+            if detail and "... and more" in detail[-1]:
+                detail = detail[:-1]
+                omitted_detail = True
+            lines.extend(detail)
+            detail_used += len(detail)
+        if not budget or omitted_detail:
+            lines.append(
+                "\nFull per-object override detail on demand: get_overrides('ИмяОбъекта') or find_ext_overrides()."
+            )
 
     elif current.role == ConfigRole.EXTENSION:
         name_label = current.name or "?"
@@ -1686,11 +1769,19 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
             lines.append(
                 f"  Main config found nearby: {ext_context.nearby_main.name or '?'} at {ext_context.nearby_main.path}"
             )
-        # Include auto-scanned own overrides
+        # Own overrides under the same global budget as the MAIN branch.
         overrides = ext_overrides.get("self", [])
         if overrides:
-            lines.append(f"\nThis extension intercepts {len(overrides)} methods:")
-            lines.extend(_format_overrides_summary(overrides))
+            lines.append(f"\n{name_label}: {len(overrides)} overrides")
+            budget = _ext_override_detail_budget()
+            if budget:
+                lines.append("")
+                lines.extend(_format_overrides_summary(overrides, max_lines=budget))
+            else:
+                lines.append(
+                    "\nPer-object override detail on demand: get_overrides('ИмяОбъекта') "
+                    "or find_ext_overrides() (omitted from strategy to save tokens)."
+                )
 
     return "\n".join(lines)
 
@@ -1708,13 +1799,16 @@ def _format_overrides_summary(overrides: list[dict], max_lines: int = 30) -> lis
 
     lines: list[str] = []
     for obj, obj_annotations in sorted(by_object.items()):
-        lines.append(f"  {obj}: {', '.join(obj_annotations)}")
         if len(lines) >= max_lines:
             lines.append("  ... and more — full list via get_overrides('ИмяОбъекта')")
             break
+        lines.append(f"  {obj}: {', '.join(obj_annotations)}")
     return lines
 
 
+# NOTE: legacy / NOT used by the MCP server — the real rlm_start tool description
+# is the docstring of server.py::rlm_start (FastMCP reads it). Kept only for the
+# existing test in test_bsl_knowledge.py; do NOT edit this expecting API changes.
 RLM_START_DESCRIPTION = (
     "Start a BSL code exploration session on a 1C codebase.\n"
     "Returns session_id, detected config format, BSL helper functions, and exploration strategy.\n"

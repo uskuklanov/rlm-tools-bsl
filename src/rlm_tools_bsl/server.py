@@ -27,6 +27,7 @@ from rlm_tools_bsl.extension_detector import (
 )
 from rlm_tools_bsl.bsl_knowledge import (
     EFFORT_LEVELS,
+    _auto_effort,
     _fuzzy_suggest,
     _get_category_helpers,
     _get_disambiguation,
@@ -267,7 +268,7 @@ def _install_session_llm_tools(session, sandbox: Sandbox) -> bool:
 def _rlm_start(
     path: str | None,
     query: str,
-    effort: str = "medium",
+    effort: str = "auto",
     max_output_chars: int = 15_000,
     max_llm_calls: int | None = None,
     max_execute_calls: int | None = None,
@@ -348,11 +349,10 @@ def _rlm_start(
 
     logger.info("rlm_start: path=%s effort=%s include_metadata=%s", path, effort, include_metadata)
 
+    effort, max_llm_calls, max_execute_calls = resolve_session_limits(effort, query, max_llm_calls, max_execute_calls)
+    # effort_config нужен дальше (safe_grep_max_files / guidance) — от ИТОГОВОГО effort
+    # (после auto-эвристики/RLM_FORCE_EFFORT он всегда валиден, но .get безопаснее).
     effort_config = EFFORT_LEVELS.get(effort, EFFORT_LEVELS["medium"])
-    if max_llm_calls is None:
-        max_llm_calls = effort_config.max_llm_calls
-    if max_execute_calls is None:
-        max_execute_calls = effort_config.max_execute_calls
 
     try:
         session_id = session_manager.create(
@@ -564,6 +564,17 @@ def _rlm_start(
         )
         t_strategy = time.monotonic() - t_step
 
+        # Finding 4: если итоговые лимиты расходятся с пресетом effort (env-дефолт
+        # или явный параметр тула), агент-facing текст «Limits:» в стратегии стал бы
+        # ложным. Дописываем правдивый баннер в НАЧАЛО стратегии.
+        if max_execute_calls != effort_config.max_execute_calls or max_llm_calls != effort_config.max_llm_calls:
+            strategy = (
+                "== SERVER LIMIT OVERRIDE ==\n"
+                f"Effective this session: max_execute_calls={max_execute_calls}, "
+                f"max_llm_calls={max_llm_calls}.\n"
+                f"(These override the '{effort}' preset defaults shown in the EFFORT block below.)\n\n" + strategy
+            )
+
         with _sandboxes_lock:
             _sandboxes[session_id] = sandbox
             if idx_reader is not None:
@@ -642,6 +653,7 @@ def _rlm_start(
             "warnings": idx_warnings,
         },
         "metadata": metadata,
+        "effective_effort": effort,
         "limits": {
             "max_llm_calls": session.max_llm_calls,
             "max_execute_calls": session.max_execute_calls,
@@ -696,6 +708,65 @@ def _format_helper_summary(helper_calls: list[HelperCall], threshold: float) -> 
         for name, times in grouped.items()
     )
     return parts, len(grouped)
+
+
+def _positive_int_env(name: str) -> int | None:
+    """Положительный int из env или None (если не задан/невалиден)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        logger.warning("Игнорирую %s=%r: не целое число", name, raw)
+        return None
+    if val <= 0:
+        logger.warning("Игнорирую %s=%d: должно быть > 0", name, val)
+        return None
+    return val
+
+
+def resolve_session_limits(
+    effort: str,
+    query: str,
+    max_llm_calls: int | None,
+    max_execute_calls: int | None,
+) -> tuple[str, int, int]:
+    """Свести effort/лимиты.
+
+    Выбор effort (по убыванию приоритета):
+      1) RLM_FORCE_EFFORT (env) — жёсткий замок админа (по умолчанию НЕ задан);
+      2) явный effort агента (low/medium/high/max);
+      3) effort == "auto" (дефолт тула) → _auto_effort(query): medium, либо high
+         по маркерам сложности запроса.
+    Невалидный effort → medium. Числовые лимиты (по убыванию): ВАЛИДНЫЙ (>0) явный
+    параметр тула > RLM_MAX_* (env) > пресет тира; невалидный explicit (≤0) игнор.
+    Возвращает (effort, llm, execute) — все значения валидны (effort из EFFORT_LEVELS, лимиты >0).
+    """
+    forced = os.environ.get("RLM_FORCE_EFFORT", "").strip().lower()
+    if forced and forced not in EFFORT_LEVELS:
+        logger.warning("Игнорирую RLM_FORCE_EFFORT=%r: ожидается low|medium|high|max", forced)
+    if forced in EFFORT_LEVELS:
+        if forced != effort:
+            logger.info("rlm_start: effort '%s' -> '%s' (RLM_FORCE_EFFORT)", effort, forced)
+        effort = forced
+    elif effort == "auto":
+        effort = _auto_effort(query)  # 'medium' | 'high' по сложности запроса
+        logger.info("rlm_start: effort='auto' -> '%s' (по запросу)", effort)
+    elif effort not in EFFORT_LEVELS:
+        effort = "medium"
+    config = EFFORT_LEVELS[effort]
+
+    # Числовые лимиты: валидный явный параметр (>0) > RLM_MAX_* (env) > пресет.
+    # Невалидный explicit (None или ≤0) игнорируем — иначе max_execute_calls=0
+    # создал бы сессию, мгновенно упирающуюся в лимит (server.py:719). Публичный
+    # MCP Field имеет ge=1; эта проверка защищает прямые _rlm_start-вызовы.
+    if max_execute_calls is None or max_execute_calls <= 0:
+        max_execute_calls = _positive_int_env("RLM_MAX_EXECUTE_CALLS") or config.max_execute_calls
+    if max_llm_calls is None or max_llm_calls <= 0:
+        max_llm_calls = _positive_int_env("RLM_MAX_LLM_CALLS") or config.max_llm_calls
+
+    return effort, max_llm_calls, max_execute_calls
 
 
 def _rlm_execute(
@@ -856,17 +927,25 @@ async def rlm_start(
     effort: Annotated[
         str,
         Field(
-            description="Analysis depth: low (single quick lookup), medium (standard), high (deep trace, RECOMMENDED for multi-aspect analysis), max (exhaustive)"
+            description="Analysis depth. 'auto' (default) — the server picks medium, or high for multi-aspect queries (lifecycle / mechanism / end-to-end). Or force a tier: low / medium / high / max. The admin can hard-lock depth via RLM_FORCE_EFFORT; the effective value is returned as 'effective_effort'."
         ),
-    ] = "high",
+    ] = "auto",
     max_output_chars: Annotated[
         int, Field(description="Max characters per execute output", ge=100, le=100_000)
     ] = 15_000,
     max_llm_calls: Annotated[
-        int | None, Field(description="Override max llm_query calls (default from effort level)")
+        int | None,
+        Field(
+            ge=1,
+            description="Override max llm_query calls. Wins over the effort preset and the RLM_MAX_LLM_CALLS server default.",
+        ),
     ] = None,
     max_execute_calls: Annotated[
-        int | None, Field(description="Override max rlm_execute calls (default from effort level)")
+        int | None,
+        Field(
+            ge=1,
+            description="Override max rlm_execute calls. Wins over the effort preset and the RLM_MAX_EXECUTE_CALLS server default.",
+        ),
     ] = None,
     execution_timeout_seconds: Annotated[
         int, Field(description="Per-rlm_execute timeout in seconds", ge=1, le=300)
@@ -893,6 +972,10 @@ async def rlm_start(
     helper-comparison rules and per-step menus you MUST call rlm_help(...) BEFORE running rlm_execute
     on non-trivial queries. (In legacy 'full' mode (RLM_STRATEGY_MODE=full) rlm_help is not exposed
     and the strategy contains everything inline.)
+    Analysis depth defaults to 'auto': the server picks medium for simple lookups and high for multi-aspect
+    queries; pass effort=low/medium/high/max to force a tier. RLM_MAX_EXECUTE_CALLS / RLM_MAX_LLM_CALLS set
+    server-side default call limits (an explicit max_execute_calls / max_llm_calls you pass still wins); the
+    admin can hard-lock depth via RLM_FORCE_EFFORT. Effective depth/limits are echoed in 'effective_effort' and 'limits'.
     IMPORTANT: For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first."""
     return await anyio.to_thread.run_sync(
         lambda: _rlm_start(

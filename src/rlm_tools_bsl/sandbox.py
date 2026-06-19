@@ -3,8 +3,10 @@ from __future__ import annotations
 import io
 import contextlib
 import builtins
+import difflib
 import functools
 import pathlib
+import re
 import signal
 import threading
 import time as _time
@@ -45,6 +47,33 @@ BLOCKED_BUILTINS = frozenset(
         "input",
     }
 )
+
+
+# Частые «угаданные» имена хелперов → реальные (из e2e-логов бенчмарков).
+_KNOWN_HELPER_ALIASES: dict[str, str] = {
+    "get_method_source": "read_procedure",
+    "get_module_source": "read_procedure",
+    "read_method": "read_procedure",
+    "get_procedure": "read_procedure",
+    "parse_metadata_xml": "parse_object_xml",
+    "get_object_structure": "get_object_full_structure",
+    "find_subscriptions": "find_event_subscriptions",
+    "get_callers": "find_callers_context",
+}
+
+# Сигнатуры generic-IO хелперов (НЕ в BSL _registry — приходят из make_helpers()).
+# Нужны, чтобы kwarg-хинт давал реальную сигнатуру и для grep/read_file/… (в логах
+# бенчмарка: grep(..., limit=...) → тупик). Зеркалит server.available_functions.
+_GENERIC_HELPER_SIGNATURES: dict[str, dict] = {
+    "read_file": {"sig": "read_file(path) -> str"},
+    "read_files": {"sig": "read_files(paths) -> dict[path, str]"},
+    "grep": {"sig": "grep(pattern, path='.') -> list[dict] keys: file, line, text"},
+    "grep_summary": {"sig": "grep_summary(pattern, path='.') -> str"},
+    "grep_read": {"sig": "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files, summary}"},
+    "glob_files": {"sig": "glob_files(pattern) -> list[str]"},
+    "tree": {"sig": "tree(path='.', max_depth=3) -> str"},
+    "find_files": {"sig": "find_files(name) -> list[str]"},
+}
 
 
 @dataclass
@@ -281,7 +310,11 @@ class Sandbox:
                     exec(code, self._namespace)
         except Exception:
             error = traceback.format_exc()
-            error = self._add_error_hints(error, code)
+            # generic-IO хелперы (grep/read_file/…) не входят в BSL _registry —
+            # домешиваем их сигнатуры, иначе kwarg-хинт для grep(..., limit=...) пуст.
+            reg = {**_GENERIC_HELPER_SIGNATURES, **(self._namespace.get("_registry") or {})}
+            available = {k for k in self._namespace if not k.startswith("_") and callable(self._namespace.get(k))}
+            error = self._add_error_hints(error, code, available_names=available, registry=reg)
 
         stdout = stdout_capture.getvalue()
         if len(stdout) > self._max_output_chars:
@@ -295,7 +328,12 @@ class Sandbox:
         )
 
     @staticmethod
-    def _add_error_hints(error: str, code: str) -> str:
+    def _add_error_hints(
+        error: str,
+        code: str,
+        available_names: set[str] | None = None,
+        registry: dict | None = None,
+    ) -> str:
         """Append actionable hints to common errors."""
         hints: list[str] = []
 
@@ -327,7 +365,26 @@ class Sandbox:
             )
 
         if "NameError" in error:
-            hints.append("HINT: Call help() to see available functions. Variables persist between rlm_execute calls.")
+            suggestion: str | None = None
+            m = re.search(r"name '([^']+)' is not defined", error)
+            if m:
+                bad = m.group(1)
+                alias = _KNOWN_HELPER_ALIASES.get(bad)
+                if alias and (available_names is None or alias in available_names):
+                    suggestion = alias
+                elif available_names:
+                    close = difflib.get_close_matches(bad, list(available_names), n=1, cutoff=0.72)
+                    if close:
+                        suggestion = close[0]
+            if suggestion:
+                hints.append(
+                    f"HINT: '{m.group(1)}' не определён — нужен, скорее всего, '{suggestion}'. "
+                    f"Сверь: help() или rlm_help(helpers=['{suggestion}']). Переменные сохраняются между вызовами."
+                )
+            else:
+                hints.append(
+                    "HINT: Call help() to see available functions. Variables persist between rlm_execute calls."
+                )
 
         if "KeyError" in error and "get_object_full_structure" in code:
             bad_keys = ("'attr_name'", "'attr_synonym'", "'attr_type'", "'attr_kind'")
@@ -360,10 +417,17 @@ class Sandbox:
         # Wrong kwarg name on a helper (observed: safe_grep(path=...) / safe_grep(hint=...);
         # the parameter is name_hint). Turn the dead-end TypeError into a correction.
         if "unexpected keyword argument" in error:
+            mfn = re.search(r"(\w+)\(\) got an unexpected keyword argument '([^']+)'", error)
+            fn = mfn.group(1) if mfn else None
             if "safe_grep" in code:
                 hints.append(
                     "HINT: safe_grep(pattern, name_hint='', max_files=20) — второй параметр "
                     "называется name_hint (имя/фрагмент модуля для сужения), НЕ path и НЕ hint."
+                )
+            elif registry and fn and fn in registry and registry[fn].get("sig"):
+                hints.append(
+                    f"HINT: у {fn} нет такого параметра. Сигнатура: {registry[fn]['sig']}. "
+                    "Лишние фильтры отбирай в Python по полям результата."
                 )
             else:
                 hints.append(

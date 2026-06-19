@@ -282,14 +282,15 @@ def test_new_helpers_in_sandbox():
 
 
 def test_new_defaults():
-    """Default effort=medium -> 25 execute calls, 15 llm calls."""
+    """Default effort='auto' → простой запрос → medium (25 execute, 15 llm)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         open(os.path.join(tmpdir, "a.py"), "w").close()
 
         result = _rlm_start(path=tmpdir, query="test defaults")
         data = json.loads(result)
-        assert data["limits"]["max_execute_calls"] == 25  # medium effort
-        assert data["limits"]["max_llm_calls"] == 15  # medium effort
+        assert data["effective_effort"] == "medium"  # auto → medium на простом запросе
+        assert data["limits"]["max_execute_calls"] == 25
+        assert data["limits"]["max_llm_calls"] == 15
         assert data["limits"]["execution_timeout_seconds"] == 45
 
         _rlm_end(data["session_id"])
