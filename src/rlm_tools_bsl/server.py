@@ -21,6 +21,7 @@ from rlm_tools_bsl.llm_bridge import get_llm_query_fn, make_llm_query_batched, w
 from rlm_tools_bsl.format_detector import FormatInfo, SourceFormat, detect_format
 from rlm_tools_bsl.extension_detector import (
     ConfigRole,
+    _ext_list_cap,
     detect_extension_context,
     find_extension_overrides,
     resolve_config_root,
@@ -39,6 +40,7 @@ from rlm_tools_bsl.bsl_knowledge import (
     list_categories,
     list_sections,
     list_topics,
+    summarize_extensions_by_overrides,
 )
 from rlm_tools_bsl.bsl_index import (
     BUILDER_VERSION,
@@ -609,6 +611,19 @@ def _rlm_start(
             ]
         )
 
+    # На extreme-extension конфигах (напр. 155 расш) сериализация полного списка
+    # расширений в ответ раздувала rlm_start выше токен-лимита. Усекаем агент-facing
+    # поле до top-N по overrides; питание песочницы (ext_paths_for_sandbox) — полное.
+    # Режем ТОЛЬКО ветку MAIN (как Site 1 _build_warnings и Site 3 _extension_strategy):
+    # для EXTENSION/UNKNOWN-сессий nearby_extensions = соседи, их не усекаем (план).
+    if ext_context.current.role == ConfigRole.MAIN:
+        shown_exts, ext_total, ext_shown = summarize_extensions_by_overrides(
+            ext_context.nearby_extensions, ext_overrides, _ext_list_cap()
+        )
+    else:
+        shown_exts = list(ext_context.nearby_extensions)
+        ext_total = ext_shown = len(shown_exts)
+
     response: dict = {
         "session_id": session_id,
         "resolved_path": resolved,
@@ -625,12 +640,13 @@ def _rlm_start(
                     "name": e.name,
                     "purpose": e.purpose,
                     "prefix": e.name_prefix,
+                    # path остаётся АБСОЛЮТНЫМ — его потребляет find_ext_overrides(extension_path).
                     "path": e.path,
                     # Count only — full per-override detail via get_overrides('Object')
                     # (the inline dump was unused noise, ~30K on extension configs).
                     "overrides_count": len(ext_overrides.get(e.path, [])),
                 }
-                for e in ext_context.nearby_extensions
+                for e in shown_exts
             ],
             "nearby_main": (
                 {"name": ext_context.nearby_main.name, "path": ext_context.nearby_main.path}
@@ -662,6 +678,16 @@ def _rlm_start(
         "available_functions": available_functions,
         "strategy": strategy,
     }
+    if ext_shown < ext_total:
+        # Soft-breaking: на N>cap конфигах nearby_extensions отдаёт только top-N.
+        # Машинно-очевидный маркер усечения + указатель на полный список (F7).
+        ec = response["extension_context"]
+        ec["nearby_extensions_truncated"] = True
+        ec["nearby_extensions_total"] = ext_total
+        ec["nearby_extensions_shown"] = ext_shown
+        ec["extensions_hint"] = (
+            f"{ext_total} extensions; showing top {ext_shown} by overrides; detect_extensions() for full list"
+        )
     if project_hint:
         response["project_hint"] = project_hint
     logger.info(
@@ -976,6 +1002,9 @@ async def rlm_start(
     queries; pass effort=low/medium/high/max to force a tier. RLM_MAX_EXECUTE_CALLS / RLM_MAX_LLM_CALLS set
     server-side default call limits (an explicit max_execute_calls / max_llm_calls you pass still wins); the
     admin can hard-lock depth via RLM_FORCE_EFFORT. Effective depth/limits are echoed in 'effective_effort' and 'limits'.
+    On configs with very many extensions (> RLM_EXT_LIST_CAP, default 20) the 'extension_context.nearby_extensions'
+    field is truncated to the top-N by overrides and carries 'nearby_extensions_truncated'/'nearby_extensions_total'/
+    'extensions_hint'; call detect_extensions() / get_overrides() for the full list (search and overrides scanning are unaffected).
     IMPORTANT: For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first."""
     return await anyio.to_thread.run_sync(
         lambda: _rlm_start(

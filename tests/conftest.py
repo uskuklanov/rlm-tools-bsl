@@ -35,6 +35,21 @@ def _strategy_mode_default(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_ext_display_env(monkeypatch):
+    """Снять переменные, управляющие агент-facing представлением расширений.
+
+    Существующие тесты ассертят ПОЛНЫЕ списки расширений (напр.
+    ``test_strategy_ext_budget.py`` ждёт все 14 ``Расш0..Расш13``). Стрэй
+    ``RLM_EXT_LIST_CAP`` в шелле разработчика/CI урезал бы их и уронил тест на
+    нерелевантной причине. Снимаем обе переменные перед каждым тестом по образцу
+    ``_strategy_mode_default``; тесты, которым нужно конкретное значение,
+    ставят его локальным ``monkeypatch.setenv`` поверх этой autouse-фикстуры.
+    """
+    monkeypatch.delenv("RLM_EXT_LIST_CAP", raising=False)
+    monkeypatch.delenv("RLM_EXT_OVERRIDE_DETAIL", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_real_home(tmp_path_factory, monkeypatch):
     """Default-isolation: every test writes indexes AND file-cache to tmp dirs.
 

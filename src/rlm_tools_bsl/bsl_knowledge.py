@@ -1696,15 +1696,23 @@ def _ext_override_detail_budget() -> int:
 
 def _extension_strategy(ext_context, ext_overrides: dict) -> str:
     """Build strategy text for extension context."""
-    from rlm_tools_bsl.extension_detector import ConfigRole
+    from rlm_tools_bsl.extension_detector import ConfigRole, _ext_list_cap
 
     current = ext_context.current
     lines: list[str] = []
 
     if current.role == ConfigRole.MAIN and ext_context.nearby_extensions:
-        ext_names = ", ".join(
-            f"{e.name or '?'} (prefix: {e.name_prefix or '—'})" for e in ext_context.nearby_extensions
+        # На extreme-extension конфигах (напр. 155 расш) заголовок + строки-счётчики
+        # на КАЖДОЕ расширение раздували стратегию выше токен-лимита. Усекаем агент-facing
+        # представление до top-N по overrides (полнота — через detect_extensions()).
+        # Внутренний ext_context.nearby_extensions и питание песочницы НЕ трогаются.
+        shown, total, n_shown = summarize_extensions_by_overrides(
+            ext_context.nearby_extensions, ext_overrides, _ext_list_cap()
         )
+        truncated = n_shown < total
+        ext_names = ", ".join(f"{e.name or '?'} (prefix: {e.name_prefix or '—'})" for e in shown)
+        if truncated:
+            ext_names += f", … +{total - n_shown} more (detect_extensions())"
         lines.append(
             f"\nCRITICAL — EXTENSIONS DETECTED: {ext_names}\n"
             "Extensions OVERRIDE methods in this config via annotations:\n"
@@ -1728,7 +1736,7 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
         budget = _ext_override_detail_budget()
         detail_used = 0
         omitted_detail = False
-        for e in ext_context.nearby_extensions:
+        for e in shown:
             overrides = ext_overrides.get(e.path, [])
             if not overrides:
                 continue
@@ -1747,6 +1755,18 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
                 omitted_detail = True
             lines.extend(detail)
             detail_used += len(detail)
+        if truncated:
+            # Расширения вне top-N не получили строку-счётчик — одна сводка про скрытые
+            # (их число + суммарные overrides) с указателем на полный список.
+            shown_paths = {e.path for e in shown}
+            hidden = total - n_shown
+            hidden_overrides = sum(
+                len(ext_overrides.get(e.path, [])) for e in ext_context.nearby_extensions if e.path not in shown_paths
+            )
+            lines.append(
+                f"\n… +{hidden} more extensions, {hidden_overrides} overrides total "
+                "— get_overrides('ИмяОбъекта') / detect_extensions()."
+            )
         if not budget or omitted_detail:
             lines.append(
                 "\nFull per-object override detail on demand: get_overrides('ИмяОбъекта') or find_ext_overrides()."
@@ -1784,6 +1804,36 @@ def _extension_strategy(ext_context, ext_overrides: dict) -> str:
                 )
 
     return "\n".join(lines)
+
+
+def summarize_extensions_by_overrides(nearby_extensions, ext_overrides: dict, cap: int):
+    """Усечь агент-facing список расширений до top-N по числу overrides.
+
+    Возвращает ``(shown_list, total, shown)``. На малых/средних конфигах и при
+    отключённом лимите усечение НЕ происходит:
+
+    - ``cap <= 0`` (без лимита, в т.ч. ``-1``) ИЛИ ``total <= cap`` →
+      ``(list(nearby_extensions), total, total)`` — исходный порядок, ``shown == total``
+      (caller НЕ добавляет companion-поля / маркер усечения).
+
+    Иначе (``total > cap > 0``) → top-N по убыванию числа overrides с ПОЛНЫМ
+    детерминированным тай-брейком ``(name, name_prefix, normcase(path))``. Вход
+    идёт из несортированного ``iterdir()`` с возможными пустыми/дублирующимися
+    именами, поэтому финальный ключ ``normcase(path)`` (пути уникальны) гарантирует
+    воспроизводимый порядок. Возвращается НОВЫЙ список (вход не мутируется)."""
+    total = len(nearby_extensions)
+    if cap <= 0 or total <= cap:
+        return list(nearby_extensions), total, total
+    shown = sorted(
+        nearby_extensions,
+        key=lambda e: (
+            -len(ext_overrides.get(e.path, [])),
+            e.name or "",
+            e.name_prefix or "",
+            os.path.normcase(e.path),
+        ),
+    )[:cap]
+    return shown, total, cap
 
 
 def _format_overrides_summary(overrides: list[dict], max_lines: int = 30) -> list[str]:

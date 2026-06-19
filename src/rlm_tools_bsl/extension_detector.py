@@ -458,6 +458,23 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
     )
 
 
+def _ext_list_cap() -> int:
+    """Порог числа расширений, выше которого агент-facing представления списка
+    (warnings / response-поле / strategy-текст) ужимаются до top-N по overrides.
+
+    Дефолт 20; ``<=0`` (в т.ч. ``-1``) пробрасывается как «без лимита». Невалидный
+    env → дефолт 20. Контракт намеренно отличается от ``_ext_override_detail_budget``
+    (там невалид→0): здесь невалид → разумный дефолт, чтобы случайный мусор в env
+    не отключал усечение на extreme-extension конфигах. Регулируется RLM_EXT_LIST_CAP."""
+    raw = os.environ.get("RLM_EXT_LIST_CAP", "").strip()
+    if not raw:
+        return 20
+    try:
+        return int(raw)
+    except ValueError:
+        return 20
+
+
 def _build_warnings(
     current: ExtensionInfo,
     nearby_extensions: list[ExtensionInfo],
@@ -467,15 +484,29 @@ def _build_warnings(
     warnings: list[str] = []
 
     if current.role == ConfigRole.MAIN and nearby_extensions:
-        ext_list = ", ".join(
-            f"{e.name or '?'} ({e.purpose or '?'}, prefix: {e.name_prefix or '—'}, path: {e.path})"
-            for e in nearby_extensions
-        )
-        warnings.append(
-            f"Extensions detected near main config: {ext_list}. "
-            "Extension code can override methods via annotations "
-            "&Перед/&После/&Вместо/&ИзменениеИКонтроль (Before/After/Instead/ChangeAndValidate)."
-        )
+        cap = _ext_list_cap()
+        n = len(nearby_extensions)
+        if cap > 0 and n > cap:
+            # Extreme-extension конфиг: поимённый join всех путей раздул бы warning
+            # (напр. 155 расш → ~15K символов). Контекст-нейтральная сводка —
+            # _build_warnings шарится с sandbox-хелпером detect_extensions(), у
+            # которого нет ключа extension_context (F1), поэтому без ссылок на
+            # rlm_start-структуру. overrides на момент warning ещё не посчитаны.
+            warnings.append(
+                f"{n} extensions detected near main config — call detect_extensions() "
+                "for the complete list. Extension code can override methods via "
+                "&Перед/&После/&Вместо/&ИзменениеИКонтроль (Before/After/Instead/ChangeAndValidate)."
+            )
+        else:
+            ext_list = ", ".join(
+                f"{e.name or '?'} ({e.purpose or '?'}, prefix: {e.name_prefix or '—'}, path: {e.path})"
+                for e in nearby_extensions
+            )
+            warnings.append(
+                f"Extensions detected near main config: {ext_list}. "
+                "Extension code can override methods via annotations "
+                "&Перед/&После/&Вместо/&ИзменениеИКонтроль (Before/After/Instead/ChangeAndValidate)."
+            )
 
     elif current.role == ConfigRole.EXTENSION:
         purpose_label = current.purpose or "unknown"
