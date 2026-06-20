@@ -414,7 +414,8 @@ def test_sandbox_unhashable_kwargs_does_not_break(bsl_env):
 
 
 def test_sandbox_helper_return_value_unchanged(bsl_env):
-    """Wrapper does NOT modify helper return values (anti-duplicate is metadata-only)."""
+    """Wrapper does NOT modify helper return values; anti-duplicate AND efficiency
+    nudges are response-metadata-only (never the helper return / stdout) — R3 #4."""
     from rlm_tools_bsl.sandbox import Sandbox
 
     from rlm_tools_bsl.format_detector import detect_format
@@ -423,6 +424,15 @@ def test_sandbox_helper_return_value_unchanged(bsl_env):
     res = sandbox.execute("result = find_module('МойМодуль')\nprint(type(result).__name__)\n")
     assert res.error is None
     assert "list" in res.stdout
+
+    # The SECOND find_module on the same object fires the reuse_var efficiency nudge —
+    # it must live ONLY in ExecutionResult.efficiency_hints, never in the return / stdout.
+    res2 = sandbox.execute("result = find_module('МойМодуль')\nprint(type(result).__name__)\n")
+    assert res2.error is None
+    assert "list" in res2.stdout  # return value unchanged
+    assert res2.efficiency_hints and any(h["id"] == "reuse_var" for h in res2.efficiency_hints)
+    assert "HINT" not in res2.stdout
+    assert "reuse_var" not in res2.stdout
 
 
 # ============================================================================

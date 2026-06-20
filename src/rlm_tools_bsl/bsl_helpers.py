@@ -355,6 +355,34 @@ def make_bsl_helpers(
     _extension_metadata_xml: list[tuple[str, str, str]] = []  # (category, object_name, rel_xml_to_base)
     _extension_synonyms: list[tuple[str, str, str, str]] = []  # (obj_name, category, prefixed_synonym, rel_to_base)
 
+    # Lazy session cache: extension root → REAL configured name (parsed from
+    # Configuration.xml/.mdo by extension_detector). Module provenance uses this so it
+    # shows the extension's metadata name (consistent with get_overrides), not just the
+    # folder basename; basename is only a best-effort fallback when the root isn't matched.
+    _ext_name_by_root: dict[str, str] = {}
+    _ext_names_resolved: list[bool] = [False]
+
+    def _extension_name_for_root(root: str) -> str | None:
+        if not root:
+            return None
+        if not _ext_names_resolved[0]:
+            _ext_names_resolved[0] = True
+            try:
+                from rlm_tools_bsl.extension_detector import detect_extension_context as _det
+
+                ctx = _det(base_path)
+                for e in getattr(ctx, "nearby_extensions", None) or []:
+                    try:
+                        if e.path and e.name:
+                            _ext_name_by_root[os.path.normcase(os.path.abspath(e.path))] = e.name
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return _ext_name_by_root.get(os.path.normcase(os.path.abspath(root))) or (
+            os.path.basename(root.rstrip("/\\")) or None
+        )
+
     # Small OrderedDict cache for files outside the sandbox base (extension reads).
     _ext_file_cache: "collections.OrderedDict[str, str]" = collections.OrderedDict()
     _ext_file_cache_lock = threading.Lock()
@@ -2187,7 +2215,7 @@ def make_bsl_helpers(
             },
         }
 
-    def get_module_outline(path: str, include_methods: bool = True) -> dict:
+    def get_module_outline(path: str, include_methods: bool = True, no_live: bool = False) -> dict:
         """Cheap structural 'skeleton' of a module — the ``#Область`` tree plus
         aggregates — as a first hop before reading bodies.
 
@@ -2205,6 +2233,13 @@ def make_bsl_helpers(
                 ошибки нет — в отличие от ``extract_procedures``, который кидает ValueError).
             include_methods: ``True`` (default) → include leaf methods + orphans;
                 ``False`` → region tree + totals only (even cheaper top-level map).
+            no_live: ``False`` (default) → on a no/stale-index module fall back to a
+                live parse (reads the file). ``True`` → NEVER read the file: the would-be
+                live branches return a skipped marker instead (empty outline,
+                ``_meta.skipped_live=True`` + ``fallback_reason``). Used by compact
+                ``get_object_profile``/``get_object_modules`` so the modules section never
+                triggers a live read on a stale index (R12/R13 — checking
+                ``index_used`` after the fact is too late, the file is already read).
 
         Returns:
             {
@@ -2307,17 +2342,36 @@ def make_bsl_helpers(
                 )
             return _assemble(regions, meths, _resolve_meta_live(), False, reason)
 
+        def _no_live(reason: str) -> dict:
+            # compact path: would-be live branch returns a skipped marker WITHOUT
+            # reading the file. Identity is filled structurally (live file-index lookup
+            # or pure path parse — both read no module body). R12/R13: prevent the live
+            # read up-front, not by inspecting index_used after the body is already read.
+            resp = {
+                "path": path,
+                **{k: _resolve_meta_live().get(k) for k in ("category", "object_name", "module_type")},
+                "totals": {"methods": 0, "exports": 0, "regions": 0, "loc": 0},
+                "outline": [],
+                "_meta": {"index_used": False, "fallback_reason": reason, "skipped_live": True},
+            }
+            if include_methods:
+                resp["orphan_methods"] = []
+            return resp
+
+        def _fallback(reason: str) -> dict:
+            return _no_live(reason) if no_live else _live(reason)
+
         # --- Routing (codex round-3: explicit branches, no silently-empty outline) ---
         data = idx_reader.get_outline_data(path) if idx_reader is not None else None
         if data is None:
-            # idx_reader is None, OR regions table missing / corrupt core → live.
-            return _finish(_live("index_unavailable_or_table_missing"))
+            # idx_reader is None, OR regions table missing / corrupt core → live / skip.
+            return _finish(_fallback("index_unavailable_or_table_missing"))
         if data["module"] is None:
-            # Module not in the index (valid 'not indexed') → live.
-            return _finish(_live("index_unavailable_or_table_missing"))
+            # Module not in the index (valid 'not indexed') → live / skip.
+            return _finish(_fallback("index_unavailable_or_table_missing"))
         if not data["methods"]:
-            # Module row present but no methods (stale) → live safety net.
-            return _finish(_live("index_empty_for_module"))
+            # Module row present but no methods (stale) → live safety net / skip.
+            return _finish(_fallback("index_empty_for_module"))
         # Index path.
         return _finish(_assemble(data["regions"], data["methods"], data["module"], True, None))
 
@@ -2735,8 +2789,16 @@ def make_bsl_helpers(
         "DataProcessors",
     )
 
-    def _resolve_object_for_full_structure(name: str) -> tuple[str | None, str | None]:
+    def _resolve_object_for_full_structure(
+        name: str, prefer_category: str | None = None
+    ) -> tuple[str | None, str | None]:
         """Return (category, object_name) for a metadata object via a strict cascade.
+
+        ``prefer_category`` (plural folder, e.g. ``'Documents'``) — when set, EVERY exact
+        match is additionally gated on that category and the Pass-3 close-match fallback is
+        skipped → on a cross-category homonym (``Document.X`` vs ``Catalog.X``) the explicitly
+        requested category wins; returns ``(None, None)`` if the object is not in that category
+        (caller may then retry without the filter). Default ``None`` keeps behaviour byte-for-byte.
 
         Pass 1 — exact-match через все источники по очереди (любой непустой
                  источник НЕ блокирует следующий, если в нём нет точного
@@ -2762,6 +2824,7 @@ def make_bsl_helpers(
         омонимом «тст_СогласованиеЗаявокСБ».
         """
         name_lower = name.lower()
+        pc = prefer_category.lower() if prefer_category else None
 
         rows = None
         so_rows = None
@@ -2775,7 +2838,9 @@ def make_bsl_helpers(
             except Exception:
                 rows = None
             for r in rows or []:
-                if (r.get("object_name") or "").lower() == name_lower:
+                if (r.get("object_name") or "").lower() == name_lower and (
+                    pc is None or (r.get("category") or "").lower() == pc
+                ):
                     return r.get("category"), r.get("object_name")
 
             # 2. object_synonyms — synonym-only объекты (Enum/Constant/FO)
@@ -2784,7 +2849,9 @@ def make_bsl_helpers(
             except Exception:
                 so_rows = None
             for s in so_rows or []:
-                if (s.get("object_name") or "").lower() == name_lower:
+                if (s.get("object_name") or "").lower() == name_lower and (
+                    pc is None or (s.get("category") or "").lower() == pc
+                ):
                     return s.get("category"), s.get("object_name")
 
             # 3. enum_values — Enum, у которого нет записей в object_synonyms
@@ -2792,17 +2859,33 @@ def make_bsl_helpers(
                 ev = idx_reader.get_enum_values(name)
             except Exception:
                 ev = None
-            if ev and not ev.get("error") and ev.get("name") and ev["name"].lower() == name_lower:
+            if (
+                ev
+                and not ev.get("error")
+                and ev.get("name")
+                and ev["name"].lower() == name_lower
+                and (pc is None or pc == "enums")
+            ):
                 return "Enums", ev["name"]
 
-        # 4. find_module — объекты с BSL-модулями (exact-проход)
-        modules = find_module(name)
-        exact_modules = [m for m in modules if (m.get("object_name") or "").lower() == name_lower]
+        # 4. find_module — объекты с BSL-модулями (exact-проход). При prefer_category
+        # фильтр категории отдаём ВНУТРЬ find_module (он применяется ДО cap-50), иначе на
+        # частом имени-подстроке целевая категория могла бы выпасть за кап и явный префикс
+        # ложно не нашёл бы module-only объект.
+        modules = find_module(name, category=prefer_category or "")
+        exact_modules = [
+            m
+            for m in modules
+            if (m.get("object_name") or "").lower() == name_lower
+            and (pc is None or (m.get("category") or "").lower() == pc)
+        ]
         if exact_modules:
             return exact_modules[0].get("category"), exact_modules[0].get("object_name")
 
         # ── Pass 2: live glob по категориям (всегда exact, имя файла = name) ─
         for cat in _METADATA_ONLY_CATEGORIES:
+            if pc is not None and cat.lower() != pc:
+                continue
             # Try CF directory layout: {Cat}/{name}/Ext/*.xml
             try:
                 hits = glob_files_fn(f"{cat}/{name}/Ext/*.xml")
@@ -2826,6 +2909,12 @@ def make_bsl_helpers(
                 return cat, name
 
         # ── Pass 3: close-match fallback ────────────────────────────────
+        # prefer_category is STRICT: if no exact match exists in the requested category
+        # (Pass 1/2), do NOT fall back to a close-match of another category — return
+        # (None, None) so the caller can retry unfiltered. Otherwise a "Документ.Заказ"
+        # request with only a Catalog.Заказ present would wrongly return Catalogs.
+        if pc is not None:
+            return None, None
         # Все источники Pass 1 не дали exact — берём первый non-empty в
         # исходном порядке. Сохраняет прежнее поведение «get_enum_values
         # как close-match» (агент пишет 'Статус', в индексе Enum
@@ -2843,7 +2932,7 @@ def make_bsl_helpers(
 
         return None, None
 
-    def get_object_full_structure(name: str) -> dict:
+    def get_object_full_structure(name: str, category_hint: str | None = None) -> dict:
         """Aggregating helper: full object structure in one call.
 
         Combines metadata from object_attributes / predefined_items / object_synonyms /
@@ -2924,7 +3013,10 @@ def make_bsl_helpers(
         # (Enums, Constants, многие Catalogs без ObjectModule, FunctionalOption и т.п.)
         # через него не находятся. Каскад: index metadata → index synonyms →
         # index enum_values → BSL modules → live glob по категориям.
-        category, obj_name = _resolve_object_for_full_structure(name)
+        category, obj_name = _resolve_object_for_full_structure(name, prefer_category=category_hint)
+        if not category and not obj_name and category_hint:
+            # Object not present in the hinted category → retry unfiltered (find it anywhere).
+            category, obj_name = _resolve_object_for_full_structure(name)
         if not category and not obj_name:
             return {
                 "error": f"Объект '{name}' не найден",
@@ -3374,7 +3466,75 @@ def make_bsl_helpers(
                 return category, object_name, modules
         return None, None, []
 
-    def get_object_modules(name: str, include_methods: bool = False) -> dict:
+    def _build_module_entries(modules, include_methods: bool, no_live: bool):
+        """Build per-module entries + roll-ups from a resolved ``[(rel, info)]`` list.
+        Shared by ``get_object_modules`` and ``get_object_profile`` (modules section).
+        Returns ``(module_entries, totals, all_index_used, any_skipped_live)``."""
+        module_entries: list[dict] = []
+        roll_methods = roll_exports = roll_overrides = 0
+        all_index_used = True
+        any_skipped_live = False
+        for rel, info in modules:
+            outline = get_module_outline(rel, include_methods=include_methods, no_live=no_live)
+            ov_methods: list[str] = []
+            if idx_reader is not None:
+                try:
+                    ov_map = idx_reader.get_overrides_for_path(rel) or {}
+                    ov_methods = sorted(ov_map.keys())
+                except Exception:
+                    ov_methods = []
+            totals = outline.get("totals") or {}
+            m_meta = outline.get("_meta") or {}
+            if not m_meta.get("index_used"):
+                all_index_used = False
+            if m_meta.get("skipped_live"):
+                any_skipped_live = True
+            module_entries.append(
+                {
+                    "path": rel,
+                    "module_type": info.module_type,
+                    "form_name": info.form_name,
+                    "totals": totals,
+                    "outline": outline.get("outline", []),
+                    "overrides": {"count": len(ov_methods), "methods": ov_methods},
+                    "_meta": {
+                        "index_used": bool(m_meta.get("index_used")),
+                        "fallback_reason": m_meta.get("fallback_reason"),
+                        "skipped_live": bool(m_meta.get("skipped_live")),
+                    },
+                }
+            )
+            roll_methods += totals.get("methods", 0)
+            roll_exports += totals.get("exports", 0)
+            roll_overrides += len(ov_methods)
+        totals_roll = {
+            "modules": len(module_entries),
+            "methods": roll_methods,
+            "exports": roll_exports,
+            "overrides": roll_overrides,
+        }
+        return module_entries, totals_roll, all_index_used, any_skipped_live
+
+    def _modules_for_identity(category: str | None, object_name: str | None):
+        """``[(rel, info)]`` modules of EXACTLY ``(category, object_name)`` — category-aware
+        (homonym-safe) direct index scan. Used by ``get_object_profile`` so the modules
+        section never re-resolves to a different homonym than the profile identity."""
+        _ensure_index()
+        name_lower = (object_name or "").lower()
+        if not name_lower:
+            return []
+        cat_lower = (category or "").lower()
+        rows = [
+            (rel, info)
+            for rel, info in _index_state
+            if info.object_name
+            and info.object_name.lower() == name_lower
+            and (not cat_lower or (info.category or "").lower() == cat_lower)
+        ]
+        rows.sort(key=lambda ri: ri[0])
+        return rows
+
+    def get_object_modules(name: str, include_methods: bool = False, no_live: bool = False) -> dict:
         """Лёгкий индексный «код-side» двойник ``get_object_full_structure``: объект →
         все его модули + скелеты ``#Область`` + агрегаты + флаги перехватов, в один вызов.
 
@@ -3390,6 +3550,10 @@ def make_bsl_helpers(
                 exact-сканом индекса (см. ``_resolve_object_for_modules``).
             include_methods: ``False`` (дефолт) — дерево ``#Область`` + агрегаты
                 (ограничивает вывод); ``True`` — листовые методы внутри областей.
+            no_live: ``False`` (дефолт) — модуль без валидного индекс-пути уходит в live
+                (читает файл). ``True`` — пробрасывается в ``get_module_outline``: stale/нет
+                индекса по модулю → секция помечается ``_meta.skipped_live=True`` БЕЗ чтения
+                файла (compact-профиль не должен ходить в live по модулям).
 
         Returns:
             ``{object_name, category,
@@ -3411,53 +3575,18 @@ def make_bsl_helpers(
                 "_meta": {"index_used": idx_reader is not None, "modules_truncated": False},
             }
 
-        module_entries: list[dict] = []
-        roll_methods = roll_exports = roll_overrides = 0
-        all_index_used = True
-        for rel, info in modules:
-            outline = get_module_outline(rel, include_methods=include_methods)
-            ov_methods: list[str] = []
-            if idx_reader is not None:
-                try:
-                    ov_map = idx_reader.get_overrides_for_path(rel) or {}
-                    ov_methods = sorted(ov_map.keys())
-                except Exception:
-                    ov_methods = []
-            totals = outline.get("totals") or {}
-            m_meta = outline.get("_meta") or {}
-            if not m_meta.get("index_used"):
-                all_index_used = False
-            module_entries.append(
-                {
-                    "path": rel,
-                    "module_type": info.module_type,
-                    "form_name": info.form_name,
-                    "totals": totals,
-                    "outline": outline.get("outline", []),
-                    "overrides": {"count": len(ov_methods), "methods": ov_methods},
-                    "_meta": {
-                        "index_used": bool(m_meta.get("index_used")),
-                        "fallback_reason": m_meta.get("fallback_reason"),
-                    },
-                }
-            )
-            roll_methods += totals.get("methods", 0)
-            roll_exports += totals.get("exports", 0)
-            roll_overrides += len(ov_methods)
-
+        module_entries, totals_roll, all_index_used, any_skipped_live = _build_module_entries(
+            modules, include_methods, no_live
+        )
         return {
             "object_name": object_name,
             "category": category,
             "modules": module_entries,
-            "totals": {
-                "modules": len(module_entries),
-                "methods": roll_methods,
-                "exports": roll_exports,
-                "overrides": roll_overrides,
-            },
+            "totals": totals_roll,
             "_meta": {
                 "index_used": idx_reader is not None and all_index_used,
                 "modules_truncated": False,
+                "modules_skipped_live": any_skipped_live,
             },
         }
 
@@ -3509,6 +3638,496 @@ def make_bsl_helpers(
             "category": category,
             "metadata": metadata,
             "modules": module_details,
+        }
+
+    # ── get_object_profile — one-shot compact object aggregate ───
+    _PROFILE_DEFAULT_SECTIONS = (
+        "structure",
+        "modules",
+        "registers",
+        "subscriptions",
+        "roles",
+        "functional_options",
+    )
+    _PROFILE_SECTION_ALIASES = {
+        "structure": "structure",
+        "attrs": "structure",
+        "attributes": "structure",
+        "metadata": "structure",
+        "реквизиты": "structure",
+        "структура": "structure",
+        "modules": "modules",
+        "code": "modules",
+        "код": "modules",
+        "модули": "modules",
+        "registers": "registers",
+        "movements": "registers",
+        "движения": "registers",
+        "регистры": "registers",
+        "subscriptions": "subscriptions",
+        "events": "subscriptions",
+        "event_subscriptions": "subscriptions",
+        "подписки": "subscriptions",
+        "события": "subscriptions",
+        "roles": "roles",
+        "rights": "roles",
+        "права": "roles",
+        "роли": "roles",
+        "functional_options": "functional_options",
+        "fo": "functional_options",
+        "options": "functional_options",
+        "опции": "functional_options",
+    }
+
+    def get_object_profile(
+        name: str,
+        sections: list[str] | None = None,
+        include_flow: bool = False,
+        include_code_usages: bool = False,
+        limit: int = 20,
+    ) -> dict:
+        """Один top-level агрегат «обзор объекта за 1 вызов»: понижает «пол» вызовов
+        для доминирующей задачи (полный анализ объекта), отдавая compact roll-up дешёвых
+        index-path секций ВМЕСТО ~10 одиночных хелперов.
+
+        Дизамбигуация: ВЕСЬ обзор за 1 вызов → get_object_profile; только код-скелет →
+        get_object_modules; только метаданные → get_object_full_structure; глубокий разбор
+        потока/тел → analyze_document_flow / analyze_object.
+
+        Args:
+            name: имя объекта (можно с префиксом ``Документ.``/``Document.``).
+            sections: ``None`` → дефолтный compact-набор
+                (structure, modules, registers, subscriptions, roles, functional_options);
+                список → ровно запрошенные (алиасы: attrs→structure, events→subscriptions,
+                movements→registers, права→roles, …).
+            include_flow: ``True`` → секция ``flow`` (полный analyze_document_flow,
+                читает тела — ДОРОГО). Дефолт ``False``.
+            include_code_usages: ``True`` → секция ``code_usages`` (reverse code-usage).
+            limit: размер top-N preview для items каждой секции (дефолт 20).
+
+        Returns:
+            ``{object_name, category, sections:{<name>:section}, _meta:{identity_source,
+            extension_visibility, total_elapsed_ms, sections:[{name, elapsed_ms, source,
+            status, items_count, truncated}]}}`` либо ``{error, hint?, _meta}`` ТОЛЬКО если
+            identity не резолвится. Каждая section: ``{status: ok|empty|error|unavailable|
+            skipped, summary:{доменные счётчики}, items:[top-N], total, returned, has_more,
+            _meta:{source: index|live|mixed|unknown, fallback_reason, reason, truncated,
+            elapsed_ms, error}}``. БЕЗ тел процедур.
+
+            Compact-инвариант: при ``idx_reader is None`` ВСЕ data-секции ``unavailable``
+            (публичные get_object_*/find_* НЕ зовутся — никакого glob/live); тяжёлый live —
+            только под ``include_flow``/``include_code_usages``.
+        """
+        import time as _time_prof
+        from rlm_tools_bsl.bsl_index import (
+            _CATEGORY_TO_TYPE_PREFIX as _cat2prefix,
+            _HINT_PREFIX_TO_CATEGORY as _prefix2cat,
+        )
+
+        prof_t0 = _time_prof.monotonic()
+        has_index = idx_reader is not None
+        raw_name = name
+
+        def _ms(t0: float) -> float:
+            return round((_time_prof.monotonic() - t0) * 1000, 1)
+
+        extension_visibility = "main_with_nearby_extensions" if _ext_paths_raw else "standalone"
+
+        # An explicit input type-prefix (Документ.X / Catalog.X) → preferred category.
+        # Honoured in BOTH paths so a cross-category homonym (Document.X vs Catalog.X)
+        # resolves to the explicitly requested category, not whichever the name-cascade
+        # happens to hit first. The prefix is recognised CASE-INSENSITIVELY (casefold), so
+        # `bare` is derived from the suffix too — a case-sensitive _strip_meta_prefix would
+        # NOT strip a lowercase 'document.' / upper 'DOCUMENT.', leaving a malformed name.
+        prefix_category = None
+        if "." in raw_name:
+            head, _, _tail = raw_name.partition(".")
+            prefix_category = _prefix2cat.get(head.casefold())
+        bare = raw_name.partition(".")[2].strip() if prefix_category else _strip_meta_prefix(name)
+
+        # ── upfront identity resolve (ONCE → (category, object_name)) ──
+        identity_source = None
+        category = object_name = None
+        if has_index:
+            if prefix_category:
+                category, object_name = _resolve_object_for_full_structure(bare, prefer_category=prefix_category)
+                identity_source = "index_prefix"
+                if not object_name:
+                    # Object not in the requested category → resolve by name anywhere.
+                    category, object_name = _resolve_object_for_full_structure(bare)
+                    identity_source = "index"
+            else:
+                category, object_name = _resolve_object_for_full_structure(bare)
+                identity_source = "index"
+            if not object_name:
+                return {
+                    "error": f"Объект '{raw_name}' не найден",
+                    "_meta": {"identity_source": "unresolved", "total_elapsed_ms": _ms(prof_t0)},
+                }
+        else:
+            # NO index → never glob. Identity strictly from the input type-prefix.
+            if prefix_category:
+                category, object_name, identity_source = prefix_category, bare, "input_prefix"
+            else:
+                return {
+                    "error": "no_index_identity_unresolved",
+                    "hint": "передай объект с префиксом типа (Документ.X / Справочник.X / Document.X) "
+                    "или построй индекс — без индекса bare-имя не резолвится без glob",
+                    "_meta": {"identity_source": "none", "total_elapsed_ms": _ms(prof_t0)},
+                }
+
+        ref = (
+            f"{_cat2prefix.get(category, category)}.{object_name}"
+            if (category and object_name)
+            else (object_name or "")
+        )
+
+        # ── which sections to run ──────────────────────────────────
+        if sections is None:
+            wanted = list(_PROFILE_DEFAULT_SECTIONS)
+        else:
+            wanted = []
+            for s in sections:
+                key = _PROFILE_SECTION_ALIASES.get(str(s).strip().lower())
+                if key and key not in wanted:
+                    wanted.append(key)
+        if include_flow and "flow" not in wanted:
+            wanted.append("flow")
+        if include_code_usages and "code_usages" not in wanted:
+            wanted.append("code_usages")
+
+        # ── section builders (each in its OWN try/except via the runner) ──
+        def _unavailable(reason: str) -> dict:
+            return {
+                "status": "unavailable",
+                "summary": {},
+                "items": [],
+                "total": 0,
+                "returned": 0,
+                "has_more": False,
+                "_meta": {"source": "unknown", "reason": reason},
+            }
+
+        def _from_reader_list(rows, summary_fn, item_fn, source="index") -> dict:
+            # rows: None → capability_missing (table missing); [] → empty; [...] → ok.
+            if rows is None:
+                return _unavailable("capability_missing")
+            total = len(rows)
+            items = [item_fn(r) for r in rows[: max(0, int(limit))]]
+            return {
+                "status": "empty" if total == 0 else "ok",
+                "summary": summary_fn(rows),
+                "items": items,
+                "total": total,
+                "returned": len(items),
+                "has_more": total > len(items),
+                "_meta": {"source": source},
+            }
+
+        def _module_provenance(rel: str) -> dict:
+            # _index_state mixes MAIN + nearby-extension (CFE) rows, so a compact main+CFE
+            # profile is ambiguous without telling the agent which root each module came from.
+            if rel in _extension_paths_set:
+                root = _extension_root_for.get(rel) or ""
+                return {
+                    "is_extension": True,
+                    "source_root": root or None,
+                    # REAL configured name (from Configuration.xml/.mdo via extension_detector),
+                    # not the folder basename; basename only as a fallback when unmatched.
+                    "extension_name": _extension_name_for_root(root),
+                }
+            return {"is_extension": False, "source_root": None, "extension_name": None}
+
+        def _sec_structure() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            # category_hint keeps structure on the SAME homonym as the resolved identity.
+            s = get_object_full_structure(object_name, category_hint=category)
+            if not isinstance(s, dict) or s.get("error"):
+                return {
+                    "status": "error",
+                    "summary": {},
+                    "items": [],
+                    "total": 0,
+                    "returned": 0,
+                    "has_more": False,
+                    "_meta": {"source": "unknown", "error": (s or {}).get("error", "no structure")},
+                }
+            m = s.get("_meta") or {}
+            idx_used = bool(m.get("index_used"))
+            fr = m.get("fallback_reason")
+            if idx_used and fr in (
+                "category_without_attributes_filled_via_live_xml",
+                "index_partially_enriched_from_live_xml",
+            ):
+                src = "mixed"
+            else:
+                src = "index" if idx_used else "live"
+            attrs = s.get("attributes") or []
+            dims = s.get("dimensions") or []
+            res = s.get("resources") or []
+            summary = {
+                "posting": s.get("posting"),
+                "attributes": len(attrs),
+                "tabular_sections": len(s.get("tabular_sections") or []),
+                "dimensions": len(dims),
+                "resources": len(res),
+                "predefined_items": len(s.get("predefined_items") or []),
+                "forms": len(s.get("forms") or []),
+            }
+            primary = attrs or dims or res
+            names = [x.get("name") for x in primary if x.get("name")]
+            items = [{"name": n} for n in names[: max(0, int(limit))]]
+            meta = {"source": src, "fallback_reason": fr}
+            # Extensions are visible to the structure resolver (ext XML/live can merge attrs),
+            # so flag it — counts may include CFE-contributed fields (per-attribute attribution
+            # isn't tracked, hence a coarse section-level signal).
+            if _ext_paths_raw:
+                meta["extension_visibility"] = extension_visibility
+            # Verification guardrail: structure uses the SAME resolver as identity, so a
+            # mismatch flags resolver drift (not a normal homonym).
+            if (s.get("object_name") or "").lower() != (object_name or "").lower() or (
+                s.get("category") or ""
+            ).lower() != (category or "").lower():
+                meta["identity_match"] = False
+            return {
+                "status": "ok",
+                "summary": summary,
+                "items": items,
+                "total": len(names),
+                "returned": len(items),
+                "has_more": len(names) > len(items),
+                "_meta": meta,
+            }
+
+        def _sec_modules() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            mods = _modules_for_identity(category, object_name)
+            entries, totals_roll, all_idx, skipped = _build_module_entries(mods, include_methods=False, no_live=True)
+            if not entries:
+                return {
+                    "status": "empty",
+                    "summary": {"modules": 0, "methods": 0, "exports": 0, "overrides": 0},
+                    "items": [],
+                    "total": 0,
+                    "returned": 0,
+                    "has_more": False,
+                    "_meta": {"source": "index"},
+                }
+            items = [
+                {
+                    "path": e["path"],
+                    "module_type": e["module_type"],
+                    "methods": e["totals"].get("methods", 0),
+                    "exports": e["totals"].get("exports", 0),
+                    "overrides": e["overrides"]["count"],
+                    "skipped_live": e["_meta"]["skipped_live"],
+                    **_module_provenance(e["path"]),
+                }
+                for e in entries[: max(0, int(limit))]
+            ]
+            ext_modules = sum(1 for e in entries if e["path"] in _extension_paths_set)
+            # skipped_live → totals (methods/exports) are NOT authoritative (stale modules
+            # were not read to avoid live). Mark the whole section 'skipped', not 'ok', so the
+            # zero counts aren't mistaken for the truth — caller can get_object_modules(no_live=False).
+            meta = {"source": "index" if all_idx else "mixed", "modules_skipped_live": skipped}
+            if skipped:
+                meta["reason"] = "stale_modules_skipped_live"
+            if _ext_paths_raw:
+                meta["extension_visibility"] = extension_visibility
+            return {
+                "status": "skipped" if skipped else "ok",
+                "summary": {**totals_roll, "extension_modules": ext_modules},
+                "items": items,
+                "total": len(entries),
+                "returned": len(items),
+                "has_more": len(entries) > len(items),
+                "_meta": meta,
+            }
+
+        def _sec_registers() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            if (category or "") != "Documents":
+                return {
+                    "status": "skipped",
+                    "summary": {},
+                    "items": [],
+                    "total": 0,
+                    "returned": 0,
+                    "has_more": False,
+                    "_meta": {"source": "index", "reason": "not_a_document"},
+                }
+            rows = idx_reader.get_register_movements(object_name)
+            if rows is None:
+                return _unavailable("capability_missing")
+            # items = the ONE main list (all movement targets, code first) so total/returned/
+            # has_more are self-consistent; the per-source breakdown lives in summary (R5 #6).
+            ordered = [(mv.get("source", "code"), mv.get("register_name")) for mv in rows]
+            by_source: dict[str, list[str]] = {"code": [], "erp_mechanism": [], "manager_table": [], "adapted": []}
+            for src, n in ordered:
+                by_source.setdefault(src, []).append(n)
+            summary = {
+                "code_registers": len(by_source["code"]),
+                "erp_mechanisms": len(by_source["erp_mechanism"]),
+                "manager_tables": len(by_source["manager_table"]),
+                "adapted_registers": len(by_source["adapted"]),
+            }
+            total = len(ordered)
+            page = ordered[: max(0, int(limit))]
+            items = [{"register": n, "source": s} for s, n in page]
+            return {
+                "status": "empty" if total == 0 else "ok",
+                "summary": summary,
+                "items": items,
+                "total": total,
+                "returned": len(items),
+                "has_more": total > len(page),
+                "_meta": {"source": "index"},
+            }
+
+        def _sec_subscriptions() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            rows = idx_reader.get_event_subscriptions_exact(ref)
+            return _from_reader_list(
+                rows,
+                summary_fn=lambda rs: {"subscriptions": len(rs)},
+                item_fn=lambda r: {"name": r.get("name"), "event": r.get("event"), "handler": r.get("handler")},
+            )
+
+        def _sec_roles() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            rows = idx_reader.get_roles_exact(ref)
+            return _from_reader_list(
+                rows,
+                summary_fn=lambda rs: {"roles": len(rs)},
+                item_fn=lambda r: {"role_name": r.get("role_name"), "rights": len(r.get("rights") or [])},
+            )
+
+        def _sec_functional_options() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            rows = idx_reader.get_functional_options_exact(ref)
+            return _from_reader_list(
+                rows,
+                summary_fn=lambda rs: {"functional_options": len(rs)},
+                item_fn=lambda r: {"name": r.get("name")},
+            )
+
+        def _sec_flow() -> dict:
+            # Heavy, opt-in: analyze_document_flow reads bodies (source=mixed).
+            flow = analyze_document_flow(object_name)
+            subs = flow.get("event_subscriptions") or []
+            movements = flow.get("register_movements") or {}
+            jobs = flow.get("related_scheduled_jobs") or []
+            code_regs = (movements.get("code_registers") or []) if isinstance(movements, dict) else []
+            summary = {
+                "event_subscriptions": len(subs),
+                "code_registers": len(code_regs),
+                "related_scheduled_jobs": len(jobs),
+                "is_postable": flow.get("is_postable"),
+            }
+            items = [{"event": s.get("event"), "handler": s.get("handler")} for s in subs[: max(0, int(limit))]]
+            return {
+                "status": "ok",
+                "summary": summary,
+                "items": items,
+                "total": len(subs),
+                "returned": len(items),
+                "has_more": len(subs) > len(items),
+                "_meta": {"source": "mixed"},
+            }
+
+        def _sec_code_usages() -> dict:
+            if not has_index:
+                return _unavailable("no_index")
+            cu = find_code_usages(ref, limit=(max(0, int(limit)) * 10) or 100)
+            # find_code_usages falls to a LIVE safe_grep when the v13 table is missing
+            # (partial=True). Surface that — don't claim 'index' and hide the live cost.
+            partial = bool(cu.get("partial"))
+            usages = cu.get("usages") or []
+            total = cu.get("total", len(usages))
+            items = [
+                {"path": u.get("path"), "line": u.get("line"), "kind": u.get("kind")}
+                for u in usages[: max(0, int(limit))]
+            ]
+            meta = {"source": "live" if partial else "index", "truncated": bool(cu.get("truncated"))}
+            if partial:
+                meta["partial"] = True
+                hint = (cu.get("_meta") or {}).get("hint")
+                if hint:
+                    meta["fallback_reason"] = hint
+            return {
+                "status": "empty" if total == 0 else "ok",
+                "summary": {"total": total, "by_kind": cu.get("by_kind") or {}, "partial": partial},
+                "items": items,
+                "total": total,
+                "returned": len(items),
+                "has_more": total > len(items),
+                "_meta": meta,
+            }
+
+        _builders = {
+            "structure": _sec_structure,
+            "modules": _sec_modules,
+            "registers": _sec_registers,
+            "subscriptions": _sec_subscriptions,
+            "roles": _sec_roles,
+            "functional_options": _sec_functional_options,
+            "flow": _sec_flow,
+            "code_usages": _sec_code_usages,
+        }
+
+        sections_out: dict[str, dict] = {}
+        meta_sections: list[dict] = []
+        for sec_name in wanted:
+            builder = _builders.get(sec_name)
+            if builder is None:
+                continue
+            s_t0 = _time_prof.monotonic()
+            try:
+                sec = builder()
+            except Exception as exc:  # per-section isolation — never roll up to the profile
+                sec = {
+                    "status": "error",
+                    "summary": {},
+                    "items": [],
+                    "total": 0,
+                    "returned": 0,
+                    "has_more": False,
+                    "_meta": {"source": "unknown", "error": f"{type(exc).__name__}: {exc}"},
+                }
+            sec.setdefault("_meta", {})
+            sec["_meta"]["elapsed_ms"] = _ms(s_t0)
+            # Surface item-list truncation honestly: has_more (preview sliced by `limit`)
+            # OR any section-specific truncation flag (e.g. code_usages reader cap). Set on
+            # the section _meta so BOTH the section contract and the trace below agree.
+            sec["_meta"]["truncated"] = bool(sec["_meta"].get("truncated")) or bool(sec.get("has_more"))
+            sections_out[sec_name] = sec
+            meta_sections.append(
+                {
+                    "name": sec_name,
+                    "elapsed_ms": sec["_meta"]["elapsed_ms"],
+                    "source": sec["_meta"].get("source", "unknown"),
+                    "status": sec.get("status", "unknown"),
+                    "items_count": len(sec.get("items") or []),
+                    "truncated": bool(sec["_meta"].get("truncated")),
+                }
+            )
+
+        return {
+            "object_name": object_name,
+            "category": category,
+            "sections": sections_out,
+            "_meta": {
+                "identity_source": identity_source,
+                "extension_visibility": extension_visibility,
+                "total_elapsed_ms": _ms(prof_t0),
+                "sections": meta_sections,
+            },
         }
 
     # ── Business-process helpers ─────────────────────────────────
@@ -5189,15 +5808,20 @@ def make_bsl_helpers(
     def _ensure_functional_options() -> list[dict]:
         return _fo_lazy.ensure(_build_functional_options)
 
-    def find_functional_options(object_name: str) -> dict:
+    def find_functional_options(object_name: str, include_code: bool = True) -> dict:
         """Find functional options that affect a given object.
         Also greps BSL modules for ПолучитьФункциональнуюОпцию("X") pattern.
         Uses SQLite index for XML options when available.
 
         Args:
             object_name: Object name to search for in FO content lists.
+            include_code: ``True`` (default, backcompat) — also grep BSL modules for
+                ``ПолучитьФункциональнуюОпцию("X")`` (a ``safe_grep`` code scan).
+                ``False`` — XML-only (index/live FO definitions), без code-скана; так
+                зовёт compact ``get_object_profile`` (тяжёлый grep — только под
+                ``include_code_usages``).
 
-        Returns: dict with object, xml_options, code_options."""
+        Returns: dict with object, xml_options, code_options (empty when not include_code)."""
         object_name = _strip_meta_prefix(object_name)
 
         # --- Fast path for xml_options: SQLite index ---
@@ -5214,24 +5838,25 @@ def make_bsl_helpers(
                 if matched:
                     xml_options.append(dict(fo))
 
-        # Grep for ПолучитьФункциональнуюОпцию in BSL code
+        # Grep for ПолучитьФункциональнуюОпцию in BSL code (skipped when XML-only).
         code_options: list[dict] = []
-        try:
-            grep_results = safe_grep("ПолучитьФункциональнуюОпцию", name_hint=object_name)
-            for r in grep_results:
-                text = r.get("text", "") or r.get("content", "")
-                # Extract option name from ПолучитьФункциональнуюОпцию("OptionName")
-                m = re.search(r'ПолучитьФункциональнуюОпцию\(\s*"([^"]+)"', text)
-                if m:
-                    code_options.append(
-                        {
-                            "option_name": m.group(1),
-                            "file": r.get("file", ""),
-                            "line": r.get("line", 0),
-                        }
-                    )
-        except Exception:
-            pass
+        if include_code:
+            try:
+                grep_results = safe_grep("ПолучитьФункциональнуюОпцию", name_hint=object_name)
+                for r in grep_results:
+                    text = r.get("text", "") or r.get("content", "")
+                    # Extract option name from ПолучитьФункциональнуюОпцию("OptionName")
+                    m = re.search(r'ПолучитьФункциональнуюОпцию\(\s*"([^"]+)"', text)
+                    if m:
+                        code_options.append(
+                            {
+                                "option_name": m.group(1),
+                                "file": r.get("file", ""),
+                                "line": r.get("line", 0),
+                            }
+                        )
+            except Exception:
+                pass
 
         return {
             "object": object_name,
@@ -7202,12 +7827,13 @@ def make_bsl_helpers(
     _reg(
         "get_module_outline",
         get_module_outline,
-        "get_module_outline(path|object_name, include_methods=True) -> {path, category, object_name, module_type, "
-        "totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, exports}, "
-        "children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, resolved_from_name, "
-        "chosen_module?, candidates?, ambiguous?}}  "
+        "get_module_outline(path|object_name, include_methods=True, no_live=False) -> {path, category, object_name, "
+        "module_type, totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, "
+        "exports}, children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, "
+        "skipped_live?, resolved_from_name, chosen_module?, candidates?, ambiguous?}}  "
         "# ДЕШЁВЫЙ СКЕЛЕТ модуля (дерево #Область + агрегаты) — первый хоп перед чтением тел; "
-        "path ИЛИ имя объекта (имя → прозрачный авто-выбор модуля, resolver-ключи в _meta, ambiguous=True при тай-брейке)",
+        "path ИЛИ имя объекта (имя → прозрачный авто-выбор модуля, resolver-ключи в _meta, ambiguous=True при тай-брейке); "
+        "no_live=True → на stale/no-index НЕ читает файл (skipped-маркер _meta.skipped_live)",
         "code",
         [
             "оглавление",
@@ -7384,18 +8010,50 @@ def make_bsl_helpers(
     )
 
     _reg(
+        "get_object_profile",
+        get_object_profile,
+        "get_object_profile(name, sections=None, include_flow=False, include_code_usages=False, limit=20) -> "
+        "{object_name, category, sections:{structure, modules, registers, subscriptions, roles, functional_options}, _meta}  "
+        "# ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ: compact roll-up index-секций вместо ~10 хелперов; секция = "
+        "{status: ok|empty|unavailable|skipped|error, summary, items:top-N, _meta:{source}}, БЕЗ тел; "
+        "тяжёлое (поток/code-scan) — только include_flow=True / include_code_usages=True",
+        "composite",
+        [
+            "обзор объекта",
+            "профиль объекта",
+            "profile",
+            "профиль",
+            "обзор",
+            "overview",
+            "object profile",
+            "get_object_profile",
+        ],
+        "OBJECT PROFILE — ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ (Step 0 полного анализа: вместо ~10 одиночных хелперов):\n"
+        "  p = get_object_profile('РеализацияТоваровУслуг')  # compact: structure+modules+registers+subscriptions+roles+functional_options\n"
+        "  print(p['object_name'], p['category'])\n"
+        "  for name, sec in p['sections'].items():\n"
+        "      print(f\"  {name}: {sec['status']} {sec.get('summary')}\")  # счётчики; items — top-N preview без тел\n"
+        "  # точечно глубже: read_procedure(path, 'Метод') по p['sections']['modules']['items'][i]['path']\n"
+        "  # ровно нужное: get_object_profile(name, sections=['structure','roles'])\n"
+        "  # тяжёлое ТОЛЬКО по флагу: get_object_profile(name, include_flow=True) → +секция flow (analyze_document_flow)\n"
+        "  # ДИЗАМБИГУАЦИЯ: весь обзор за 1 вызов → get_object_profile; только код-скелет → get_object_modules;\n"
+        "  #   только метаданные → get_object_full_structure; глубокий разбор тел/потока → analyze_document_flow / analyze_object",
+    )
+    _reg(
         "analyze_object",
         analyze_object,
-        "analyze_object(name) -> full profile: metadata + modules + procedures + exports",
+        "analyze_object(name) -> {name, category, metadata (XML), modules:[{module_type, procedures, exports, ...}]}  "
+        "# ДОРОГО: читает XML + ВСЕ тела всех модулей (extract_procedures). Для обзора бери get_object_profile; "
+        "сюда — только когда реально нужны ВСЕ процедуры объекта сразу",
         "composite",
-        ["profile", "профиль", "обзор", "overview", "analyze_object"],
-        "OBJECT PROFILE:\n"
-        "  result = analyze_object('АвансовыйОтчет')\n"
+        ["analyze_object", "все тела объекта", "все процедуры объекта"],
+        "DEEP OBJECT DUMP (ДОРОГО — XML + все тела; для обзора используй get_object_profile):\n"
+        "  result = analyze_object('АвансовыйОтчет')  # бери ТОЛЬКО когда нужны ВСЕ процедуры объекта сразу\n"
         "  meta = result.get('metadata', {})\n"
         "  print(f\"Объект: {result['name']} ({meta.get('synonym', '')})\")\n"
-        "  print(f\"Реквизитов: {len(meta.get('attributes', []))}\")\n"
         "  for m in result.get('modules', []):\n"
-        "      print(f\"  {m['module_type']}: {m['procedures_count']} проц, {m['exports_count']} эксп\")",
+        "      print(f\"  {m['module_type']}: {m['procedures_count']} проц, {m['exports_count']} эксп\")\n"
+        "  # Обзор за 1 дешёвый вызов → get_object_profile(name); код-скелет → get_object_modules(name).",
     )
     _reg(
         "get_object_full_structure",
@@ -7415,7 +8073,6 @@ def make_bsl_helpers(
             "полная структура",
             "карточка объекта",
             "object structure",
-            "object profile",
             "вся структура",
             "реквизиты документа",
             "реквизиты справочника",
@@ -7448,13 +8105,14 @@ def make_bsl_helpers(
     _reg(
         "get_object_modules",
         get_object_modules,
-        "get_object_modules(name, include_methods=False) -> {object_name, category, "
+        "get_object_modules(name, include_methods=False, no_live=False) -> {object_name, category, "
         "modules:[{path, module_type, form_name, totals:{methods,exports,regions,loc}, "
         "outline:[{region, line, end_line, totals, children, methods?}], "
-        "overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason}}], "
-        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated}} | {error, _meta}  "
+        "overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason, skipped_live}}], "
+        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}  "
         "# ДЕШЁВЫЙ КОД-СКЕЛЕТ объекта: все модули + дерево #Область + агрегаты + флаги перехватов в 1 вызов. "
-        "НЕ читает тела (extract_procedures) на индексном пути и НЕ парсит XML — легче analyze_object",
+        "НЕ читает тела (extract_procedures) на индексном пути и НЕ парсит XML — легче analyze_object; "
+        "no_live=True → stale/no-index модули помечаются skipped_live БЕЗ live-чтения",
         "composite",
         [
             "модули объекта",

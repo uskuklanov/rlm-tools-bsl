@@ -8482,6 +8482,67 @@ class IndexReader:
                     role_map[key]["rights"].append(right)
             return list(role_map.values())
 
+    def get_roles_exact(self, object_ref: str, include_members: bool = False) -> list[dict] | None:
+        """Roles granting rights to an EXACT object ref — no substring false-positives.
+
+        Where ``get_roles`` matches ``object_name LIKE '%name%'`` (so ``Document.Заказ``
+        pulls in ``Document.ЗаказПоставщику`` and ``Document.X`` pulls in ``Document.XYZ``),
+        this matches ``role_rights.object_name`` against the canonical English ref
+        (e.g. ``Document.ЗаказПоставщику``) exactly. Read-only; no schema/builder bump.
+
+        Args:
+            object_ref: canonical English ``Type.Name`` ref (see ``_CATEGORY_TO_TYPE_PREFIX``).
+            include_members: when ``True`` also include member rights whose ``object_name``
+                starts with ``<ref>.`` (e.g. ``Document.X.TabularSection.Y.Attribute.Z``).
+                Default ``False`` = object-level grants only.
+
+        Returns:
+            Grouped ``[{role_name, object, rights:[...], file}]`` (same shape as
+            ``get_roles``), or ``None`` if the ``role_rights`` table is empty/missing.
+            ``[]`` when the table is present but no role grants the exact ref.
+        """
+        with self._lock:
+            try:
+                if include_members:
+                    rows = self._conn.execute(
+                        "SELECT role_name, object_name, right_name, file FROM role_rights "
+                        "WHERE object_name = ? COLLATE NOCASE OR object_name LIKE ? || '.%'",
+                        (object_ref, object_ref),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        "SELECT role_name, object_name, right_name, file FROM role_rights "
+                        "WHERE object_name = ? COLLATE NOCASE",
+                        (object_ref,),
+                    ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+
+            if not rows:
+                # Distinguish empty table (→ None, caller marks unavailable) from
+                # "table has data but exact ref matched nothing" (→ [], authoritative).
+                try:
+                    cnt = self._conn.execute("SELECT COUNT(*) AS cnt FROM role_rights").fetchone()
+                    if cnt and cnt["cnt"] == 0:
+                        return None
+                except sqlite3.Error:
+                    return None
+
+            role_map: dict[str, dict] = {}
+            for r in rows:
+                key = r["role_name"]
+                if key not in role_map:
+                    role_map[key] = {
+                        "role_name": r["role_name"],
+                        "object": r["object_name"],
+                        "rights": [],
+                        "file": r["file"],
+                    }
+                right = r["right_name"]
+                if right not in role_map[key]["rights"]:
+                    role_map[key]["rights"].append(right)
+            return list(role_map.values())
+
     def get_enum_values(self, enum_name: str) -> dict | None:
         """Get enum definition from the index.
 
@@ -9197,6 +9258,61 @@ class IndexReader:
 
             return result
 
+    def get_event_subscriptions_exact(self, object_ref: str) -> list[dict] | None:
+        """Event subscriptions whose source canonicalizes to an EXACT object ref.
+
+        ``source_types`` stores type-FORMS (``DocumentObject.X``, ``DocumentRef.X``,
+        ``CatalogManager.X`` …). Each element is normalized via ``canonicalize_type_ref``
+        → ``Document.X`` and compared to ``object_ref`` exactly, so ``Document.X`` will
+        NOT pull in ``Document.XYZ`` (the substring trap of ``get_event_subscriptions``).
+        Read-only; no schema/builder bump.
+
+        Args:
+            object_ref: canonical English ``Type.Name`` ref.
+
+        Returns:
+            ``list[dict]`` (``find_event_subscriptions`` shape, with ``source_types``)
+            of subscriptions whose source is exactly this object, or ``None`` if the
+            table is empty/missing. ``[]`` when present but nothing matches.
+        """
+        ref_lower = object_ref.lower()
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT name, synonym, event, handler_module, handler_procedure, "
+                    "source_types, source_count, file FROM event_subscriptions"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            if not rows:
+                return None
+            result: list[dict] = []
+            for r in rows:
+                source_types: list[str] = []
+                try:
+                    source_types = json.loads(r["source_types"]) if r["source_types"] else []
+                except (ValueError, TypeError):
+                    pass
+                if not any(t and canonicalize_type_ref(t).lower() == ref_lower for t in source_types):
+                    continue
+                handler_module = r["handler_module"] or ""
+                handler_procedure = r["handler_procedure"] or ""
+                handler = f"CommonModule.{handler_module}.{handler_procedure}" if handler_module else handler_procedure
+                result.append(
+                    {
+                        "name": r["name"],
+                        "synonym": r["synonym"] or "",
+                        "source_types": source_types,
+                        "source_count": r["source_count"] or 0,
+                        "event": r["event"] or "",
+                        "handler": handler,
+                        "handler_module": handler_module,
+                        "handler_procedure": handler_procedure,
+                        "file": r["file"] or "",
+                    }
+                )
+            return result
+
     def get_scheduled_jobs(self, name: str = "") -> list[dict] | None:
         """Get scheduled jobs from the index, optionally filtered by name.
 
@@ -9285,6 +9401,60 @@ class IndexReader:
                 else:
                     result.append(entry)
 
+            return result
+
+    def get_functional_options_exact(self, object_ref: str, include_members: bool = True) -> list[dict] | None:
+        """Functional options whose content references an EXACT object ref.
+
+        ``content`` stores canonical English refs (``Document.X`` and attribute-scoped
+        ``Document.X.TabularSection.Y.Attribute.Z``). Matches ``object_ref`` exactly,
+        plus — when *include_members* — content starting with ``<ref>.``. Avoids the
+        substring false-positive of ``get_functional_options``. Read-only; no bump.
+
+        Args:
+            object_ref: canonical English ``Type.Name`` ref.
+            include_members: include attribute/TS-scoped content (default ``True`` — an
+                FO scoping a single attribute still "affects" the object).
+
+        Returns:
+            ``list[dict]`` (``find_functional_options`` shape) or ``None`` if the table
+            is empty/missing. ``[]`` when present but nothing matches.
+        """
+        ref_lower = object_ref.lower()
+        member_prefix = ref_lower + "."
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT name, synonym, location, content, file FROM functional_options"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            if not rows:
+                return None
+            result: list[dict] = []
+            for r in rows:
+                content_list: list[str] = []
+                try:
+                    content_list = json.loads(r["content"]) if r["content"] else []
+                except (ValueError, TypeError):
+                    pass
+                matched = False
+                for c in content_list:
+                    cl = (c or "").lower()
+                    if cl == ref_lower or (include_members and cl.startswith(member_prefix)):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                result.append(
+                    {
+                        "name": r["name"],
+                        "synonym": r["synonym"] or "",
+                        "location": r["location"] or "",
+                        "content": content_list,
+                        "file": r["file"] or "",
+                    }
+                )
             return result
 
     def get_subsystems_for_object(self, object_name: str) -> list[dict] | None:

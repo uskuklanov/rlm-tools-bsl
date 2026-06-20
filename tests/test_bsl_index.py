@@ -4,6 +4,7 @@ Tests IndexBuilder, IndexReader, incremental updates, freshness checks,
 and path/env helpers.
 """
 
+import json
 import sqlite3
 import time
 
@@ -1434,3 +1435,199 @@ def tmp_path_from_base(base_path: str):
     from pathlib import Path
 
     return Path(base_path)
+
+
+# ---------------------------------------------------------------------------
+# v1.23.0 — exact-ref reader methods (category-aware adapters for
+# get_object_profile). Verify Document.X does NOT pull in Document.XYZ.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_index_with_meta(tmp_path, monkeypatch):
+    """Build a minimal index (empty config) so the metadata tables exist, then
+    return (db_path) ready for direct row inserts."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".index_exact"))
+    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    builder = IndexBuilder()
+    db_path = builder.build(str(tmp_path), build_calls=False, build_metadata=True)
+    return db_path
+
+
+class TestExactRefReaders:
+    """get_roles_exact / get_event_subscriptions_exact / get_functional_options_exact."""
+
+    def _seed(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        # role_rights: object-level grant, a prefix-collision sibling, a member right.
+        conn.executemany(
+            "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
+            [
+                ("РольА", "Document.ЗаказПоставщику", "Read", "Roles/РольА/Ext/Rights.xml"),
+                ("РольА", "Document.ЗаказПоставщику", "Update", "Roles/РольА/Ext/Rights.xml"),
+                ("РольB", "Document.ЗаказПоставщикуРасш", "Read", "Roles/РольB/Ext/Rights.xml"),
+                (
+                    "РольC",
+                    "Document.ЗаказПоставщику.Attribute.Контрагент",
+                    "View",
+                    "Roles/РольC/Ext/Rights.xml",
+                ),
+            ],
+        )
+        # event_subscriptions: source_types are type-FORMS (need canonicalize_type_ref).
+        conn.executemany(
+            "INSERT INTO event_subscriptions (name, synonym, event, handler_module, "
+            "handler_procedure, source_types, source_count, file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "ПодпискаЗаказ",
+                    "",
+                    "BeforeWrite",
+                    "ОбщийМодуль",
+                    "Обработчик",
+                    json.dumps(["DocumentObject.ЗаказПоставщику"], ensure_ascii=False),
+                    1,
+                    "f1.xml",
+                ),
+                (
+                    "ПодпискаРасш",
+                    "",
+                    "OnWrite",
+                    "ОбщийМодуль",
+                    "Обработчик2",
+                    json.dumps(["DocumentObject.ЗаказПоставщикуРасш"], ensure_ascii=False),
+                    1,
+                    "f2.xml",
+                ),
+                (
+                    "ПодпискаКонтр",
+                    "",
+                    "OnWrite",
+                    "ОбщийМодуль",
+                    "Обработчик3",
+                    json.dumps(["CatalogRef.Контрагенты"], ensure_ascii=False),
+                    1,
+                    "f3.xml",
+                ),
+            ],
+        )
+        # functional_options: content is canonical refs (object-level + member + collision).
+        conn.executemany(
+            "INSERT INTO functional_options (name, synonym, location, content, file) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("ФО_Заказ", "", "", json.dumps(["Document.ЗаказПоставщику"], ensure_ascii=False), "fo1.xml"),
+                ("ФО_Расш", "", "", json.dumps(["Document.ЗаказПоставщикуРасш"], ensure_ascii=False), "fo2.xml"),
+                (
+                    "ФО_Член",
+                    "",
+                    "",
+                    json.dumps(["Document.ЗаказПоставщику.Attribute.Сумма"], ensure_ascii=False),
+                    "fo3.xml",
+                ),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+    def test_get_roles_exact_no_collision(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            roles = reader.get_roles_exact("Document.ЗаказПоставщику")
+            names = {r["role_name"] for r in roles}
+            assert names == {"РольА"}, f"Document.X must NOT pull Document.XYZ / member; got {names}"
+            role_a = next(r for r in roles if r["role_name"] == "РольА")
+            assert set(role_a["rights"]) == {"Read", "Update"}
+        finally:
+            reader.close()
+
+    def test_get_roles_exact_ascii_prefix_case_insensitive(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # ASCII prefix folded by COLLATE NOCASE; Cyrillic tail must still match.
+            roles = reader.get_roles_exact("document.ЗаказПоставщику")
+            assert {r["role_name"] for r in roles} == {"РольА"}
+        finally:
+            reader.close()
+
+    def test_get_roles_exact_include_members(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            roles = reader.get_roles_exact("Document.ЗаказПоставщику", include_members=True)
+            assert {r["role_name"] for r in roles} == {"РольА", "РольC"}
+        finally:
+            reader.close()
+
+    def test_get_roles_exact_empty_table_none_vs_no_match_empty(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        reader = IndexReader(str(db_path))
+        try:
+            # Empty role_rights table → None (caller marks 'unavailable').
+            assert reader.get_roles_exact("Document.ЗаказПоставщику") is None
+        finally:
+            reader.close()
+        # Seed, then ask for a ref that has no grant → [] (authoritative empty).
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_roles_exact("Document.НесуществующийДок") == []
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_exact_no_collision(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            subs = reader.get_event_subscriptions_exact("Document.ЗаказПоставщику")
+            names = {s["name"] for s in subs}
+            assert names == {"ПодпискаЗаказ"}, f"type-form must canonicalize exact; got {names}"
+            assert subs[0]["event"] == "BeforeWrite"
+        finally:
+            reader.close()
+
+    def test_get_event_subscriptions_exact_empty_vs_no_match(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_event_subscriptions_exact("Document.X") is None
+        finally:
+            reader.close()
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_event_subscriptions_exact("Document.НетТакого") == []
+        finally:
+            reader.close()
+
+    def test_get_functional_options_exact_members_and_collision(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # Default include_members=True → object-level + attribute-scoped, NOT collision.
+            fos = reader.get_functional_options_exact("Document.ЗаказПоставщику")
+            assert {f["name"] for f in fos} == {"ФО_Заказ", "ФО_Член"}
+            # include_members=False → object-level only.
+            fos_obj = reader.get_functional_options_exact("Document.ЗаказПоставщику", include_members=False)
+            assert {f["name"] for f in fos_obj} == {"ФО_Заказ"}
+        finally:
+            reader.close()
+
+    def test_get_functional_options_exact_empty_vs_no_match(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_functional_options_exact("Document.X") is None
+        finally:
+            reader.close()
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_functional_options_exact("Document.НетТакого") == []
+        finally:
+            reader.close()

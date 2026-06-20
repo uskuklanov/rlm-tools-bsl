@@ -689,3 +689,49 @@ class TestMetadataXmlDiscoveryFallback:
         locators = _iter_metadata_xml_files(str(tmp_path))
         rel = next(rel for (c, o, rel) in locators if c == "Catalogs" and o == "Obj")
         assert rel.endswith("Catalog.xml"), rel
+
+
+def test_profile_modules_carry_main_cfe_provenance(helpers_with_idx_reader):
+    """get_object_profile tags each module with main/CFE provenance (is_extension /
+    source_root / extension_name) so a main+extension profile is not ambiguous (codex finding)."""
+    bsl, cf, cfe, reader = helpers_with_idx_reader
+
+    # extension-only object → its module is flagged as coming from the extension
+    ext = bsl["get_object_profile"]("ExtCatalog")
+    assert ext["_meta"]["extension_visibility"] == "main_with_nearby_extensions"
+    mods = ext["sections"]["modules"]
+    om = next(i for i in mods["items"] if i["path"].endswith("ObjectModule.bsl"))
+    assert om["is_extension"] is True
+    assert om["extension_name"] == "ExtAddOn"
+    assert om["source_root"] and "ExtAddOn" in om["source_root"]
+    assert mods["summary"]["extension_modules"] >= 1
+    assert mods["_meta"]["extension_visibility"] == "main_with_nearby_extensions"
+
+    # main object → its module is NOT an extension, and the ext count is 0
+    main = bsl["get_object_profile"]("MainCat")
+    mmods = main["sections"]["modules"]
+    mom = next(i for i in mmods["items"] if i["path"].endswith("ObjectModule.bsl"))
+    assert mom["is_extension"] is False
+    assert mom["extension_name"] is None
+    assert mom["source_root"] is None
+    assert mmods["summary"]["extension_modules"] == 0
+
+
+def test_profile_extension_name_is_metadata_name_not_folder(helpers_with_idx_reader, monkeypatch):
+    """extension_name is the REAL configured name (extension_detector parses Configuration.xml/.mdo),
+    NOT the folder basename — guards the dir-vs-metadata divergence (codex finding)."""
+    import types
+
+    import rlm_tools_bsl.extension_detector as _ed
+
+    bsl, cf, cfe, reader = helpers_with_idx_reader
+
+    # The extension folder is 'ExtAddOn'; force its configured metadata name to differ.
+    def _fake_ctx(_base):
+        return types.SimpleNamespace(nearby_extensions=[types.SimpleNamespace(path=cfe, name="РеальноеИмяРасширения")])
+
+    monkeypatch.setattr(_ed, "detect_extension_context", _fake_ctx)
+
+    p = bsl["get_object_profile"]("ExtCatalog")
+    om = next(i for i in p["sections"]["modules"]["items"] if i["is_extension"])
+    assert om["extension_name"] == "РеальноеИмяРасширения"  # metadata name, NOT folder 'ExtAddOn'

@@ -50,7 +50,8 @@ def test_topic_compact(dispatch):
     assert r["topic"] == "проведение"
     assert r["format"] == "compact"
     assert r["steps"]
-    assert any("find_register_movements" in s for s in r["steps"])
+    # v1.23.0: the проведение compact branch leads with the one-call aggregate.
+    assert any("get_object_profile" in s for s in r["steps"])
 
 
 def test_topic_full_with_code(dispatch):
@@ -300,3 +301,37 @@ def test_no_session_required(dispatch):
     # Just exercise once more — entire dispatcher path is pure / static
     # snapshot-backed.
     assert dispatch()["mode"] == "menu"
+
+
+# ── v1.23.0 tripwires: get_object_profile routing + recipe-first ────────────
+
+
+def test_get_object_profile_registered():
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    snap = build_helper_metadata_snapshot()
+    assert "get_object_profile" in snap
+    assert snap["get_object_profile"]["cat"] == "composite"
+    assert "get_object_profile(name" in snap["get_object_profile"]["sig"]
+
+
+def test_profile_keywords_route_to_get_object_profile():
+    """profile/профиль/overview/обзор own get_object_profile, NOT analyze_object (R2 #3)."""
+    from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
+
+    snap = build_helper_metadata_snapshot()
+    for kw in ("profile", "профиль", "обзор", "overview"):
+        owners = [name for name, meta in snap.items() if kw in (meta.get("kw") or [])]
+        assert owners == ["get_object_profile"], (kw, owners)
+    assert "profile" not in snap["analyze_object"]["kw"]
+    assert "overview" not in snap["analyze_object"]["kw"]
+
+
+def test_business_recipes_lead_with_get_object_profile():
+    """проведение/себестоимость/распределение/права/структура объекта compact branch
+    references get_object_profile (R5 #2)."""
+    from rlm_tools_bsl.bsl_knowledge import _BUSINESS_RECIPES
+
+    for domain in ("проведение", "себестоимость", "распределение", "права", "структура объекта"):
+        compact = " ".join(_BUSINESS_RECIPES[domain]["compact"])
+        assert "get_object_profile" in compact, domain

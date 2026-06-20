@@ -37,6 +37,51 @@ def test_nameerror_backward_compatible_two_args():
     assert "HINT" in out
 
 
+# ── v1.23.0: three recurrent agent-shape errors ─────────────────────────────
+
+
+def test_list_get_attribute_error_hint():
+    error = "AttributeError: 'list' object has no attribute 'get'"
+    code = "roles = find_roles('X'); print(roles.get('roles'))"
+    out = Sandbox._add_error_hints(error, code)
+    assert "СПИСОК (list[dict])" in out
+    assert "итерируй" in out.lower()
+
+
+def test_unhashable_dict_set_hint():
+    error = "TypeError: unhashable type: 'dict'"
+    code = "uniq = set(find_event_subscriptions('X'))"
+    out = Sandbox._add_error_hints(error, code)
+    assert "unhashable type 'dict'" in out
+    assert "set()" in out
+
+
+def test_keyerror_contract_shape_hint():
+    error = "KeyError: 'code_registers'"
+    code = "m = find_register_movements('X'); print(m['code_registers'][0]['lines'])"
+    out = Sandbox._add_error_hints(error, code)
+    assert "KeyError 'code_registers'" in out
+    assert "result.keys()" in out
+
+
+def test_keyerror_does_not_fire_generic_on_full_structure():
+    """The get_object_full_structure-specific KeyError hint stays; the generic one is suppressed."""
+    error = "KeyError: 'attr_kind'"
+    code = "s = get_object_full_structure('X'); print(s['attributes'][0]['attr_kind'])"
+    out = Sandbox._add_error_hints(error, code)
+    # specific hint mentions attr_kind contract; generic 'result.keys()' must NOT be appended
+    assert "attr_kind" in out
+    assert "result.keys()" not in out
+
+
+def test_keyerror_slice_uses_slice_hint_not_generic():
+    error = "KeyError: slice(None, 5, None)"
+    code = "flow = analyze_document_flow('X'); print(flow[:5])"
+    out = Sandbox._add_error_hints(error, code)
+    assert "срезаете dict как список" in out
+    assert "result.keys()" not in out
+
+
 # ── Интеграция: реальный Sandbox.execute() пробрасывает _registry/имена ──────
 
 

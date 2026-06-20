@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -2876,6 +2878,671 @@ def test_get_object_modules_stale_index_fallback_reason(monkeypatch):
             assert mm["_meta"]["fallback_reason"] == "index_empty_for_module"
             om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
             assert om["_meta"]["index_used"] is True
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_module_outline_no_live_skips_stale_read(monkeypatch):
+    """no_live=True: stale module → skipped marker (empty outline, skipped_live), NO live parse.
+    no_live=False on the same module → live read populates the outline (proves the contrast)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            real = reader.get_outline_data
+
+            def _stale(rel_path):
+                if rel_path.endswith("ManagerModule.bsl"):
+                    return {
+                        "module": {
+                            "category": "Documents",
+                            "object_name": "РеализацияТоваров",
+                            "module_type": "ManagerModule",
+                        },
+                        "regions": [],
+                        "methods": [],
+                    }
+                return real(rel_path)
+
+            monkeypatch.setattr(reader, "get_outline_data", _stale)
+            # Find the ManagerModule rel path.
+            mods = bsl["find_module"]("РеализацияТоваров")
+            mgr = next(m["path"] for m in mods if m["path"].endswith("ManagerModule.bsl"))
+
+            skipped = bsl["get_module_outline"](mgr, no_live=True)
+            assert skipped["_meta"]["skipped_live"] is True
+            assert skipped["_meta"]["index_used"] is False
+            assert skipped["_meta"]["fallback_reason"] == "index_empty_for_module"
+            assert skipped["outline"] == []
+            assert skipped["totals"]["methods"] == 0
+            # Identity still filled structurally (no body read needed).
+            assert skipped["object_name"] == "РеализацияТоваров"
+
+            live = bsl["get_module_outline"](mgr, no_live=False)
+            assert live["_meta"].get("skipped_live") is not True
+            assert live["totals"]["methods"] == 1  # ManagerModule has 1 export — live read happened
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_no_live_propagates(monkeypatch):
+    """get_object_modules(no_live=True): stale module marked skipped_live, top-level
+    _meta.modules_skipped_live=True, and NO live parse (methods stay 0 for that module)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            real = reader.get_outline_data
+
+            def _stale(rel_path):
+                if rel_path.endswith("ManagerModule.bsl"):
+                    return {
+                        "module": {
+                            "category": "Documents",
+                            "object_name": "РеализацияТоваров",
+                            "module_type": "ManagerModule",
+                        },
+                        "regions": [],
+                        "methods": [],
+                    }
+                return real(rel_path)
+
+            monkeypatch.setattr(reader, "get_outline_data", _stale)
+            res = bsl["get_object_modules"]("РеализацияТоваров", no_live=True)
+            mm = next(m for m in res["modules"] if m["path"].endswith("ManagerModule.bsl"))
+            assert mm["_meta"]["skipped_live"] is True
+            assert mm["totals"]["methods"] == 0  # not read
+            om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
+            assert om["_meta"]["index_used"] is True  # healthy module unaffected
+            assert res["_meta"]["modules_skipped_live"] is True
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_find_functional_options_include_code_gate():
+    """include_code=False → XML-only, the safe_grep code scan is skipped (code_options empty)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mod_dir = os.path.join(tmpdir, "CommonModules", "Скидки", "Ext")
+        os.makedirs(mod_dir)
+        with open(os.path.join(mod_dir, "Module.bsl"), "w", encoding="utf-8") as f:
+            f.write(
+                "Функция ИспользуютсяСкидки() Экспорт\n"
+                '    Возврат ПолучитьФункциональнуюОпцию("ИспользоватьСкидки");\n'
+                "КонецФункции\n"
+            )
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,
+        )
+        with_code = bsl["find_functional_options"]("Скидки", include_code=True)
+        assert any(c["option_name"] == "ИспользоватьСкидки" for c in with_code["code_options"])
+        xml_only = bsl["find_functional_options"]("Скидки", include_code=False)
+        assert xml_only["code_options"] == []
+
+
+# ============================================================
+# v1.23.0 — get_object_profile (one-shot compact object aggregate)
+# ============================================================
+
+_PROFILE_STATUS_ENUM = {"ok", "empty", "error", "unavailable", "skipped"}
+_PROFILE_SOURCE_ENUM = {"index", "live", "mixed", "unknown"}
+
+
+def _seed_profile_meta(db_path):
+    """Inject roles/subscriptions/FO/register_movements rows (+ a non-Document object)
+    so the profile data sections are populated, including a *Доп prefix-collision sibling."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        "INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES (?, ?, ?, ?)",
+        [
+            ("РольПродажи", "Document.РеализацияТоваров", "Read", "Roles/РольПродажи/Ext/Rights.xml"),
+            ("РольПродажи", "Document.РеализацияТоваров", "Update", "Roles/РольПродажи/Ext/Rights.xml"),
+            ("РольДоп", "Document.РеализацияТоваровДоп", "Read", "Roles/РольДоп/Ext/Rights.xml"),  # collision
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO event_subscriptions (name, synonym, event, handler_module, "
+        "handler_procedure, source_types, source_count, file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "ПодпискаРеализация",
+                "",
+                "BeforeWrite",
+                "ОМ",
+                "Обр",
+                json.dumps(["DocumentObject.РеализацияТоваров"], ensure_ascii=False),
+                1,
+                "es1.xml",
+            ),
+            (
+                "ПодпискаДоп",
+                "",
+                "OnWrite",
+                "ОМ",
+                "Обр2",
+                json.dumps(["DocumentObject.РеализацияТоваровДоп"], ensure_ascii=False),
+                1,
+                "es2.xml",
+            ),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO functional_options (name, synonym, location, content, file) VALUES (?, ?, ?, ?, ?)",
+        [
+            ("ФО_Реализация", "", "", json.dumps(["Document.РеализацияТоваров"], ensure_ascii=False), "fo1.xml"),
+            ("ФО_Доп", "", "", json.dumps(["Document.РеализацияТоваровДоп"], ensure_ascii=False), "fo2.xml"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO register_movements (document_name, register_name, source, file) VALUES (?, ?, ?, ?)",
+        [
+            ("РеализацияТоваров", "Продажи", "code", "om.bsl"),
+            ("РеализацияТоваров", "Себестоимость", "code", "om.bsl"),
+            ("РеализацияТоваров", "МеханизмУУ", "erp_mechanism", "mm.bsl"),
+            ("РеализацияТоваров", "ТаблицаX", "manager_table", "mm.bsl"),
+            ("РеализацияТоваров", "АдаптРег", "adapted", "mm.bsl"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO object_attributes (object_name, category, attr_name, attr_synonym, "
+        "attr_type, attr_kind, ts_name, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("Контрагенты", "Catalogs", "ИНН", "ИНН", json.dumps(["String"]), "attribute", None, "cat.xml"),
+            ("Контрагенты", "Catalogs", "КПП", "КПП", json.dumps(["String"]), "attribute", None, "cat.xml"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+def _make_profile_fixture(tmpdir, *, with_index=True, glob_counter=None, read_counter=None):
+    """Document РеализацияТоваров (ObjectModule+ManagerModule) + seeded metadata rows.
+    Optional glob/read counters prove the no-index path triggers no glob/live."""
+    obj = os.path.join(tmpdir, "Documents", "РеализацияТоваров", "Ext")
+    os.makedirs(obj)
+    with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+        f.write(BSL_CODE)
+    with open(os.path.join(obj, "ManagerModule.bsl"), "w", encoding="utf-8") as f:
+        f.write(_MANAGER_BSL)
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    format_info = detect_format(tmpdir)
+    reader = None
+    kw = {}
+    if with_index:
+        from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+        db_path = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+        _seed_profile_meta(db_path)
+        reader = IndexReader(str(db_path))
+        kw["idx_reader"] = reader
+
+    read_fn = helpers["read_file"]
+    glob_fn = helpers["glob_files"]
+    if read_counter is not None:
+        _r = read_fn
+
+        def read_fn(p, _r=_r):  # noqa: F811
+            read_counter.append(p)
+            return _r(p)
+
+    if glob_counter is not None:
+        _g = glob_fn
+
+        def glob_fn(pat, _g=_g):  # noqa: F811
+            glob_counter.append(pat)
+            return _g(pat)
+
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=read_fn,
+        grep_fn=helpers["grep"],
+        glob_files_fn=glob_fn,
+        format_info=format_info,
+        **kw,
+    )
+    return bsl, reader
+
+
+def _assert_section_shape(sec):
+    """Every section conforms to the unified contract."""
+    assert sec["status"] in _PROFILE_STATUS_ENUM, sec["status"]
+    assert isinstance(sec["summary"], dict)
+    assert isinstance(sec["items"], list)
+    assert isinstance(sec["total"], int)
+    assert isinstance(sec["returned"], int)
+    assert isinstance(sec["has_more"], bool)
+    assert sec["_meta"]["source"] in _PROFILE_SOURCE_ENUM, sec["_meta"]["source"]
+    assert isinstance(sec["_meta"]["elapsed_ms"], (int, float))
+
+
+def test_profile_default_sections_full_shape():
+    """Default profile: top-level + every section conforms; _meta tracing present."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("РеализацияТоваров")
+            assert "error" not in p
+            assert p["object_name"] == "РеализацияТоваров"
+            assert p["category"] == "Documents"
+            # default section set, no heavy flow/code_usages
+            assert set(p["sections"]) == {
+                "structure",
+                "modules",
+                "registers",
+                "subscriptions",
+                "roles",
+                "functional_options",
+            }
+            for sec in p["sections"].values():
+                _assert_section_shape(sec)
+            # _meta tracing (R4 #1,#2)
+            meta = p["_meta"]
+            assert meta["identity_source"] == "index"
+            assert meta["extension_visibility"] == "standalone"
+            assert isinstance(meta["total_elapsed_ms"], (int, float))
+            names = {s["name"] for s in meta["sections"]}
+            assert names == set(p["sections"])
+            for s in meta["sections"]:
+                assert set(s) >= {"name", "elapsed_ms", "source", "status", "items_count", "truncated"}
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_exact_ref_no_collision():
+    """roles/subscriptions/functional_options match РеализацияТоваров EXACTLY, never *Доп."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("РеализацияТоваров")
+            roles = p["sections"]["roles"]
+            assert roles["status"] == "ok"
+            assert {r["role_name"] for r in roles["items"]} == {"РольПродажи"}
+            subs = p["sections"]["subscriptions"]
+            assert {s["name"] for s in subs["items"]} == {"ПодпискаРеализация"}
+            fo = p["sections"]["functional_options"]
+            assert {f["name"] for f in fo["items"]} == {"ФО_Реализация"}
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_registers_summary_domain_counters_not_flattened():
+    """registers.summary keeps code/erp/manager/adapted counters separate (R5 #6)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            reg = bsl["get_object_profile"]("РеализацияТоваров")["sections"]["registers"]
+            assert reg["status"] == "ok"
+            assert reg["summary"] == {
+                "code_registers": 2,
+                "erp_mechanisms": 1,
+                "manager_tables": 1,
+                "adapted_registers": 1,
+            }
+            # total/returned/has_more self-consistent (all about the ONE main list)
+            assert reg["total"] == 5
+            assert reg["returned"] == 5
+            assert reg["has_more"] is False
+            # items = all movement targets with a source label; breakdown lives in summary
+            assert {i["register"] for i in reg["items"]} == {
+                "Продажи",
+                "Себестоимость",
+                "МеханизмУУ",
+                "ТаблицаX",
+                "АдаптРег",
+            }
+            assert {i["source"] for i in reg["items"]} == {"code", "erp_mechanism", "manager_table", "adapted"}
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_no_index_all_sections_unavailable_no_glob():
+    """No index → identity from input prefix, ALL data sections 'unavailable', NO glob/read (R10 #1, R11 #1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        globs, reads = [], []
+        bsl, _ = _make_profile_fixture(tmpdir, with_index=False, glob_counter=globs, read_counter=reads)
+        globs.clear()
+        reads.clear()
+        p = bsl["get_object_profile"]("Документ.РеализацияТоваров")
+        assert p["object_name"] == "РеализацияТоваров"
+        assert p["category"] == "Documents"
+        assert p["_meta"]["identity_source"] == "input_prefix"
+        for name, sec in p["sections"].items():
+            assert sec["status"] == "unavailable", name
+            assert sec["_meta"]["reason"] == "no_index"
+        # The compact no-index path must NOT touch the filesystem.
+        assert globs == [], f"unexpected glob: {globs}"
+        assert reads == [], f"unexpected read: {reads}"
+
+
+def test_profile_no_index_bare_name_errors_no_glob():
+    """No index + bare name (no type prefix) → {error:'no_index_identity_unresolved'}, NO glob."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        globs = []
+        bsl, _ = _make_profile_fixture(tmpdir, with_index=False, glob_counter=globs)
+        globs.clear()
+        p = bsl["get_object_profile"]("РеализацияТоваров")
+        assert p["error"] == "no_index_identity_unresolved"
+        assert "hint" in p
+        assert globs == []
+
+
+def test_profile_per_section_isolation():
+    """A broken section (component raises) → status 'error', neighbors 'ok', profile still valid (R2 #2, R4 #4)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+
+            def _boom(*a, **k):
+                raise RuntimeError("boom")
+
+            reader.get_roles_exact = _boom  # shadow → roles section raises
+            p = bsl["get_object_profile"]("РеализацияТоваров")
+            assert "error" not in p  # profile still valid
+            assert p["sections"]["roles"]["status"] == "error"
+            assert "boom" in p["sections"]["roles"]["_meta"]["error"]
+            # neighbors unaffected
+            assert p["sections"]["subscriptions"]["status"] in {"ok", "empty"}
+            assert p["sections"]["registers"]["status"] == "ok"
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_not_found_top_level_error():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("НетТакогоОбъекта")
+            assert "error" in p
+            assert p["_meta"]["identity_source"] == "unresolved"
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_non_document_modules_empty_registers_skipped():
+    """Catalog (no BSL modules): modules 'empty', registers 'skipped' (not a Document), structure 'ok'."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("Справочник.Контрагенты")
+            assert p["object_name"] == "Контрагенты"
+            assert p["category"] == "Catalogs"
+            assert p["sections"]["modules"]["status"] == "empty"
+            assert p["sections"]["registers"]["status"] == "skipped"
+            assert p["sections"]["registers"]["_meta"]["reason"] == "not_a_document"
+            structure = p["sections"]["structure"]
+            assert structure["status"] == "ok"
+            assert structure["summary"]["attributes"] == 2
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_sections_arg_takes_exactly_requested():
+    """sections=[...] (with aliases) runs ONLY the requested sections."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("РеализацияТоваров", sections=["structure", "права"])
+            assert set(p["sections"]) == {"structure", "roles"}  # 'права' → roles alias
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_include_flow_adds_heavy_section_only_on_flag():
+    """flow/code_usages sections appear ONLY under include_flow/include_code_usages (heavy gated)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            default = bsl["get_object_profile"]("РеализацияТоваров")
+            assert "flow" not in default["sections"]
+            assert "code_usages" not in default["sections"]
+            withflow = bsl["get_object_profile"]("РеализацияТоваров", include_flow=True)
+            assert "flow" in withflow["sections"]
+            assert withflow["sections"]["flow"]["_meta"]["source"] == "mixed"
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_items_carry_no_procedure_bodies():
+    """Compact output contract (R4 #3): section items expose only names/paths/counts, no bodies."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("РеализацияТоваров")
+            for sec in p["sections"].values():
+                for item in sec["items"]:
+                    # no procedure bodies / large snippets (a small 'source' label is fine)
+                    assert "body" not in item and "text" not in item
+                    # items are small flat dicts (names/paths/counts only)
+                    for v in item.values():
+                        assert not (isinstance(v, str) and len(v) > 300)
+        finally:
+            if reader:
+                reader.close()
+
+
+def _make_homonym_profile_fixture(tmpdir):
+    """Document.Заказ AND Catalog.Заказ — both have an ObjectModule (a true homonym)."""
+    for cat in ("Documents", "Catalogs"):
+        d = os.path.join(tmpdir, cat, "Заказ", "Ext")
+        os.makedirs(d)
+        with open(os.path.join(d, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write(BSL_CODE)
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    format_info = detect_format(tmpdir)
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+    db_path = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+    reader = IndexReader(str(db_path))
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+        idx_reader=reader,
+    )
+    return bsl, reader
+
+
+def test_profile_homonym_modules_category_aware():
+    """Homonym Document.Заказ / Catalog.Заказ: modules section carries ONLY the resolved
+    category's module (category-aware adapter, not a merge of both) (R2 #1, R5 #1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_homonym_profile_fixture(tmpdir)
+        try:
+            p = bsl["get_object_profile"]("Заказ")
+            cat = p["category"]
+            assert cat in {"Documents", "Catalogs"}
+            mods = p["sections"]["modules"]
+            assert mods["status"] == "ok"
+            # every module path belongs to the ONE resolved category (no homonym merge)
+            folder = cat + "/"
+            for item in mods["items"]:
+                assert folder in item["path"].replace("\\", "/"), (cat, item["path"])
+            assert mods["total"] == 1  # exactly that object's single module
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_prefix_disambiguates_homonym():
+    """Explicit type prefix routes identity (and ALL sections) to the requested category on a
+    cross-category homonym — in the INDEXED path, not just no-index (codex finding 1)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_homonym_profile_fixture(tmpdir)
+        try:
+            doc = bsl["get_object_profile"]("Документ.Заказ")
+            assert doc["category"] == "Documents"
+            assert doc["_meta"]["identity_source"] == "index_prefix"
+            assert doc["sections"]["modules"]["items"]
+            for item in doc["sections"]["modules"]["items"]:
+                assert "Documents/" in item["path"].replace("\\", "/")
+            # structure stays on the SAME homonym (category_hint) — no identity_match drift
+            assert "identity_match" not in doc["sections"]["structure"]["_meta"]
+
+            cat = bsl["get_object_profile"]("Справочник.Заказ")
+            assert cat["category"] == "Catalogs"
+            for item in cat["sections"]["modules"]["items"]:
+                assert "Catalogs/" in item["path"].replace("\\", "/")
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_prefix_missing_type_falls_back_honestly():
+    """Explicit prefix for a type that does NOT contain the object → fall back to the object's
+    REAL category with identity_source='index' (NOT a misleading 'index_prefix'). Guards the
+    Pass-3 close-match leak when prefer_category is set (codex finding 5)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # ONLY Catalog.Заказ exists — there is NO Document.Заказ.
+        d = os.path.join(tmpdir, "Catalogs", "Заказ", "Ext")
+        os.makedirs(d)
+        with open(os.path.join(d, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write(BSL_CODE)
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+        db_path = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+        reader = IndexReader(str(db_path))
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,
+            idx_reader=reader,
+        )
+        try:
+            p = bsl["get_object_profile"]("Документ.Заказ")
+            # the object exists only as a Catalog → resolved to its real category, honestly labelled
+            assert p["category"] == "Catalogs"
+            assert p["object_name"] == "Заказ"
+            assert p["_meta"]["identity_source"] == "index", "must NOT claim index_prefix on a fallback"
+        finally:
+            reader.close()
+
+
+def test_profile_prefix_case_insensitive():
+    """The type prefix is recognised case-insensitively AND `bare` is derived from the suffix,
+    so 'document.X' / 'DOCUMENT.X' behave exactly like 'Document.X' / 'Документ.X' (finding 6)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_homonym_profile_fixture(tmpdir)
+        try:
+            for variant in ("Документ.Заказ", "document.Заказ", "DOCUMENT.Заказ", "Document.Заказ"):
+                p = bsl["get_object_profile"](variant)
+                assert "error" not in p, (variant, p)
+                assert p["category"] == "Documents", variant
+                assert p["object_name"] == "Заказ", variant
+                assert p["_meta"]["identity_source"] == "index_prefix", variant
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_modules_skipped_status_on_stale(monkeypatch):
+    """no_live modules section that hits a stale module → status 'skipped' (NOT 'ok'): the
+    zero methods/exports are not authoritative; section flagged for a full live re-read (finding 2)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            real = reader.get_outline_data
+
+            def _stale(rel_path):
+                if rel_path.endswith("ObjectModule.bsl"):
+                    return {
+                        "module": {
+                            "category": "Documents",
+                            "object_name": "РеализацияТоваров",
+                            "module_type": "ObjectModule",
+                        },
+                        "regions": [],
+                        "methods": [],
+                    }
+                return real(rel_path)
+
+            monkeypatch.setattr(reader, "get_outline_data", _stale)
+            mods = bsl["get_object_profile"]("РеализацияТоваров")["sections"]["modules"]
+            assert mods["status"] == "skipped"
+            assert mods["_meta"]["modules_skipped_live"] is True
+            assert mods["_meta"]["reason"] == "stale_modules_skipped_live"
+            om = next(i for i in mods["items"] if i["path"].endswith("ObjectModule.bsl"))
+            assert om["skipped_live"] is True
+            assert om["methods"] == 0  # not read — flagged, not silently authoritative
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_code_usages_surfaces_live_fallback(monkeypatch):
+    """code_usages reflects find_code_usages' live grep fallback (partial=True → source 'live',
+    not 'index') so the hidden live cost is visible (codex finding 3)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+
+            def _boom(*a, **k):
+                raise RuntimeError("no v13 metadata_code_usages table")
+
+            monkeypatch.setattr(reader, "find_code_usages", _boom)
+            monkeypatch.setattr(reader, "count_code_usages", _boom)
+            p = bsl["get_object_profile"]("РеализацияТоваров", include_code_usages=True)
+            cu = p["sections"]["code_usages"]
+            assert cu["_meta"]["source"] == "live"
+            assert cu["_meta"]["partial"] is True
+            assert cu["summary"]["partial"] is True
+            # the per-section _meta source surfaced into the top-level trace
+            trace = next(s for s in p["_meta"]["sections"] if s["name"] == "code_usages")
+            assert trace["source"] == "live"
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_profile_trace_truncated_matches_has_more():
+    """A section sliced by `limit` (has_more=True) reports _meta.truncated=True AND the
+    top-level trace truncated=True — the trace must not lie about truncation (codex finding)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
+        try:
+            p = bsl["get_object_profile"]("РеализацияТоваров", limit=2)
+            reg = p["sections"]["registers"]  # 5 movements, limit 2 → truncated preview
+            assert reg["has_more"] is True
+            assert reg["_meta"]["truncated"] is True  # section _meta honest
+            reg_trace = next(s for s in p["_meta"]["sections"] if s["name"] == "registers")
+            assert reg_trace["truncated"] is True  # trace agrees with has_more
+
+            subs = p["sections"]["subscriptions"]  # only 1 match → not truncated
+            assert subs["has_more"] is False
+            assert subs["_meta"]["truncated"] is False
+            subs_trace = next(s for s in p["_meta"]["sections"] if s["name"] == "subscriptions")
+            assert subs_trace["truncated"] is False
         finally:
             if reader:
                 reader.close()

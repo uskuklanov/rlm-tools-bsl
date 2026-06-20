@@ -90,6 +90,21 @@ class ExecutionResult:
     error: str | None
     variables: list[str]
     helper_calls: list[HelperCall] | None = None
+    efficiency_hints: list[dict] | None = None
+
+
+def _arg_fingerprint(args, kwargs) -> str | None:
+    """Best-effort identity fingerprint of a helper call: the first non-empty STRING
+    positional arg (object name / path), else the first string kwarg value, normalized
+    (stripped + lower). Non-string / unreadable args → ``None`` (skip). Used only by the
+    session efficiency-nudge aggregator — never affects helper behaviour or return value."""
+    for a in args:
+        if isinstance(a, str) and a.strip():
+            return a.strip().lower()
+    for v in kwargs.values():
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    return None
 
 
 def _make_restricted_import(allowed: frozenset[str]):
@@ -127,6 +142,12 @@ class Sandbox:
         # Session-wide state for duplicate-call detection. NOT cleared in execute().
         self._session_call_count: int = 0
         self._session_call_signatures: dict[str, int] = {}
+        # Session-wide efficiency-nudge aggregators (strictly instance-local — never a
+        # module singleton, else hints would leak across projects/sessions). NOT cleared
+        # in execute(). `*_arg_counts` keys on (helper_name, arg_fingerprint).
+        self._session_helper_name_counts: dict[str, int] = {}
+        self._session_helper_arg_counts: dict[tuple[str, str], int] = {}
+        self._emitted_efficiency_hints: set[str] = set()
         self._setup_namespace()
 
     def _setup_namespace(self) -> None:
@@ -236,6 +257,14 @@ class Sandbox:
                             duplicate_of = prev
                         else:
                             self._session_call_signatures[sig_key] = seq
+                    # Session-level efficiency aggregator (name count + arg fingerprint).
+                    # Composite helpers call inner closures directly (bypassing this
+                    # wrapper), so only TOP-LEVEL agent calls are counted here.
+                    self._session_helper_name_counts[_name] = self._session_helper_name_counts.get(_name, 0) + 1
+                    _fp = _arg_fingerprint(args, kwargs)
+                    if _fp is not None:
+                        _akey = (_name, _fp)
+                        self._session_helper_arg_counts[_akey] = self._session_helper_arg_counts.get(_akey, 0) + 1
                     try:
                         return _fn(*args, **kwargs)
                     finally:
@@ -252,6 +281,81 @@ class Sandbox:
             else:
                 wrapped[name] = obj
         return wrapped
+
+    # Batch/aggregate helpers — using ANY of them means the agent is already batching,
+    # which suppresses the generic "batch more" nudge.
+    _AGGREGATE_HELPERS = frozenset(
+        {"read_files", "get_object_profile", "get_object_modules", "get_object_full_structure"}
+    )
+
+    def _compute_efficiency_hints(self) -> list[dict]:
+        """Session-cumulative efficiency nudges, throttled to ONE per id per session.
+
+        Lives in the ``rlm_execute`` response metadata (never the helper return / stdout —
+        see ``test_sandbox_helper_return_value_unchanged``). Each hint:
+        ``{id, message, trigger, helper?, count?}`` with stable ids
+        ``read_files`` / ``reuse_var`` / ``batch``."""
+        out: list[dict] = []
+        nc = self._session_helper_name_counts
+        emitted = self._emitted_efficiency_hints
+
+        # (1) Non-batched homogeneous reads → read_files([...]) / read_procedure(path, [...]).
+        rf = nc.get("read_file", 0)
+        rp = nc.get("read_procedure", 0)
+        if (rf >= 3 or rp >= 3) and "read_files" not in emitted:
+            emitted.add("read_files")
+            helper = "read_file" if rf >= rp else "read_procedure"
+            out.append(
+                {
+                    "id": "read_files",
+                    "helper": helper,
+                    "count": max(rf, rp),
+                    "trigger": f"{helper} x{max(rf, rp)} single calls in session",
+                    "message": (
+                        "Несколько одиночных чтений за сессию — батчи: read_files([...]) одним вызовом "
+                        "вместо N×read_file; read_procedure(path, ['Проц1','Проц2']) списком вместо N вызовов."
+                    ),
+                }
+            )
+
+        # (3) Re-resolve: find_module / extract_procedures repeated on the SAME object.
+        if "reuse_var" not in emitted:
+            for h in ("find_module", "extract_procedures"):
+                rep = max((c for (n, _fp), c in self._session_helper_arg_counts.items() if n == h), default=0)
+                if rep >= 2:
+                    emitted.add("reuse_var")
+                    out.append(
+                        {
+                            "id": "reuse_var",
+                            "helper": h,
+                            "count": rep,
+                            "trigger": f"{h} repeated on same arg x{rep}",
+                            "message": (
+                                "Повторный резолв того же объекта — сохрани результат в переменную "
+                                "(переменные живут между rlm_execute) или возьми get_object_profile(name) за 1 вызов."
+                            ),
+                        }
+                    )
+                    break
+
+        # (2) Many single helper calls and no aggregate helper used → batch more.
+        total = sum(nc.values())
+        used_aggregate = any(nc.get(h, 0) for h in self._AGGREGATE_HELPERS)
+        if total >= 8 and not used_aggregate and "batch" not in emitted:
+            emitted.add("batch")
+            out.append(
+                {
+                    "id": "batch",
+                    "helper": None,
+                    "count": total,
+                    "trigger": f"{total} single helper calls, no aggregate helper used",
+                    "message": (
+                        "Много одиночных вызовов — батчи 3–5 связанных операций в один rlm_execute; "
+                        "для обзора объекта бери get_object_profile(name) (≈10 вызовов в 1)."
+                    ),
+                }
+            )
+        return out
 
     @contextmanager
     def _execution_timeout(self):
@@ -325,6 +429,7 @@ class Sandbox:
             error=error,
             variables=self.list_variables(),
             helper_calls=list(self._helper_calls),
+            efficiency_hints=self._compute_efficiency_hints() or None,
         )
 
     @staticmethod
@@ -466,6 +571,35 @@ class Sandbox:
                 "HINT: detect_extensions() возвращает dict {config_role, config_name, "
                 "config_prefix, warnings, nearby_extensions, nearby_main}, НЕ список. "
                 "Расширения — это список ctx['nearby_extensions']; роль — ctx['config_role']."
+            )
+
+        # v1.23.0 — three recurrent agent-shape errors (from A/B logs). Each caught retry
+        # that the agent would otherwise spend a whole rlm_execute fixing = −1 call.
+        # (a) .get()/.keys() on a list result (helper returned list[dict], not dict).
+        if "AttributeError" in error and "'list' object has no attribute" in error:
+            hints.append(
+                "HINT: результат — СПИСОК (list[dict]), а не dict — не зови .get()/[ключ] на самом "
+                "списке. Итерируй элементы: for r in result: print(r['name']). Списком отдают, напр., "
+                "find_event_subscriptions (без limit), search_methods, extract_procedures, "
+                "find_roles(...)['roles']."
+            )
+        # (b) set()/dict-key over list[dict] → unhashable.
+        if "TypeError" in error and "unhashable type: 'dict'" in error:
+            hints.append(
+                "HINT: unhashable type 'dict' — нельзя положить dict в set() или в ключ dict. "
+                "Элементы результата — словари: для дедупликации бери конкретное поле — "
+                "{r['name'] for r in result} либо seen=set(); seen.add(r['name'])."
+            )
+        # (c) KeyError on a result-contract key not covered by the specific hints above.
+        if "KeyError" in error and "slice(" not in error and "get_object_full_structure" not in code:
+            mk = re.search(r"KeyError: '?([^'\n]+)'?", error)
+            bad_key = mk.group(1) if mk else "<key>"
+            hints.append(
+                f"HINT: KeyError '{bad_key}' — форма результата иная, чем ожидалось. Многие хелперы "
+                "возвращают dict с под-списками: find_register_movements → {code_registers, "
+                "erp_mechanisms, manager_tables, adapted_registers}; get_object_profile → "
+                "{object_name, category, sections:{...}, _meta}; get_overrides → {overrides, total, "
+                "source}. Сверь ключи: print(list(result.keys())) или rlm_help(helpers=['имя'])."
             )
 
         if "import" in error.lower() and "restricted" in error.lower():

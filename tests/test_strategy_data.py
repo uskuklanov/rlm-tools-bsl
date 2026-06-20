@@ -100,6 +100,35 @@ def test_rlm_help_topic_extensions_does_not_suggest_read_file_on_ext_paths():
     assert "extract_procedures" in full_text + compact_text
 
 
+# ── v1.23.0 tripwires: batch-default + truncation marker (slim + full) ──────
+
+
+def test_batching_leads_with_get_object_profile_slim_and_full():
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    for text in (STRATEGY_SECTIONS["batching"], _STRATEGY_HEADER):
+        assert "get_object_profile" in text
+        # the batch (list) form of the overloaded reader is shown, not just the single form
+        assert "read_procedure(path, ['" in text
+        # read_files batch form promoted
+        assert "read_files([" in text
+
+
+def test_truncation_marker_matches_sandbox_slim_and_full():
+    """Strategy references the ACTUAL marker the sandbox writes — '... [output truncated]' (R2 #4)."""
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    for text in (STRATEGY_SECTIONS["batching"], _STRATEGY_HEADER):
+        assert "... [output truncated]" in text
+
+
+def test_no_get_index_info_on_start_note_slim_and_full():
+    from rlm_tools_bsl.bsl_knowledge import _STRATEGY_HEADER
+
+    for text in (STRATEGY_SECTIONS["batching"], _STRATEGY_HEADER):
+        assert "get_index_info" in text  # the "не зови ... на старте" note
+
+
 def test_extension_critical_block_mentions_new_phrasing():
     from types import SimpleNamespace
 

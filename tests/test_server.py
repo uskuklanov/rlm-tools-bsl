@@ -106,6 +106,116 @@ def test_full_rlm_flow():
         assert end_data["success"] is True
 
 
+def test_rlm_start_index_block_carries_discovery_fields(monkeypatch):
+    """rlm_start.index carries builder_version + has_*/counts so the agent skips a
+    separate get_index_info() discovery call on start (Tier 3.2 — PUBLIC key names)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        from rlm_tools_bsl.bsl_index import IndexBuilder
+
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+
+        result = json.loads(_rlm_start(path=tmpdir, query="discovery fields"))
+        try:
+            idx = result["index"]
+            assert idx["loaded"] is True
+            assert isinstance(idx["builder_version"], int) and idx["builder_version"] >= 11
+            for key in (
+                "has_synonyms",
+                "object_synonyms",
+                "has_object_attributes",
+                "object_attributes_count",
+                "has_predefined_items",
+                "predefined_items_count",
+                "has_form_elements",
+                "form_elements_count",
+                "has_metadata_references",
+                "metadata_references_count",
+                "has_metadata_code_usages",
+                "metadata_code_usages_count",
+            ):
+                assert key in idx, f"missing index discovery field: {key}"
+            assert isinstance(idx["has_object_attributes"], bool)
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_rlm_start_index_block_shape_consistent_without_index(monkeypatch):
+    """A project WITHOUT an index returns the SAME index discovery keys (safe defaults) so the
+    payload shape is stable — agents read them instead of calling get_index_info() and must not
+    KeyError on no-index projects (codex finding)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # plain non-BSL dir + RLM_INDEX_DIR pointing at an empty location → no index loads
+        with open(os.path.join(tmpdir, "example.py"), "w") as f:
+            f.write("def f():\n    return 1\n")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".empty_idx"))
+        result = json.loads(_rlm_start(path=tmpdir, query="no index"))
+        try:
+            idx = result["index"]
+            assert idx["loaded"] is False
+            # SAME discovery keys as the with-index branch, with safe defaults
+            for key in (
+                "builder_version",
+                "has_synonyms",
+                "object_synonyms",
+                "has_object_attributes",
+                "object_attributes_count",
+                "has_predefined_items",
+                "predefined_items_count",
+                "has_form_elements",
+                "form_elements_count",
+                "has_metadata_references",
+                "metadata_references_count",
+                "has_metadata_code_usages",
+                "metadata_code_usages_count",
+            ):
+                assert key in idx, f"missing no-index discovery field: {key}"
+            assert idx["builder_version"] == 0
+            assert idx["has_object_attributes"] is False
+            assert idx["object_attributes_count"] == 0
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_efficiency_hints_in_execute_response_and_log(caplog):
+    """efficiency_hints surface in the rlm_execute response metadata AND the server log
+    carries `hints=<id>` for A/B analysis (Tier 2.1)."""
+    import logging
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for n in ("a", "b", "c"):
+            with open(os.path.join(tmpdir, f"{n}.txt"), "w", encoding="utf-8") as f:
+                f.write("x")
+        start = json.loads(_rlm_start(path=tmpdir, query="hints flow"))
+        sid = start["session_id"]
+        try:
+            with caplog.at_level(logging.INFO, logger="rlm_tools_bsl.server"):
+                res = json.loads(_rlm_execute(sid, "read_file('a.txt'); read_file('b.txt'); read_file('c.txt')"))
+            assert "efficiency_hints" in res
+            assert any(h["id"] == "read_files" for h in res["efficiency_hints"])
+            assert any("hints=read_files" in r.getMessage() for r in caplog.records)
+        finally:
+            _rlm_end(sid)
+
+
+def test_rlm_execute_tool_description_mentions_profile_and_batch():
+    """rlm_execute Field description teaches get_object_profile + batch forms (R3 #2)."""
+    import inspect
+
+    from rlm_tools_bsl import server
+
+    src = inspect.getsource(server)
+    assert "get_object_profile(name) (structure+modules" in src
+    assert "read_files([p1,p2])" in src
+    assert "read_procedure(path, ['ProcA','ProcB'])" in src
+
+
 def test_invalid_session():
     result = _rlm_execute(session_id="nonexistent", code="print('hi')")
     data = json.loads(result)

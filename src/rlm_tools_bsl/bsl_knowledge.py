@@ -474,18 +474,18 @@ get_object_modules(name) vs get_object_full_structure(name):
   Разные стороны объекта, дополняют друг друга — нужны обе стороны, зови оба (каждый дёшев на индексе).
 
 == BATCHING & OUTPUT ==
-Batch 3-5 related helpers per rlm_execute call — this is more efficient than one-at-a-time.
-Pass a LIST to overloaded helpers — резолвит модуль/объект один раз, возвращает dict по имени:
-  read_procedure(path, ['Проц1','Проц2']) · find_callers_context(['A','B'], hint) · find_enum_values(['E1','E2'])
-AGGREGATE-FIRST, не после: get_object_modules(name) → код-скелет ВСЕХ модулей объекта;
-  get_object_full_structure(name) → метаданные. Звать individual-хелперы, а ПОТОМ тот же агрегат
-  (напр. find_register_movements + затем analyze_document_flow) — двойной фетч; бери агрегат сразу.
-If output is truncated (ends with '... [truncated]'), split into smaller calls.
+ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ — Step 0 полного анализа объекта (вместо ~10 одиночных хелперов):
+  get_object_profile(name) → compact roll-up по секциям (структура+модули+регистры+подписки+роли+ФО), items=top-N без тел.
+  Ровно нужное: sections=['structure','roles']; тяжёлое — только include_flow=True / include_code_usages=True.
+БАТЧ-ФОРМА по умолчанию — передавай LIST перегруженным хелперам (резолв объекта 1 раз, dict по имени):
+  read_procedure(path, ['Проц1','Проц2']) · find_callers_context(['A','B'], hint) · find_enum_values(['E1','E2']) · read_files([p1,p2,p3])
+AGGREGATE-FIRST (не после): get_object_modules(name) → код-скелет; get_object_full_structure(name) → метаданные.
+  Звать individual-хелпер, а ПОТОМ тот же агрегат — двойной фетч; бери агрегат сразу. Батчи 3-5 связанных операций за вызов.
+If output is truncated (ends with '... [output truncated]'), split into smaller calls.
 Print only summaries (counts, first N items) — never dump raw data.
-If response contains 'duplicates' section — you've called the same helper with identical args twice
-(possibly across rlm_execute calls). If you assigned the previous result to a variable, reuse it —
-variables persist across rlm_execute calls. Otherwise the second call is wasted work; restructure
-your batches. Note: helper return values are NOT cached automatically — only variables you assigned.
+Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
+  и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
+Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index).
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -505,9 +505,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "себестоимость": {
         "compact": [
             "search_objects('себестоимость') → объекты по синониму",
-            "find_by_type('AccumulationRegisters', 'Себестоимость') → регистры",
-            "find_register_writers('РегистрИмя') → документы-писатели",
-            "analyze_document_flow('ДокИмя') → проводки + подписки",
+            "get_object_profile('ДокИмя') → за 1 вызов: регистры + подписки + структура + модули (вместо find_register_movements/analyze_document_flow по отдельности)",
+            "find_register_writers('РегистрСебестоимости') → какие документы пишут в регистр",
+            "детали потока → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
             "search_objects('себестоимость') → документы, регистры, модули по синониму",
@@ -523,9 +523,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "проведение": {
         "compact": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
-            "find_register_movements('ДокИмя') → какие регистры пишет",
-            "проверить is_postable: если find_register_movements вернул is_postable=False — переходить к find_event_subscriptions, не искать ОбработкаПроведения",
-            "analyze_document_flow('ДокИмя') → подписки + движения + задания",
+            "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
+            "registers.summary: если code_registers=0 и движений нет — документ непроводим, смотри subscriptions, не ищи ОбработкуПроведения",
+            "поток целиком → get_object_profile('ДокИмя', include_flow=True); код проведения → read_procedure(path, 'ОбработкаПроведения')",
         ],
         "full": [
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
@@ -542,8 +542,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "распределение": {
         "compact": [
             "search_objects('распределение') → объекты по синониму",
-            "search_methods('Распредел') → методы распределения",
-            "find_register_writers('РегистрИмя') → документы-источники",
+            "get_object_profile('ДокИмя') → за 1 вызов: регистры + подписки + структура + модули",
+            "find_register_writers('РегистрИмя') → документы-источники; методы → search_methods('Распредел')",
         ],
         "full": [
             "search_objects('распределение') → объекты по синониму",
@@ -576,8 +576,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     "права": {
         "compact": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
-            "find_roles('ОбъектИмя') → роли с доступом к объекту",
-            "find_functional_options('ОбъектИмя') → функциональные опции",
+            "get_object_profile('ОбъектИмя') → за 1 вызов: роли (roles) + функц.опции (functional_options) + структура",
+            "детальнее: find_roles('ОбъектИмя') по ролям; find_functional_options('ОбъектИмя') по опциям",
         ],
         "full": [
             "search_objects('ОбъектИмя') → найти объект по бизнес-имени",
@@ -711,8 +711,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "структура объекта": {
         "compact": [
-            "get_object_full_structure('ИмяОбъекта') → metadata + attrs + ТЧ + predefined + enums + forms за 1 вызов",
-            "Если _meta.index_used=False — индекс отсутствует, синонимы ТЧ доступны (live XML)",
+            "get_object_profile('ИмяОбъекта') → за 1 вызов: структура + модули + регистры + подписки + роли + ФО",
+            "только метаданные (реквизиты/ТЧ/предопределённые) → get_object_full_structure('ИмяОбъекта'); только код → get_object_modules('ИмяОбъекта')",
         ],
         "full": [
             "s = get_object_full_structure('ИмяОбъекта')",

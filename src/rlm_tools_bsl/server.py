@@ -594,7 +594,7 @@ def _rlm_start(
     available_functions.extend(
         [
             "read_file(path) -> str (numbered: '  42 | code')",
-            "read_files(paths) -> dict[path, str] (numbered: '  42 | code')",
+            "read_files(paths) -> dict[path, str] — BATCH: читай N файлов одним вызовом вместо N×read_file (numbered)",
             "grep(pattern, path='.') -> list[dict] keys: file, line, text",
             "grep_summary(pattern, path='.') -> compact grouped string",
             "grep_read(pattern, path='.', max_files=10, context_lines=0) -> {matches, files (numbered), summary}",
@@ -623,6 +623,63 @@ def _rlm_start(
     else:
         shown_exts = list(ext_context.nearby_extensions)
         ext_total = ext_shown = len(shown_exts)
+
+    # rlm_start.index carries a get_index_info()-shaped subset (PUBLIC key names —
+    # builder_version + has_*/counts) so the agent does NOT need a separate
+    # get_index_info() discovery call on start. Derivation mirrors get_index_info.
+    if idx_stats:
+        _bv = int(idx_stats.get("builder_version") or 0)
+        _has_meta = bool(idx_stats.get("has_metadata"))
+        index_block: dict = {
+            "loaded": idx_reader is not None,
+            "index_check": "quick",
+            "builder_version": _bv,
+            "methods": idx_stats.get("methods"),
+            "calls": idx_stats.get("calls"),
+            "has_fts": idx_stats.get("has_fts", False),
+            "has_synonyms": bool(idx_stats.get("object_synonyms", 0)),
+            "object_synonyms": idx_stats.get("object_synonyms", 0),
+            "has_object_attributes": _bv >= 11 and _has_meta,
+            "object_attributes_count": idx_stats.get("object_attributes", 0),
+            "has_predefined_items": _bv >= 11 and _has_meta,
+            "predefined_items_count": idx_stats.get("predefined_items", 0),
+            "has_form_elements": _bv >= 10 and _has_meta,
+            "form_elements_count": idx_stats.get("form_elements", 0),
+            "has_metadata_references": _bv >= 12 and (idx_stats.get("metadata_references") or 0) > 0,
+            "metadata_references_count": idx_stats.get("metadata_references", 0),
+            "has_metadata_code_usages": _bv >= 13,
+            "metadata_code_usages_count": idx_stats.get("metadata_code_usages", 0),
+            "config_name": idx_stats.get("config_name"),
+            "config_version": idx_stats.get("config_version"),
+            "warnings": idx_warnings,
+        }
+    else:
+        # No index loaded — SAME key set with safe defaults so the payload shape is stable
+        # (strategy/docs tell the agent to read these from rlm_start.index; a missing key
+        # would break that or push agents back to a get_index_info() call).
+        index_block = {
+            "loaded": idx_reader is not None,
+            "index_check": "quick",
+            "builder_version": 0,
+            "methods": None,
+            "calls": None,
+            "has_fts": False,
+            "has_synonyms": False,
+            "object_synonyms": 0,
+            "has_object_attributes": False,
+            "object_attributes_count": 0,
+            "has_predefined_items": False,
+            "predefined_items_count": 0,
+            "has_form_elements": False,
+            "form_elements_count": 0,
+            "has_metadata_references": False,
+            "metadata_references_count": 0,
+            "has_metadata_code_usages": False,
+            "metadata_code_usages_count": 0,
+            "config_name": None,
+            "config_version": None,
+            "warnings": idx_warnings,
+        }
 
     response: dict = {
         "session_id": session_id,
@@ -658,16 +715,7 @@ def _rlm_start(
             ),
         },
         "detected_custom_prefixes": detected_prefixes,
-        "index": {
-            "loaded": idx_reader is not None,
-            "index_check": "quick",
-            "methods": idx_stats.get("methods") if idx_stats else None,
-            "calls": idx_stats.get("calls") if idx_stats else None,
-            "has_fts": idx_stats.get("has_fts", False) if idx_stats else False,
-            "config_name": idx_stats.get("config_name") if idx_stats else None,
-            "config_version": idx_stats.get("config_version") if idx_stats else None,
-            "warnings": idx_warnings,
-        },
+        "index": index_block,
         "metadata": metadata,
         "effective_effort": effort,
         "limits": {
@@ -854,6 +902,11 @@ def _rlm_execute(
         if duplicates:
             response["duplicates"] = duplicates
 
+    # Server-side efficiency nudges (session-cumulative, throttled). Response metadata
+    # ONLY — never in the helper return or stdout. Stable ids: read_files/reuse_var/batch.
+    if result.efficiency_hints:
+        response["efficiency_hints"] = result.efficiency_hints
+
     if detail_level in {"usage", "full"}:
         response["usage"] = {
             "execute_calls_used": session.execute_calls,
@@ -892,8 +945,11 @@ def _rlm_execute(
     result_json = json.dumps(response, ensure_ascii=False)
     out_chars = len(result_json)
     session.total_out_chars += out_chars
+    hints_log = ""
+    if result.efficiency_hints:
+        hints_log = " hints=" + ",".join(h["id"] for h in result.efficiency_hints)
     logger.info(
-        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s",
+        "rlm_execute: session=%s call=%d/%d error=%s elapsed=%.2fs out_chars=%d out_tokens~%d%s%s",
         session_id,
         session.execute_calls,
         session.max_execute_calls,
@@ -902,6 +958,7 @@ def _rlm_execute(
         out_chars,
         int(out_chars / 1.75),
         helpers_summary,
+        hints_log,
     )
     return result_json
 
@@ -1029,8 +1086,10 @@ async def rlm_execute(
         Field(
             description=(
                 "Python code to execute. IMPORTANT: Batch multiple related operations into each call. "
-                "A good call does: grep -> read top matches -> extract patterns -> print summary. "
-                "A bad call does just one grep or one read_file. Variables persist between calls."
+                "Object overview in ONE call: get_object_profile(name) (structure+modules+registers+"
+                "subscriptions+roles+functional_options). Batch reads: read_files([p1,p2]), "
+                "read_procedure(path, ['ProcA','ProcB']). A good call does several related ops + prints a "
+                "summary; a bad call does just one grep or one read_file. Variables persist between calls."
             )
         ),
     ],
