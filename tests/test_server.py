@@ -109,7 +109,14 @@ def test_full_rlm_flow():
 def test_rlm_start_index_block_carries_discovery_fields(monkeypatch):
     """rlm_start.index carries builder_version + has_*/counts so the agent skips a
     separate get_index_info() discovery call on start (Tier 3.2 — PUBLIC key names)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        # rlm_start canonicalizes the path (.resolve()) before hashing it into the
+        # index dir; the real CLI build does the same (_cmd_build → _resolve_path).
+        # Mirror that here so the md5(base_path) hash agrees — otherwise on runners
+        # whose TEMP carries an 8.3 short name (e.g. RUNNER~1) the build hashes the
+        # short form while rlm_start hashes the resolved long form, the index is not
+        # found, and idx["loaded"] comes back False.
+        tmpdir = _canonicalize_path(raw_tmpdir)
         obj = os.path.join(tmpdir, "Documents", "X", "Ext")
         os.makedirs(obj)
         with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
