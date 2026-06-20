@@ -174,7 +174,7 @@ def test_disambiguation_full(dispatch):
     res = dispatch(section="disambiguation")
     assert res["mode"] == "disambiguation"
     assert isinstance(res["result"], list)
-    assert len(res["result"]) == 9
+    assert len(res["result"]) == 11
 
 
 def test_disambiguation_filter_by_helpers(dispatch):

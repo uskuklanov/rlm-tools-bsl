@@ -695,6 +695,96 @@ def make_bsl_helpers(
             "form_name": info.form_name,
         }
 
+    def _single_or_map(arg, fn):
+        """P1 list-перегрузка: целевой аргумент list/tuple → ``{str(x): fn(x)}``
+        (изоляция ошибок поэлементно — плохой элемент даёт свой ключ, не роняя
+        батч); скаляр → ``fn(arg)`` (прежний контракт байт-в-байт).
+
+        ОБЯЗАН быть ПЕРВЫМ оператором перегруженного хелпера: list не должен
+        дойти до скалярной логики (``proc_name.lower()`` / ``_strip_meta_prefix``
+        / reader-вызовов), иначе она падает на списке.
+
+        Изоляция РЕАЛЬНАЯ: исключение скаляра на одном элементе ловится и кладётся
+        как ``{"error": ...}`` под его ключ, остальные элементы батча доезжают (а не
+        обрываются). В скалярном режиме исключение пробрасывается как прежде.
+        """
+        if isinstance(arg, (list, tuple)):
+            out = {}
+            for x in arg:
+                try:
+                    out[str(x)] = fn(x)
+                except Exception as exc:  # изоляция: один битый элемент не роняет батч
+                    out[str(x)] = {"error": f"{type(exc).__name__}: {exc}"}
+            return out
+        return fn(arg)
+
+    def _looks_like_path(s) -> bool:
+        """P3-детектор: rel-путь модуля всегда содержит '/' (или '\\'), начинается
+        с '..' (extension), либо оканчивается на .bsl/.os/.mdo/.xml; имя объекта 1С
+        — нет. Внутренние вызовы хелперов всегда передают путь → детект имени не
+        срабатывает ложно."""
+        if not isinstance(s, str):
+            return False
+        return "/" in s or "\\" in s or s.startswith("..") or s.lower().endswith((".bsl", ".os", ".mdo", ".xml"))
+
+    def _module_rank(category, module_type) -> int:
+        """Единое правило выбора модуля по ПАРЕ (category, module_type) — НЕ по одному
+        module_type: у общих модулей и общих/обычных форм module_type всегда 'Module',
+        семантику несёт category (MODULE_TYPE_MAP не содержит CommonModule/CommonForm).
+        Меньше ранг = выше приоритет:
+          0: (CommonModules|CommonForms, Module)  →  1: (*, ObjectModule)  →
+          2: (*, ManagerModule)  →  3: всё остальное (формы/команды/прочее)."""
+        cat_l = (category or "").lower()
+        mt = module_type or ""
+        if cat_l in ("commonmodules", "commonforms") and mt == "Module":
+            return 0
+        if mt == "ObjectModule":
+            return 1
+        if mt == "ManagerModule":
+            return 2
+        return 3
+
+    def _resolve_module_arg(arg):
+        """P3: принять путь ИЛИ имя объекта. Возвращает ``(path, meta)`` — ``meta``
+        ВСЕГДА (даже на path-пути), чтобы у вызывающих не было двух контрактов.
+
+        Путь → ``(arg, {resolved_from_name: False})``. Имя → exact-перечисление
+        модулей тем же прямым ``_index_state``-сканом, что и P2 (НЕ capped
+        ``find_module``), выбор по единому правилу ``_module_rank``;
+        ``meta = {resolved_from_name: True, chosen_module, chosen_reason,
+        candidates:[paths по возрастанию ранга], ambiguous}``. ``ambiguous=True``
+        когда после приоритета остаётся >1 кандидата одного (верхнего) ранга — выбор
+        всё равно детерминирован (первый по стабильной сортировке пути). Имя без
+        кандидатов → ``(arg, {... candidates: []})``: трактуем ``arg`` как литеральный
+        путь (обратная совместимость — поведение как у прежнего bad-path)."""
+        if _looks_like_path(arg):
+            return arg, {"resolved_from_name": False}
+        _ensure_index()
+        # Снять префикс типа (``Документ.X`` → ``X``) перед exact-сканом — как в
+        # get_object_modules; иначе ``Документ.X`` не матчит bare object_name и уходит
+        # битым путём. Оригинал (arg) сохраняется у вызывающих для error/_meta-текста.
+        a_lower = _strip_meta_prefix(arg).lower()
+        cands = [(rel, info) for rel, info in _index_state if info.object_name and info.object_name.lower() == a_lower]
+        if not cands:
+            return arg, {
+                "resolved_from_name": True,
+                "chosen_module": None,
+                "chosen_reason": "name_not_found",
+                "candidates": [],
+                "ambiguous": False,
+            }
+        ranked = sorted(cands, key=lambda ri: (_module_rank(ri[1].category, ri[1].module_type), ri[0]))
+        top_rank = _module_rank(ranked[0][1].category, ranked[0][1].module_type)
+        top = [ri for ri in ranked if _module_rank(ri[1].category, ri[1].module_type) == top_rank]
+        chosen_rel, chosen_info = top[0]
+        return chosen_rel, {
+            "resolved_from_name": True,
+            "chosen_module": chosen_rel,
+            "chosen_reason": f"({chosen_info.category}, {chosen_info.module_type})",
+            "candidates": [rel for rel, _ in ranked],
+            "ambiguous": len(top) > 1,
+        }
+
     # ── Helper registry ──────────────────────────────────────────
     _registry: dict[str, dict] = {}
 
@@ -877,8 +967,23 @@ def make_bsl_helpers(
         self-healing — multi-line procedures appear immediately, without
         requiring ``rlm-bsl-index index update``.
 
+        ``path`` — rel_path модуля ИЛИ имя объекта (P3). По имени модуль выбирается
+        единым правилом ``(category, module_type)`` (см. ``_resolve_module_arg``)
+        ТОЛЬКО при детерминированном выборе; при неоднозначности — **``ValueError``**
+        (а НЕ ``[]``: пустой список неотличим от «у модуля нет процедур» и тихо
+        просаживает анализ). Прозрачное разрешение по имени с ``_meta`` —
+        ``get_module_outline``. Внутренние вызовы передают реальные пути.
+
         Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}.
         ``params`` — список имён параметров (list[str], v1.18.0; напр. "Знач А, Б=5" → ["А", "Б"])."""
+
+        _orig_arg = path
+        path, _arg_meta = _resolve_module_arg(path)
+        if _arg_meta.get("resolved_from_name") and _arg_meta.get("ambiguous"):
+            raise ValueError(
+                f"неоднозначное имя модуля '{_orig_arg}': кандидаты {_arg_meta['candidates']}; "
+                "передайте путь или используйте get_module_outline (прозрачный авто-выбор в _meta)"
+            )
 
         def _extract_with_index():
             overrides_map: dict | None = None
@@ -1084,11 +1189,10 @@ def make_bsl_helpers(
             return [{"error": "git grep failed or timed out"}]
         return res
 
-    def read_procedure(
+    def _read_procedure_one(
         path: str, proc_name: str, include_overrides: bool = False, numbered: bool = False
     ) -> str | None:
-        """Extract a single procedure body from a BSL file by name.
-        With include_overrides=True, appends extension override bodies if available."""
+        """Scalar core of read_procedure (single proc_name). See read_procedure."""
         procedures = extract_procedures(path)
         target = None
         for p in procedures:
@@ -1195,6 +1299,20 @@ def make_bsl_helpers(
 
         return "\n".join(parts)
 
+    def read_procedure(path: str, proc_name, include_overrides: bool = False, numbered: bool = False):
+        """Extract a single procedure body from a BSL file by name.
+        With include_overrides=True, appends extension override bodies if available.
+
+        ``proc_name`` — ``str`` (прежний контракт: ``str | None``) ИЛИ ``list[str]``
+        (P1 list-перегрузка → ``{proc_name: str | None | {error}}``, тело модуля
+        парсится один раз благодаря мемоизации ``extract_procedures``). Изоляция:
+        ненайденный метод даёт ``None`` под своим ключом, а исключение на элементе —
+        ``{"error": ...}`` (не роняя остальной батч); в обходе проверяй ``'error' in v``."""
+        return _single_or_map(
+            proc_name,
+            lambda name: _read_procedure_one(path, name, include_overrides, numbered),
+        )
+
     def find_callers(proc_name: str, module_hint: str = "", max_files: int = 20) -> list[dict]:
         """Find all callers of a procedure by name across BSL files.
         Delegates to find_callers_context for thorough cross-module search.
@@ -1249,13 +1367,15 @@ def make_bsl_helpers(
             line = line[:ci]
         return line
 
-    def find_callers_context(
+    def _find_callers_context_one(
         proc_name: str,
         module_hint: str = "",
         offset: int = 0,
         limit: int = 50,
     ) -> dict:
-        """Find callers of a procedure with full context: which procedure
+        """Scalar core of find_callers_context (single proc_name). See find_callers_context.
+
+        Find callers of a procedure with full context: which procedure
         in which module calls the target. Returns structured result with
         caller_name, caller_is_export, file metadata, and pagination info.
 
@@ -1472,6 +1592,40 @@ def make_bsl_helpers(
                 "offset, limit). Повторите с offset=0."
             )
         return _tag({"callers": callers, "_meta": _fs_meta})
+
+    def find_callers_context(
+        proc_name,
+        module_hint: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict:
+        """Find callers of a procedure with full context: which procedure
+        in which module calls the target. Returns structured result with
+        caller_name, caller_is_export, file metadata, and pagination info.
+
+        Uses SQLite call graph index when available (instant); FS-scan fallback.
+
+        Args:
+            proc_name: target procedure/function name (``str``) ИЛИ ``list[str]``
+                (P1 list-перегрузка → ``{proc_name: {callers, _meta} | {error}}``; общий
+                module_hint/offset/limit применяется ко ВСЕМ именам — для разных
+                модулей зови без hint или поимённо). Изоляция: имя без вызывающих
+                даёт валидный пустой результат под своим ключом, а исключение на
+                элементе — ``{"error": ...}`` (не роняя остальной батч); в обходе
+                проверяй ``'error' in data``.
+            module_hint: Optional module name to determine export scope.
+            offset: File offset for pagination (0-based).
+            limit: Max files to scan per call (default 50).
+
+        Returns:
+            ``str``-режим: dict with "callers" list and "_meta" pagination info.
+            ``list``-режим: dict by name (значение — ``{callers, _meta}`` либо
+            ``{error}`` на упавшем элементе).
+        """
+        return _single_or_map(
+            proc_name,
+            lambda name: _find_callers_context_one(name, module_hint, offset, limit),
+        )
 
     def find_call_hierarchy(
         name: str,
@@ -2043,7 +2197,12 @@ def make_bsl_helpers(
         agent can decide where to drill without reading a 5–15K-line module.
 
         Args:
-            path: rel_path of the module (e.g. from ``find_module(...)[i]['path']``).
+            path: rel_path of the module (e.g. from ``find_module(...)[i]['path']``)
+                ИЛИ имя объекта (P3): модуль выбирается единым правилом
+                ``(category, module_type)`` (см. ``_resolve_module_arg``) с ПРОЗРАЧНЫМ
+                авто-выбором — resolver-ключи домержены в ``_meta`` (см. ниже), при
+                неоднозначности ``_meta.ambiguous=True`` (выбор всё равно детерминирован,
+                ошибки нет — в отличие от ``extract_procedures``, который кидает ValueError).
             include_methods: ``True`` (default) → include leaf methods + orphans;
                 ``False`` → region tree + totals only (even cheaper top-level map).
 
@@ -2054,15 +2213,26 @@ def make_bsl_helpers(
               "outline": [{region, line, end_line, totals:{methods, exports},
                            children:[...], methods:[...]}],   # methods iff include_methods
               "orphan_methods": [...],                        # present iff include_methods
-              "_meta": {"index_used": bool, "fallback_reason": str | None}
+              "_meta": {"index_used": bool, "fallback_reason": str | None,
+                        "resolved_from_name": bool,           # P3: всегда (False на path-пути)
+                        "chosen_module", "chosen_reason", "candidates", "ambiguous"}  # iff by name
             }
 
         ``_meta`` mirrors ``get_object_full_structure``: ``index_used=True`` → tree
         built from the index; otherwise ``fallback_reason`` is one of
         ``'index_unavailable_or_table_missing'`` (no/old index, missing regions
         table, or module not indexed), ``'index_empty_for_module'`` (module row
-        present but no methods — live safety net), or ``'parse_failed: …'``.
+        present but no methods — live safety net), or ``'parse_failed: …'``. P3
+        resolver-ключи МЕРЖАТСЯ в ``_meta`` (не затирают ``index_used``/``fallback_reason``).
         """
+
+        # P3: принять имя ИЛИ путь. meta резолва (resolved_from_name всегда + ключи
+        # авто-выбора при name-режиме) домержится в _meta каждого возвращаемого resp.
+        path, _arg_meta = _resolve_module_arg(path)
+
+        def _finish(resp: dict) -> dict:
+            resp["_meta"].update(_arg_meta)
+            return resp
 
         def _resolve_meta_live() -> dict:
             # Best-effort module identity. Prefer the live file index when it is
@@ -2141,15 +2311,15 @@ def make_bsl_helpers(
         data = idx_reader.get_outline_data(path) if idx_reader is not None else None
         if data is None:
             # idx_reader is None, OR regions table missing / corrupt core → live.
-            return _live("index_unavailable_or_table_missing")
+            return _finish(_live("index_unavailable_or_table_missing"))
         if data["module"] is None:
             # Module not in the index (valid 'not indexed') → live.
-            return _live("index_unavailable_or_table_missing")
+            return _finish(_live("index_unavailable_or_table_missing"))
         if not data["methods"]:
             # Module row present but no methods (stale) → live safety net.
-            return _live("index_empty_for_module")
+            return _finish(_live("index_empty_for_module"))
         # Index path.
-        return _assemble(data["regions"], data["methods"], data["module"], True, None)
+        return _finish(_assemble(data["regions"], data["methods"], data["module"], True, None))
 
     # XML file names by metadata category (CF format: Ext/<name>.xml)
     _CATEGORY_XML_NAMES = {
@@ -3151,6 +3321,145 @@ def make_bsl_helpers(
                 ]
 
         return result
+
+    def _resolve_object_for_modules(name: str):
+        """``(category, object_name, modules)`` для объекта одним прямым exact-сканом
+        ``_index_state`` — НЕ через capped ``find_module`` и НЕ через
+        ``_resolve_object_for_full_structure`` напрямую (оба возвращают на шаг раньше
+        cap-false-negative / fuzzy ``modules[0]``).
+
+        ``modules`` — ``list[(rel_path, BslFileInfo)]`` собственных модулей объекта;
+        идентичность ``(category, object_name)`` берётся из ПЕРВОЙ совпавшей по
+        ``object_name`` строки, по ней же фильтруются модули (развязка коллизии
+        одноимённых объектов в разных категориях — берётся первая). Synonym→canon
+        fallback к ``_resolve_object_for_full_structure`` срабатывает ТОЛЬКО когда
+        прямой скан пуст, с повторным exact-сканом по канон-имени (чтобы capped/fuzzy
+        путь резолвера никогда не был источником финального списка модулей).
+        ``(None, None, [])`` если ничего не нашлось.
+        """
+        _ensure_index()
+
+        def _scan(target_lower: str, want_cat_lower: str | None = None):
+            rows = [
+                (rel, info)
+                for rel, info in _index_state
+                if info.object_name
+                and info.object_name.lower() == target_lower
+                and (want_cat_lower is None or (info.category or "").lower() == want_cat_lower)
+            ]
+            if not rows:
+                return None, None, []
+            # Детерминированный выбор identity при коллизии одноимённых объектов в
+            # разных категориях: get_all_modules() без ORDER BY → порядок _index_state
+            # не гарантирован. Сорт по rel_path фиксирует, какая категория «первая».
+            rows.sort(key=lambda ri: ri[0])
+            category = rows[0][1].category
+            object_name = rows[0][1].object_name
+            cat_lower = (category or "").lower()
+            modules = [(rel, info) for rel, info in rows if (info.category or "").lower() == cat_lower]
+            return category, object_name, modules
+
+        category, object_name, modules = _scan(name.lower())
+        if modules:
+            return category, object_name, modules
+
+        # Прямой скан пуст → synonym→canon, затем повторный exact-скан по канону.
+        # Категорию канона (_canon_cat) ПРОКИДЫВАЕМ в скан как фильтр: иначе одноимённый
+        # канон в другой категории мог бы перебить разрешённый резолвером объект.
+        _canon_cat, canon_name = _resolve_object_for_full_structure(name)
+        if canon_name:
+            want_cat = _canon_cat.lower() if _canon_cat else None
+            category, object_name, modules = _scan(canon_name.lower(), want_cat)
+            if modules:
+                return category, object_name, modules
+        return None, None, []
+
+    def get_object_modules(name: str, include_methods: bool = False) -> dict:
+        """Лёгкий индексный «код-side» двойник ``get_object_full_structure``: объект →
+        все его модули + скелеты ``#Область`` + агрегаты + флаги перехватов, в один вызов.
+
+        В отличие от ``analyze_object`` НЕ зовёт ``parse_object_xml`` ни на одном пути
+        и НЕ зовёт ``extract_procedures`` на валидном индексном пути (там скелет берётся
+        из ``idx_reader.get_outline_data`` — см. ``module._meta.index_used``). При
+        no/old-index, отсутствии module-row или пустых methods модуль честно уходит в
+        live (виден в ``module._meta.fallback_reason``), поэтому «дешёвый индексный
+        двойник» гарантирован именно на валидном индексном пути.
+
+        Args:
+            name: имя объекта (префикс типа ``Документ.`` снимается). Резолв — прямым
+                exact-сканом индекса (см. ``_resolve_object_for_modules``).
+            include_methods: ``False`` (дефолт) — дерево ``#Область`` + агрегаты
+                (ограничивает вывод); ``True`` — листовые методы внутри областей.
+
+        Returns:
+            ``{object_name, category,
+               modules: [{path, module_type, form_name,
+                          totals:{methods,exports,regions,loc}, outline:[...],
+                          overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason}}],
+               totals: {modules, methods, exports, overrides},
+               _meta: {index_used, modules_truncated}}``
+            либо ``{error, _meta}`` если объект не найден.
+
+        Дизамбигуация: метаданные → ``get_object_full_structure``; код-скелет →
+        ``get_object_modules``; тяжёлый разбор тел → ``analyze_object``.
+        """
+        name = _strip_meta_prefix(name)
+        category, object_name, modules = _resolve_object_for_modules(name)
+        if not modules:
+            return {
+                "error": f"Объект '{name}' не найден (нет модулей в индексе)",
+                "_meta": {"index_used": idx_reader is not None, "modules_truncated": False},
+            }
+
+        module_entries: list[dict] = []
+        roll_methods = roll_exports = roll_overrides = 0
+        all_index_used = True
+        for rel, info in modules:
+            outline = get_module_outline(rel, include_methods=include_methods)
+            ov_methods: list[str] = []
+            if idx_reader is not None:
+                try:
+                    ov_map = idx_reader.get_overrides_for_path(rel) or {}
+                    ov_methods = sorted(ov_map.keys())
+                except Exception:
+                    ov_methods = []
+            totals = outline.get("totals") or {}
+            m_meta = outline.get("_meta") or {}
+            if not m_meta.get("index_used"):
+                all_index_used = False
+            module_entries.append(
+                {
+                    "path": rel,
+                    "module_type": info.module_type,
+                    "form_name": info.form_name,
+                    "totals": totals,
+                    "outline": outline.get("outline", []),
+                    "overrides": {"count": len(ov_methods), "methods": ov_methods},
+                    "_meta": {
+                        "index_used": bool(m_meta.get("index_used")),
+                        "fallback_reason": m_meta.get("fallback_reason"),
+                    },
+                }
+            )
+            roll_methods += totals.get("methods", 0)
+            roll_exports += totals.get("exports", 0)
+            roll_overrides += len(ov_methods)
+
+        return {
+            "object_name": object_name,
+            "category": category,
+            "modules": module_entries,
+            "totals": {
+                "modules": len(module_entries),
+                "methods": roll_methods,
+                "exports": roll_exports,
+                "overrides": roll_overrides,
+            },
+            "_meta": {
+                "index_used": idx_reader is not None and all_index_used,
+                "modules_truncated": False,
+            },
+        }
 
     def analyze_object(name: str) -> dict:
         """Full object profile in one call: XML metadata + all modules + procedures + exports.
@@ -4212,13 +4521,8 @@ def make_bsl_helpers(
 
     # ── Enum / FunctionalOption / Roles helpers ──────────────────
 
-    def find_enum_values(enum_name: str) -> dict:
-        """Find an enumeration by name and return its values.
-
-        Args:
-            enum_name: Enum name (or fragment).
-
-        Returns: dict with name, synonym, values, file — or error."""
+    def _find_enum_values_one(enum_name: str) -> dict:
+        """Scalar core of find_enum_values (single enum_name). See find_enum_values."""
         enum_name = _strip_meta_prefix(enum_name)
 
         # --- Fast path: SQLite index ---
@@ -4250,6 +4554,19 @@ def make_bsl_helpers(
                 return parsed
 
         return {"error": f"Перечисление '{enum_name}' не найдено"}
+
+    def find_enum_values(enum_name) -> dict:
+        """Find an enumeration by name and return its values.
+
+        Args:
+            enum_name: Enum name (or fragment) — ``str`` (прежний контракт) ИЛИ
+                ``list[str]`` (P1 list-перегрузка → ``{enum_name: {...} | {error}}``).
+                Изоляция: ненайденное перечисление даёт ``{error}`` под своим ключом,
+                не роняя батч.
+
+        Returns: dict with name, synonym, values, file — or error (str-режим);
+            dict by name (list-режим)."""
+        return _single_or_map(enum_name, _find_enum_values_one)
 
     # Predefined items only exist for these categories (CF + EDT).
     _PREDEFINED_CATS = frozenset(
@@ -6680,7 +6997,9 @@ def make_bsl_helpers(
     _reg(
         "extract_procedures",
         extract_procedures,
-        "extract_procedures(path) -> [{name, type, line, end_line, is_export, params(list)}]",
+        "extract_procedures(path|object_name) -> [{name, type, line, end_line, is_export, params(list)}]  "
+        "# path ИЛИ имя объекта: имя → авто-выбор модуля по (category, module_type); неоднозначно → ValueError "
+        "(для прозрачного разрешения по имени с _meta — get_module_outline)",
         "code",
     )
     _reg(
@@ -6702,7 +7021,8 @@ def make_bsl_helpers(
     _reg(
         "read_procedure",
         read_procedure,
-        "read_procedure(path, proc_name, include_overrides=False) -> str | None (numbered in MCP session)",
+        "read_procedure(path, proc_name(str|list), include_overrides=False) -> str | None  "
+        "# list имён → {proc_name: str|None|{error}} (модуль парсится один раз; {error} на упавшем элементе); numbered in MCP session",
         "code",
         ["read", "чтени", "читать", "содержим", "content", "тело", "body"],
         "READ PROCEDURE BODY:\n"
@@ -6721,12 +7041,17 @@ def make_bsl_helpers(
         "          print(body)\n"
         "  # Если расширения перехватили метод — читать с перехватами:\n"
         "  full = read_procedure(path, 'ProcName', include_overrides=True)\n"
-        "  # full = оригинал + '=== Перехвачен &Аннотация в расширении X ===' + тело перехвата",
+        "  # full = оригинал + '=== Перехвачен &Аннотация в расширении X ===' + тело перехвата\n"
+        "  # BATCH: несколько методов одного модуля одним вызовом (модуль парсится 1 раз) → dict по имени:\n"
+        "  bodies = read_procedure(path, ['ОбработкаПроведения', 'ПриЗаписи'])  # {name: str|None|{error}}\n"
+        "  for name, b in bodies.items():\n"
+        "      if isinstance(b, dict) and 'error' in b: continue  # упавший элемент изолирован\n"
+        "      print(name, 'найден' if b else 'нет тела')",
     )
     _reg(
         "find_callers_context",
         find_callers_context,
-        "find_callers_context(proc, module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # exact_rows/fallback_rows: точные (по callee_key) vs эвристические (по имени) рёбра",
+        "find_callers_context(proc(str|list), module_hint, 0, 50) -> {callers: [{file, caller_name, line, ...}], _meta: {total_callers, returned, offset, has_more, exact_available, target_exact, exact_rows, fallback_rows}}  # list имён → {proc: {callers,_meta}|{error}} (общий module_hint/offset/limit на все имена; {error} на упавшем элементе); exact_rows/fallback_rows: точные (по callee_key) vs эвристические (по имени) рёбра",
         "code",
         ["caller", "call graph", "граф", "вызов", "вызыва", "кто вызывает", "find_callers"],
         "BUILD CALL GRAPH:\n"
@@ -6743,7 +7068,12 @@ def make_bsl_helpers(
         "          for c in data['callers']:\n"
         "              print(e['name'], '<-', c['caller_name'], c['file'], 'line:', c['line'])\n"
         "          if data['_meta']['has_more']:\n"
-        "              print('  ... more callers, increase offset')",
+        "              print('  ... more callers, increase offset')\n"
+        "  # BATCH: вместо цикла по экспортам — один вызов со списком имён → {name: {callers,_meta}|{error}}:\n"
+        "  by_name = find_callers_context([e['name'] for e in exports], '', 0, 50)\n"
+        "  for name, data in by_name.items():\n"
+        "      if 'error' in data: continue  # упавший элемент изолирован, батч цел\n"
+        "      print(name, '<-', len(data['callers']), 'callers')",
     )
     _reg(
         "find_call_hierarchy",
@@ -6872,10 +7202,12 @@ def make_bsl_helpers(
     _reg(
         "get_module_outline",
         get_module_outline,
-        "get_module_outline(path, include_methods=True) -> {path, category, object_name, module_type, "
+        "get_module_outline(path|object_name, include_methods=True) -> {path, category, object_name, module_type, "
         "totals:{methods, exports, regions, loc}, outline:[{region, line, end_line, totals:{methods, exports}, "
-        "children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason}}  "
-        "# ДЕШЁВЫЙ СКЕЛЕТ модуля (дерево #Область + агрегаты) — первый хоп перед чтением тел",
+        "children:[...], methods:[...]}], orphan_methods, _meta:{index_used, fallback_reason, resolved_from_name, "
+        "chosen_module?, candidates?, ambiguous?}}  "
+        "# ДЕШЁВЫЙ СКЕЛЕТ модуля (дерево #Область + агрегаты) — первый хоп перед чтением тел; "
+        "path ИЛИ имя объекта (имя → прозрачный авто-выбор модуля, resolver-ключи в _meta, ambiguous=True при тай-брейке)",
         "code",
         [
             "оглавление",
@@ -6989,14 +7321,19 @@ def make_bsl_helpers(
     _reg(
         "find_enum_values",
         find_enum_values,
-        "find_enum_values(enum_name) -> {name, synonym, values: [{name, synonym}]}",
+        "find_enum_values(enum_name(str|list)) -> {name, synonym, values: [{name, synonym}]} | {error}  "
+        "# list имён → {enum_name: {...}|{error}} (изоляция ошибок поэлементно)",
         "xml",
         ["перечислен", "enum", "значени перечислени"],
         "FIND ENUM VALUES:\n"
         "  result = find_enum_values('СтатусыЗаказовКлиентов')\n"
         "  print(f\"{result['name']} ({result['synonym']})\")\n"
         "  for v in result['values']:\n"
-        "      print(f\"  {v['name']}: {v['synonym']}\")",
+        "      print(f\"  {v['name']}: {v['synonym']}\")\n"
+        "  # BATCH: несколько перечислений одним вызовом → {enum_name: {...}|{error}}:\n"
+        "  many = find_enum_values(['СтатусыЗаказов', 'ВидыОпераций'])\n"
+        "  for name, r in many.items():\n"
+        "      print(name, len(r.get('values', [])) if 'error' not in r else r['error'])",
     )
     _reg(
         "find_attributes",
@@ -7107,6 +7444,41 @@ def make_bsl_helpers(
         "  # _meta.index_used=False означает live XML fallback (синонимы ТЧ доступны только в этом режиме)\n"
         "  if not s['_meta']['index_used']:\n"
         "      print('Fallback:', s['_meta']['fallback_reason'])",
+    )
+    _reg(
+        "get_object_modules",
+        get_object_modules,
+        "get_object_modules(name, include_methods=False) -> {object_name, category, "
+        "modules:[{path, module_type, form_name, totals:{methods,exports,regions,loc}, "
+        "outline:[{region, line, end_line, totals, children, methods?}], "
+        "overrides:{count, methods:[...]}, _meta:{index_used, fallback_reason}}], "
+        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated}} | {error, _meta}  "
+        "# ДЕШЁВЫЙ КОД-СКЕЛЕТ объекта: все модули + дерево #Область + агрегаты + флаги перехватов в 1 вызов. "
+        "НЕ читает тела (extract_procedures) на индексном пути и НЕ парсит XML — легче analyze_object",
+        "composite",
+        [
+            "модули объекта",
+            "скелет объекта",
+            "все модули",
+            "object modules",
+            "структура кода объекта",
+            "get_object_modules",
+            "области объекта",
+        ],
+        "OBJECT CODE SKELETON (все модули объекта + #Область + агрегаты, 1 вызов вместо find_module+N×get_module_outline):\n"
+        "  om = get_object_modules('РеализацияТоваров')  # include_methods=False — только области + агрегаты\n"
+        "  if 'error' in om:\n"
+        "      print(om['error'])\n"
+        "  else:\n"
+        "      print(om['object_name'], om['category'], om['totals'])  # {modules, methods, exports, overrides}\n"
+        "      for m in om['modules']:\n"
+        "          flag = '' if m['_meta']['index_used'] else f\" (live: {m['_meta']['fallback_reason']})\"\n"
+        "          print(f\"  {m['module_type']}: {m['totals']['methods']} методов, перехватов {m['overrides']['count']}{flag}\")\n"
+        "          for r in m['outline']:\n"
+        "              print(f\"    #Область {r['region']} {r['totals']}\")\n"
+        "  # затем нырнуть: get_object_modules(name, include_methods=True) ИЛИ read_procedure(m['path'], 'Метод')\n"
+        "  # ДИЗАМБИГУАЦИЯ: метаданные (реквизиты/ТЧ) → get_object_full_structure; код-скелет → get_object_modules;\n"
+        "  #   тяжёлый разбор ВСЕХ тел + XML → analyze_object. Перехваты по имени метода — в m['overrides']['methods'].",
     )
     _reg(
         "analyze_document_flow",

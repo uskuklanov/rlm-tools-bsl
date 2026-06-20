@@ -1026,6 +1026,42 @@ def test_read_procedure_numbered_absolute():
         assert "7 | КонецПроцедуры" in numbered
 
 
+def test_read_procedure_list_numbered_returns_dict_of_numbered_bodies():
+    """P1 + numbering: list proc_name with numbered=True → {name: numbered body}.
+
+    Это путь, которым пользуется MCP-обёртка _numbered_read_procedure
+    (она пробрасывает proc_name в диспетчер и форсит numbered=True)."""
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl_path = os.path.join(tmpdir, "Module.bsl")
+        with open(bsl_path, "w", encoding="utf-8") as f:
+            f.write(
+                "// header\nПроцедура Тест()\n  Возврат;\nКонецПроцедуры\nПроцедура Тест2()\n  Возврат;\nКонецПроцедуры\n"
+            )
+
+        def _read(p):
+            with open(os.path.join(tmpdir, p), encoding="utf-8-sig", errors="replace") as fh:
+                return fh.read()
+
+        helpers = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=lambda p: os.path.join(tmpdir, p),
+            read_file_fn=_read,
+            grep_fn=lambda *a, **kw: [],
+            glob_files_fn=lambda *a, **kw: [],
+            format_info=None,
+        )
+        rp = helpers["read_procedure"]
+
+        res = rp("Module.bsl", ["Тест", "Тест2", "НетТакой"], numbered=True)
+        assert isinstance(res, dict)
+        assert set(res.keys()) == {"Тест", "Тест2", "НетТакой"}
+        assert "2 | Процедура Тест()" in res["Тест"]
+        assert "5 | Процедура Тест2()" in res["Тест2"]
+        assert res["НетТакой"] is None
+
+
 def test_streamable_http_server_starts():
     """Integration: streamable-http server starts and responds to MCP initialize."""
     import socket

@@ -194,7 +194,9 @@ def test_tree_include_methods_false():
 def test_index_nested_tree_and_aggregates(built):
     bsl, _r, _cf = built
     o = bsl["get_module_outline"](_path_of(bsl, "Главный"))
-    assert o["_meta"] == {"index_used": True, "fallback_reason": None}
+    # P3: _meta теперь всегда несёт resolved_from_name (path-режим → False);
+    # index_used/fallback_reason сохранены (resolver-ключи домержены, не затёрты).
+    assert o["_meta"] == {"index_used": True, "fallback_reason": None, "resolved_from_name": False}
     assert o["category"] == "CommonModules" and o["object_name"] == "Главный"
     assert o["totals"]["methods"] == 4
     assert o["totals"]["exports"] == 1

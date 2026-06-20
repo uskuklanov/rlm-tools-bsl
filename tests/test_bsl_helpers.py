@@ -1,6 +1,8 @@
 import os
 import tempfile
 
+import pytest
+
 from rlm_tools_bsl.helpers import make_helpers
 from rlm_tools_bsl.format_detector import detect_format
 from rlm_tools_bsl.bsl_helpers import (
@@ -2572,3 +2574,474 @@ class TestFallbackContract:
             # Сумма type must be normalized
             summ = next(r for r in results if r["attr_name"] == "Сумма")
             assert "Number" in summ["attr_type"]
+
+
+# ============================================================
+# P1 — list-перегрузка read_procedure / find_callers_context / find_enum_values
+# Каждый: первый «целевой» аргумент list → dict-by-name (изоляция ошибок
+# поэлементно); str → прежний контракт байт-в-байт.
+# ============================================================
+
+
+def test_read_procedure_list_returns_dict_by_name(bsl_env):
+    """list имён → {name: body}; модуль резолвится один раз (мемоизация)."""
+    path = bsl_env.bsl["find_module"]("МойМодуль")[0]["path"]
+    res = bsl_env.bsl["read_procedure"](path, ["ЗаполнитьДанные", "ПолучитьСумму"])
+    assert isinstance(res, dict)
+    assert set(res.keys()) == {"ЗаполнитьДанные", "ПолучитьСумму"}
+    assert "ЗаполнитьДанные" in res["ЗаполнитьДанные"]
+    assert "ПолучитьСумму" in res["ПолучитьСумму"]
+
+
+def test_read_procedure_list_isolates_bad_name(bsl_env):
+    """Один валид + один отсутствующий: dict с телом-str и None, без падения батча."""
+    path = bsl_env.bsl["find_module"]("МойМодуль")[0]["path"]
+    res = bsl_env.bsl["read_procedure"](path, ["ЗаполнитьДанные", "НетТакойМетод"])
+    assert isinstance(res, dict)
+    assert isinstance(res["ЗаполнитьДанные"], str)
+    assert res["НетТакойМетод"] is None
+
+
+def test_read_procedure_str_mode_unchanged(bsl_env):
+    """str proc_name → str|None (НЕ dict) — прежний контракт."""
+    path = bsl_env.bsl["find_module"]("МойМодуль")[0]["path"]
+    body = bsl_env.bsl["read_procedure"](path, "ЗаполнитьДанные")
+    assert isinstance(body, str)
+    assert "ЗаполнитьДанные" in body
+    none_body = bsl_env.bsl["read_procedure"](path, "НетТакойМетод")
+    assert none_body is None
+
+
+def test_find_callers_context_list_returns_dict_by_name(bsl_env):
+    """list имён → {name: {callers, _meta}} с общим module_hint/offset/limit."""
+    res = bsl_env.bsl["find_callers_context"](["ЗаполнитьДанные", "ПолучитьСумму"])
+    assert isinstance(res, dict)
+    assert set(res.keys()) == {"ЗаполнитьДанные", "ПолучитьСумму"}
+    for name in ("ЗаполнитьДанные", "ПолучитьСумму"):
+        assert "callers" in res[name]
+        assert "_meta" in res[name]
+    assert any(c["caller_name"] == "ОбработкаЗаполнения" for c in res["ЗаполнитьДанные"]["callers"])
+
+
+def test_find_callers_context_list_isolates_no_callers(bsl_env):
+    """list с именем без вызывающих → его запись — валидный пустой результат, не крэш."""
+    res = bsl_env.bsl["find_callers_context"](["ЗаполнитьДанные", "ВнутренняяПроцедура"])
+    assert res["ВнутренняяПроцедура"]["callers"] == []
+    assert len(res["ЗаполнитьДанные"]["callers"]) >= 1
+
+
+def test_find_callers_context_str_mode_unchanged(bsl_env):
+    """str proc_name → {callers, _meta} (НЕ keyed by name) — прежний контракт."""
+    res = bsl_env.bsl["find_callers_context"]("ЗаполнитьДанные")
+    assert "callers" in res and "_meta" in res
+    assert any(c["caller_name"] == "ОбработкаЗаполнения" for c in res["callers"])
+
+
+def test_find_enum_values_list_returns_dict_by_name():
+    """list → {name: {...}|{error}}; изоляция: валид + не найдено."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        enum_dir = os.path.join(tmpdir, "Enums", "СтатусыЗаказов")
+        os.makedirs(enum_dir)
+        with open(os.path.join(enum_dir, "СтатусыЗаказов.xml"), "w", encoding="utf-8") as f:
+            f.write(ENUM_CF_XML)
+        res = bsl["find_enum_values"](["СтатусыЗаказов", "НетТакогоПеречисления"])
+        assert isinstance(res, dict)
+        assert set(res.keys()) == {"СтатусыЗаказов", "НетТакогоПеречисления"}
+        assert res["СтатусыЗаказов"]["name"] == "СтатусыЗаказов"
+        assert "error" not in res["СтатусыЗаказов"]
+        assert "error" in res["НетТакогоПеречисления"]
+
+
+def test_find_enum_values_str_mode_unchanged():
+    """str enum_name → один dict с name/values (НЕ keyed by name) — прежний контракт."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        enum_dir = os.path.join(tmpdir, "Enums", "СтатусыЗаказов")
+        os.makedirs(enum_dir)
+        with open(os.path.join(enum_dir, "СтатусыЗаказов.xml"), "w", encoding="utf-8") as f:
+            f.write(ENUM_CF_XML)
+        res = bsl["find_enum_values"]("СтатусыЗаказов")
+        assert res["name"] == "СтатусыЗаказов"
+        assert "values" in res
+
+
+# ============================================================
+# P2 — дешёвый агрегат get_object_modules(name, include_methods=False)
+# ============================================================
+
+_MANAGER_BSL = "Функция ПолучитьПоИдентификатору(Ид) Экспорт\n    Возврат Ид;\nКонецФункции\n"
+
+
+def _make_object_modules_fixture(tmpdir, *, with_index=True):
+    """Document РеализацияТоваров: ObjectModule (3 метода, 1 #Область, 2 экспорта) +
+    ManagerModule (1 метод-экспорт, без области). Returns (bsl, reader|None)."""
+    obj = os.path.join(tmpdir, "Documents", "РеализацияТоваров", "Ext")
+    os.makedirs(obj)
+    with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+        f.write(BSL_CODE)
+    with open(os.path.join(obj, "ManagerModule.bsl"), "w", encoding="utf-8") as f:
+        f.write(_MANAGER_BSL)
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    format_info = detect_format(tmpdir)
+    reader = None
+    kw = {}
+    if with_index:
+        from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+        db_path = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+        reader = IndexReader(str(db_path))
+        kw["idx_reader"] = reader
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+        **kw,
+    )
+    return bsl, reader
+
+
+def test_get_object_modules_index_path():
+    """Индексный путь: идентичность объекта, все модули, per-module index_used=True, roll-up."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            res = bsl["get_object_modules"]("РеализацияТоваров")
+            assert "error" not in res
+            assert res["object_name"] == "РеализацияТоваров"
+            assert res["category"] == "Documents"
+            paths = {m["path"] for m in res["modules"]}
+            assert any(p.endswith("ObjectModule.bsl") for p in paths)
+            assert any(p.endswith("ManagerModule.bsl") for p in paths)
+            # Дешёвый индексный путь доказан per-module (без extract_procedures).
+            for m in res["modules"]:
+                assert m["_meta"]["index_used"] is True
+            # roll-up: 3 (ObjectModule) + 1 (ManagerModule) методов, 2+1 экспортов.
+            assert res["totals"]["modules"] == 2
+            assert res["totals"]["methods"] == 4
+            assert res["totals"]["exports"] == 3
+            assert res["_meta"]["index_used"] is True
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_include_methods_false_vs_true():
+    """include_methods=False → область без листовых методов; True → методы есть. totals одинаковы."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            skel = bsl["get_object_modules"]("РеализацияТоваров", include_methods=False)
+            full = bsl["get_object_modules"]("РеализацияТоваров", include_methods=True)
+
+            def _om_outline(res):
+                om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
+                return om["outline"]
+
+            for r in _om_outline(skel):
+                assert "methods" not in r
+            assert any("methods" in r and r["methods"] for r in _om_outline(full))
+            assert skel["totals"]["methods"] == full["totals"]["methods"] == 4
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_not_found():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            res = bsl["get_object_modules"]("НетТакогоОбъекта")
+            assert "error" in res
+            assert "_meta" in res
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_override_flags():
+    """Флаги перехватов на модуль через get_overrides_for_path + roll-up overrides."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+
+            def _fake_overrides(rel_path):
+                if rel_path.endswith("ObjectModule.bsl"):
+                    return {"ЗаполнитьДанные": [{"extension_name": "Расш", "annotation": "Вместо"}]}
+                return {}
+
+            reader.get_overrides_for_path = _fake_overrides  # instance attr shadows method
+            res = bsl["get_object_modules"]("РеализацияТоваров")
+            om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
+            assert om["overrides"]["count"] == 1
+            assert "ЗаполнитьДанные" in om["overrides"]["methods"]
+            mm = next(m for m in res["modules"] if m["path"].endswith("ManagerModule.bsl"))
+            assert mm["overrides"]["count"] == 0
+            assert res["totals"]["overrides"] == 1
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_exact_enumeration_not_capped():
+    """Имя-подстрока многих путей: прямой exact-скан собирает ВСЕ свои модули и НЕ
+    обрезается капом 50 (в отличие от find_module). Live-режим."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        obj = os.path.join(tmpdir, "Documents", "Док", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write(BSL_CODE)
+        with open(os.path.join(obj, "ManagerModule.bsl"), "w", encoding="utf-8") as f:
+            f.write(_MANAGER_BSL)
+        # 60 «декоев», object_name которых СОДЕРЖИТ «Док» подстрокой → find_module
+        # их substring-матчит и упирается в кап 50.
+        for i in range(60):
+            d = os.path.join(tmpdir, "Documents", f"Док_Декой{i:02d}", "Ext")
+            os.makedirs(d)
+            with open(os.path.join(d, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+                f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,  # live, без индекса
+        )
+        # Кап реально срабатывает на частом имени-подстроке.
+        assert len(bsl["find_module"]("Док")) == 50
+        # get_object_modules — exact scan → ТОЛЬКО 2 собственных модуля «Док».
+        res = bsl["get_object_modules"]("Док")
+        assert res["object_name"] == "Док"
+        assert len(res["modules"]) == 2
+        assert all("/Док/" in m["path"] for m in res["modules"])  # ни одного декоя
+
+
+def test_get_object_modules_does_not_parse_object_xml(monkeypatch):
+    """get_object_modules НИКОГДА не зовёт parse_object_xml/parse_metadata_xml (в отличие от analyze_object)."""
+    import rlm_tools_bsl.bsl_helpers as bh
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            calls = []
+            real = bh.parse_metadata_xml
+
+            def _spy(*a, **k):
+                calls.append(1)
+                return real(*a, **k)
+
+            monkeypatch.setattr(bh, "parse_metadata_xml", _spy)
+            res = bsl["get_object_modules"]("РеализацияТоваров")
+            assert "error" not in res
+            assert calls == []
+        finally:
+            if reader:
+                reader.close()
+
+
+def test_get_object_modules_stale_index_fallback_reason(monkeypatch):
+    """Честный per-module live-fallback: module-row есть, methods пуст → index_used=False + fallback_reason."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
+        try:
+            real = reader.get_outline_data
+
+            def _stale(rel_path):
+                if rel_path.endswith("ManagerModule.bsl"):
+                    return {
+                        "module": {
+                            "category": "Documents",
+                            "object_name": "РеализацияТоваров",
+                            "module_type": "ManagerModule",
+                        },
+                        "regions": [],
+                        "methods": [],
+                    }
+                return real(rel_path)
+
+            monkeypatch.setattr(reader, "get_outline_data", _stale)
+            res = bsl["get_object_modules"]("РеализацияТоваров")
+            mm = next(m for m in res["modules"] if m["path"].endswith("ManagerModule.bsl"))
+            assert mm["_meta"]["index_used"] is False
+            assert mm["_meta"]["fallback_reason"] == "index_empty_for_module"
+            om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
+            assert om["_meta"]["index_used"] is True
+        finally:
+            if reader:
+                reader.close()
+
+
+# ============================================================
+# P3 — extract_procedures / get_module_outline принимают имя ИЛИ путь
+# Единое правило (category, module_type): (CommonModules/CommonForms, Module)
+# → (*, ObjectModule) → (*, ManagerModule) → первый по стабильной сортировке.
+# ============================================================
+
+
+def _make_ambiguous_object_fixture(tmpdir):
+    """Document «Многоформ» с ДВУМЯ формами и БЕЗ ObjectModule → обе строки
+    (Documents, Module) одного ранга → неоднозначность. Live-режим."""
+    for fn in ("Ф1", "Ф2"):
+        d = os.path.join(tmpdir, "Documents", "Многоформ", "Forms", fn, "Ext", "Form")
+        os.makedirs(d)
+        with open(os.path.join(d, "Module.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура ПриОткрытии()\nКонецПроцедуры\n")
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    format_info = detect_format(tmpdir)
+    return make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+
+
+def test_extract_procedures_by_name_picks_object_module(bsl_env):
+    """Имя Document → (*, ObjectModule) по единому правилу; результат == по пути."""
+    by_name = bsl_env.bsl["extract_procedures"]("АвансовыйОтчет")
+    names = {p["name"] for p in by_name}
+    assert "ОбработкаЗаполнения" in names  # ObjectModule выбран (у формы методов нет)
+    om_path = next(
+        m["path"] for m in bsl_env.bsl["find_module"]("АвансовыйОтчет") if m["path"].endswith("ObjectModule.bsl")
+    )
+    by_path = bsl_env.bsl["extract_procedures"](om_path)
+    assert {p["name"] for p in by_path} == names
+
+
+def test_extract_procedures_by_name_common_module(bsl_env):
+    """Имя общего модуля → (CommonModules, Module) ранг 0."""
+    procs = bsl_env.bsl["extract_procedures"]("МойМодуль")
+    assert {p["name"] for p in procs} == {"ЗаполнитьДанные", "ПолучитьСумму", "ВнутренняяПроцедура"}
+
+
+def test_extract_procedures_path_mode_unchanged(bsl_env):
+    """Путь (есть '/') — прежний контракт, детект имени не ложно-срабатывает."""
+    path = bsl_env.bsl["find_module"]("МойМодуль")[0]["path"]
+    assert "/" in path
+    procs = bsl_env.bsl["extract_procedures"](path)
+    assert len(procs) == 3
+
+
+def test_extract_procedures_ambiguous_name_raises():
+    """Неоднозначное имя → ValueError (НЕ [] — пустой список неотличим от «нет процедур»)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl = _make_ambiguous_object_fixture(tmpdir)
+        with pytest.raises(ValueError):
+            bsl["extract_procedures"]("Многоформ")
+
+
+def test_get_module_outline_by_name_merges_meta(bsl_env):
+    """Имя → _meta МЕРЖИТ resolver-ключи в существующий _meta (index_used/fallback_reason НЕ затёрты)."""
+    by_name = bsl_env.bsl["get_module_outline"]("МойМодуль")
+    meta = by_name["_meta"]
+    # старый контракт _meta цел
+    assert "index_used" in meta and "fallback_reason" in meta
+    # resolver-ключи домержены
+    assert meta["resolved_from_name"] is True
+    assert meta["chosen_module"].endswith("Module.bsl")
+    assert meta["ambiguous"] is False
+    assert "candidates" in meta
+    # name-режим == path-режим того же модуля
+    path = meta["chosen_module"]
+    by_path = bsl_env.bsl["get_module_outline"](path)
+    assert by_path["_meta"]["resolved_from_name"] is False
+    assert "index_used" in by_path["_meta"] and "fallback_reason" in by_path["_meta"]
+    assert by_name["totals"] == by_path["totals"]
+
+
+def test_get_module_outline_ambiguous_name_flags_meta():
+    """Неоднозначное имя → прозрачный авто-выбор: _meta.ambiguous=True + кандидаты, НЕ ошибка."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl = _make_ambiguous_object_fixture(tmpdir)
+        o = bsl["get_module_outline"]("Многоформ")
+        assert o["_meta"]["resolved_from_name"] is True
+        assert o["_meta"]["ambiguous"] is True
+        assert len(o["_meta"]["candidates"]) == 2
+        assert "totals" in o  # валидный outline (авто-выбор первого по стабильной сортировке)
+        assert "index_used" in o["_meta"] and "fallback_reason" in o["_meta"]
+
+
+# ============================================================
+# Codex review fixes (dense-batching): findings 1/2/3
+# ============================================================
+
+
+def test_resolve_module_arg_strips_meta_prefix_extract_procedures(bsl_env):
+    """Finding 2: имя с префиксом типа (Документ.X) резолвится так же, как bare-имя."""
+    bare = {p["name"] for p in bsl_env.bsl["extract_procedures"]("АвансовыйОтчет")}
+    prefixed = {p["name"] for p in bsl_env.bsl["extract_procedures"]("Документ.АвансовыйОтчет")}
+    assert prefixed == bare
+    assert "ОбработкаЗаполнения" in prefixed
+
+
+def test_resolve_module_arg_strips_meta_prefix_get_module_outline(bsl_env):
+    """Finding 2: get_module_outline('Документ.X') резолвит ObjectModule, не уходит битым путём."""
+    o = bsl_env.bsl["get_module_outline"]("Документ.АвансовыйОтчет")
+    assert "error" not in o
+    assert o["_meta"]["resolved_from_name"] is True
+    assert o["_meta"]["chosen_module"].endswith("ObjectModule.bsl")
+    # bare и prefixed дают один и тот же выбранный модуль
+    bare = bsl_env.bsl["get_module_outline"]("АвансовыйОтчет")
+    assert bare["_meta"]["chosen_module"] == o["_meta"]["chosen_module"]
+
+
+def test_single_or_map_isolates_raising_item():
+    """Finding 3: исключение скаляра на одном элементе батча → {error} под его ключом,
+    валидный сосед всё равно резолвится (батч не оборван)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        enum_dir = os.path.join(tmpdir, "Enums", "СтатусыЗаказов")
+        os.makedirs(enum_dir)
+        with open(os.path.join(enum_dir, "СтатусыЗаказов.xml"), "w", encoding="utf-8") as f:
+            f.write(ENUM_CF_XML)
+        # 123 (int) → _strip_meta_prefix(123) бросает AttributeError в скалярном ядре.
+        res = bsl["find_enum_values"](["СтатусыЗаказов", 123])
+        assert isinstance(res, dict)
+        assert res["СтатусыЗаказов"]["name"] == "СтатусыЗаказов"  # сосед уцелел
+        assert "error" in res["123"]  # битый элемент изолирован, батч не упал
+
+
+def test_get_object_modules_collision_category_deterministic():
+    """Finding 1: одноимённые объекты в разных категориях → выбор детерминирован
+    (rel-path сорт), модули ровно ОДНОЙ категории — get_all_modules() без ORDER BY
+    больше не делает результат порядок-зависимым."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for cat in ("Catalogs", "Documents"):
+            obj = os.path.join(tmpdir, cat, "Омоним", "Ext")
+            os.makedirs(obj)
+            with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+                f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,  # live, без индекса
+        )
+        res = bsl["get_object_modules"]("Омоним")
+        assert "error" not in res
+        # Catalogs/... < Documents/... по rel-path → первая категория Catalogs.
+        assert res["category"] == "Catalogs"
+        assert res["modules"]  # непусто
+        # ровно одна категория: все модули из Catalogs, ни одного из Documents
+        assert all(m["path"].startswith("Catalogs/") for m in res["modules"])
+        assert not any("Documents" in m["path"] for m in res["modules"])

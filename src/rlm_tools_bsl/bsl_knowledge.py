@@ -462,8 +462,24 @@ read_procedure(path, name) vs read_procedure(path, name, include_overrides=True)
   - С include_overrides: оригинал + тело перехвата с маркером "=== Перехвачен &Аннотация ===".
   - Используй с include_overrides когда rlm_start обнаружил расширения (extension_context).
 
+get_object_modules(name) vs analyze_object(name):
+  - get_object_modules → все модули объекта + дерево #Область + агрегаты + флаги перехватов.
+    Дёшев на индексном пути: НЕ читает тела (extract_procedures) и НЕ парсит XML.
+  - analyze_object → читает ВСЕ тела процедур каждого модуля + parse_object_xml. Тяжёлый (>60с на 10K+).
+  Сначала get_object_modules (карта кода); analyze_object — только если нужны тела всех процедур сразу.
+
+get_object_modules(name) vs get_object_full_structure(name):
+  - get_object_modules → КОД-side: модули, области, методы/экспорты, перехваты.
+  - get_object_full_structure → METADATA-side: реквизиты, ТЧ, измерения/ресурсы, предопределённые, перечисления, формы.
+  Разные стороны объекта, дополняют друг друга — нужны обе стороны, зови оба (каждый дёшев на индексе).
+
 == BATCHING & OUTPUT ==
 Batch 3-5 related helpers per rlm_execute call — this is more efficient than one-at-a-time.
+Pass a LIST to overloaded helpers — резолвит модуль/объект один раз, возвращает dict по имени:
+  read_procedure(path, ['Проц1','Проц2']) · find_callers_context(['A','B'], hint) · find_enum_values(['E1','E2'])
+AGGREGATE-FIRST, не после: get_object_modules(name) → код-скелет ВСЕХ модулей объекта;
+  get_object_full_structure(name) → метаданные. Звать individual-хелперы, а ПОТОМ тот же агрегат
+  (напр. find_register_movements + затем analyze_document_flow) — двойной фетч; бери агрегат сразу.
 If output is truncated (ends with '... [truncated]'), split into smaller calls.
 Print only summaries (counts, first N items) — never dump raw data.
 If response contains 'duplicates' section — you've called the same helper with identical args twice

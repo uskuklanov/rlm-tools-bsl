@@ -100,6 +100,11 @@ CAUTION: на конфигах 10K+ файлов analyze_* могут быть >
     "batching": """\
 == BATCHING & OUTPUT ==
 Batch 3-5 related helpers per rlm_execute call — this is more efficient than one-at-a-time.
+Pass a LIST to overloaded helpers — резолвит модуль/объект один раз, возвращает dict по имени:
+  read_procedure(path, ['Проц1','Проц2']) · find_callers_context(['A','B'], hint) · find_enum_values(['E1','E2'])
+AGGREGATE-FIRST, не после: get_object_modules(name) → код-скелет ВСЕХ модулей объекта;
+  get_object_full_structure(name) → метаданные. Звать individual-хелперы, а ПОТОМ тот же агрегат
+  (напр. find_register_movements + затем analyze_document_flow) — двойной фетч; бери агрегат сразу.
 If output is truncated (ends with '... [truncated]'), split into smaller calls.
 Print only summaries (counts, first N items) — never dump raw data.
 If response contains 'duplicates' section — you've called the same helper with identical args twice
@@ -198,5 +203,21 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "when_b": 'find_code_usages — ОБРАЩЕНИЯ В КОДЕ: Документы.X (manager), "ДокументСсылка.X" (ref_type), запросы Документ.X.ТЧ (query, member=имя ТЧ). Метаданные-XML НЕ сканирует.',
         "rule": "Это РАЗНЫЕ слои. «Где объявлен/связан» → find_references_to_object. «Где используется в коде» → find_code_usages. Нужны оба — find_references_to_object(obj, include_code=True). Доступ к реквизитам через локальные переменные и код расширений — вне охвата find_code_usages.",
         "tags": ["references", "code", "usages"],
+    },
+    {
+        "pair": ("get_object_modules", "analyze_object"),
+        "summary": "лёгкий индексный скелет vs тяжёлый разбор тел",
+        "when_a": "get_object_modules — все модули объекта + дерево #Область + агрегаты + флаги перехватов. Дёшев на индексном пути: НЕ читает тела (extract_procedures) и НЕ парсит XML. include_methods=False (дефолт) — только области.",
+        "when_b": "analyze_object — читает ВСЕ тела процедур каждого модуля + parse_object_xml метаданных. Тяжёлый (на 10K+ конфигах >60с).",
+        "rule": "Сначала get_object_modules (карта кода объекта). analyze_object — только когда реально нужны тела всех процедур сразу; иначе ныряй точечно read_procedure(path, name).",
+        "tags": ["modules", "skeleton", "composite", "code"],
+    },
+    {
+        "pair": ("get_object_modules", "get_object_full_structure"),
+        "summary": "код-side скелет vs metadata-side структура (композируются)",
+        "when_a": "get_object_modules — КОД: модули, области, методы/экспорты, перехваты.",
+        "when_b": "get_object_full_structure — МЕТАДАННЫЕ: реквизиты, ТЧ, измерения/ресурсы, предопределённые, раскрытые перечисления, формы.",
+        "rule": "Разные стороны объекта, дополняют друг друга. Нужен код → get_object_modules; нужны реквизиты/ТЧ → get_object_full_structure; нужно и то и то → зови оба (каждый дёшев на индексе).",
+        "tags": ["modules", "structure", "metadata", "composite"],
     },
 ]

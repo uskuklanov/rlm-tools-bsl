@@ -180,7 +180,7 @@ RLM_PORT=9000
 ### Где найти готовые промпты для типовых задач?
 
 См. [docs/full_analysis_prompt.md](full_analysis_prompt.md) — там **10 готовых промптов** для разных задач:
-- Полный анализ документа (все 61 хелпер)
+- Полный анализ документа (все 62 хелпера)
 - Анализ интеграции (HTTP/SOAP/XDTO/планы обмена) — v1.4.0
 - Object Synonyms (бизнес-имена) — v1.4.1
 - Regions & Module Headers (семантический контекст кода) — v1.4.2
@@ -220,7 +220,7 @@ rlm-bsl-index index info <path>
 ## Что почитать дальше
 
 - [QUICKSTART.md](QUICKSTART.md) — установка и первые шаги
-- [HELPERS.md](HELPERS.md) — полный список из 61 хелпера с примерами
+- [HELPERS.md](HELPERS.md) — полный список из 62 хелперов с примерами
 - [INDEXING.md](INDEXING.md) — устройство SQLite-индекса (27 таблиц + FTS5)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — общая архитектура
 - [full_analysis_prompt.md](full_analysis_prompt.md) — готовые E2E-промпты для типовых задач
