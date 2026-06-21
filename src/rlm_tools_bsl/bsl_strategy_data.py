@@ -38,6 +38,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
+  NOTE: search_regions/search_module_headers молча усекаются по limit — для census/статистики бери count_only=True (index-side {total})
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
@@ -67,7 +68,7 @@ Step 4 — ANALYZE: get the full picture
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → indexed overrides (instant)
+  get_overrides('ObjectName') → indexed overrides (instant); без фильтра первые 200 (порядок не гарантирован), total/truncated в ответе сигналят обрезку
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.

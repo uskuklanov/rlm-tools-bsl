@@ -207,6 +207,16 @@ def test_recipe_aliases_consistency():
         assert dom in _BUSINESS_RECIPES, f"alias '{alias}' points to missing domain '{dom}'"
 
 
+def test_references_recipe_has_subsystem_membership_hint():
+    """v1.24.0 #3 — рецепт 'ссылки' должен подсказывать членство в подсистемах через
+    kinds=['subsystem_content'] + предупреждать про устаревший индекс (live-проверку)."""
+    full_text = " ".join(_BUSINESS_RECIPES["ссылки"]["full"])
+    assert "subsystem_content" in full_text
+    assert "kinds=['subsystem_content']" in full_text
+    # stale-index caveat: подсказка должна вести к live-проверке состава подсистем
+    assert "устаревш" in full_text.lower() or "live" in full_text.lower()
+
+
 def test_match_recipe_found():
     assert _match_recipe("Как рассчитывается себестоимость?") == "себестоимость"
     assert _match_recipe("Проведение документа РеализацияТоваров") == "проведение"

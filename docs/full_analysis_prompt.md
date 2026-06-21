@@ -406,13 +406,13 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
    - Проверь extension_context из ответа rlm_start — какая роль конфигурации, есть ли расширения рядом
 
 2. **Обзор всех перехватов из индекса**:
-   - get_overrides() без фильтров → сколько всего перехватов, из каких расширений, source="index" или "live"
+   - get_overrides() без фильтров → `total` (полное число), `source`, `truncated`. ВНИМАНИЕ: `overrides` несёт только ПЕРВЫЕ 200; если `truncated=True`, группировка ниже неполная — опирайся на `total` и/или сужай get_overrides('Объект') по объектам
    - Сгруппируй по расширениям: для каждого расширения — количество перехватов и назначение (purpose)
    - Сгруппируй по типам аннотаций: сколько &Перед, &После, &Вместо, &ИзменениеИКонтроль
 
 3. **Прицельный поиск перехватов**:
    - Выбери объект с наибольшим количеством перехватов
-   - get_overrides('ИмяОбъекта') → все перехваты этого объекта
+   - get_overrides('ИмяОбъекта') → перехваты этого объекта (первые 200; проверь `truncated`)
    - Для каждого перехвата: метод, тип аннотации, метод расширения, файл расширения
 
 4. **Обогащение extract_procedures**:
@@ -459,12 +459,12 @@ This prompt verifies the extension overrides indexing pipeline from v1.5.0: the 
 |------|-----------------|----------------|
 | Index diagnostics | `get_index_info()` | builder_version=9, has_extension_overrides=True, count>0 |
 | Extension context | `rlm_start` response | extension_context with nearby extensions, live overrides |
-| Indexed overrides | `get_overrides()` | source="index", instant response, all overrides |
+| Indexed overrides | `get_overrides()` | source="index", instant response, first 200 rows (`total`/`truncated` present; filter by object if `truncated`) |
 | Filtered overrides | `get_overrides(object_name)` | Correct filtering by object |
 | Procedure enrichment | `extract_procedures(path)` | overridden_by field on intercepted methods |
 | Read original | `read_procedure(path, name)` | Clean body without override data (regression) |
 | Read with overrides | `read_procedure(path, name, include_overrides=True)` | Original + extension body with annotation header |
-| Live fallback | `detect_extensions()` + `find_ext_overrides()` | Live data matches index data |
+| Live fallback | `detect_extensions()` + `find_ext_overrides()` | Live matches index on a FRESH index (may differ on stale — index is a snapshot; documented caveat) |
 | Help recipe | `help('override')` | Recipe displayed correctly |
 | WORKFLOW Step 5 | Strategy | get_overrides, read_procedure(include_overrides), overridden_by |
 
@@ -1503,7 +1503,8 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 3. **Перехваты расширений (CFE) и их триггеры**:
    - get_overrides() → сводка: total, source, разбивка по расширениям (поле extension_name) и
      по аннотациям (&Перед/&После/&Вместо/&ИзменениеИКонтроль). (Помни: get_overrides() — это dict
-     {overrides, total, source}, перехваты в res['overrides'].)
+     {overrides, total, truncated, source}, перехваты в res['overrides'] — ПЕРВЫЕ 200; если
+     res['truncated'] — сводка неполная, сузь get_overrides('Объект') / find_ext_overrides(ext_path).)
    - Возьми объект с наибольшим числом перехватов; для одного его перехваченного метода построй
      find_call_hierarchy(метод, module_hint=<этот объект>, include_triggers=True) и подтверди, что в
      triggers появляется ребро edge_type='cfe_override' с resolved=True.
@@ -1567,7 +1568,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Reachability (NEW) | `find_path(from, to, to_hint=...)` | forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False` = truly unreachable |
 | Data path (NEW) | `find_data_path(from, to)` → `find_metadata_refs_from` | edge list {from,to,kind}; bare endpoint → structural hint (no traversal); `partial` on old index |
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
-| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,source}`; key `extension_name` (incl. live extension session) |
+| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,source}`; `overrides`=первые 200 (`truncated` сигналит обрезку); key `extension_name` (incl. live extension session) |
 | Contract: register movements | `find_register_movements()` | `code_registers`=list[dict]; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
 | Contract: roles | `find_roles()` | `rights` = list[str] |
 | Contract: doc flow | `analyze_document_flow()` | dict with documented keys |

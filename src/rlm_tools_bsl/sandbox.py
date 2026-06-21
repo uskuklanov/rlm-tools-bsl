@@ -148,6 +148,10 @@ class Sandbox:
         self._session_helper_name_counts: dict[str, int] = {}
         self._session_helper_arg_counts: dict[tuple[str, str], int] = {}
         self._emitted_efficiency_hints: set[str] = set()
+        # v1.24.0 #5 — batch nudge granularity is rlm_execute ROUND-TRIPS, not raw
+        # invocations: an execute with only 1-2 top-level helper calls is "sparse".
+        # Accumulated across the session (NOT cleared in execute(), unlike _helper_calls).
+        self._session_sparse_execute_count: int = 0
         self._setup_namespace()
 
     def _setup_namespace(self) -> None:
@@ -288,6 +292,11 @@ class Sandbox:
         {"read_files", "get_object_profile", "get_object_modules", "get_object_full_structure"}
     )
 
+    # v1.24.0 #5 — an execute with 1..THRESHOLD top-level helper calls is "sparse"
+    # (poor batching); after NUDGE such sparse round-trips, suggest batching.
+    _SPARSE_CALLS_THRESHOLD = 2
+    _SPARSE_EXECUTES_TO_NUDGE = 8
+
     def _compute_efficiency_hints(self) -> list[dict]:
         """Session-cumulative efficiency nudges, throttled to ONE per id per session.
 
@@ -298,6 +307,15 @@ class Sandbox:
         out: list[dict] = []
         nc = self._session_helper_name_counts
         emitted = self._emitted_efficiency_hints
+
+        # v1.24.0 #5 — batch nudge granularity: count THIS execute's top-level helper
+        # calls. _helper_calls is cleared at the start of execute() and appended only
+        # for top-level invocations (composite helpers bypass _timed), so its length
+        # here == top-level calls in this execute (error-execute included: calls made
+        # before the exception are already recorded). 1..THRESHOLD = sparse round-trip.
+        calls_this_execute = len(self._helper_calls)
+        if 1 <= calls_this_execute <= self._SPARSE_CALLS_THRESHOLD:
+            self._session_sparse_execute_count += 1
 
         # (1) Non-batched homogeneous reads → read_files([...]) / read_procedure(path, [...]).
         rf = nc.get("read_file", 0)
@@ -338,20 +356,22 @@ class Sandbox:
                     )
                     break
 
-        # (2) Many single helper calls and no aggregate helper used → batch more.
-        total = sum(nc.values())
+        # (2) Many SPARSE rlm_execute round-trips (1-2 calls each) and no aggregate
+        # helper used → batch more. Granularity is round-trips, not raw invocations,
+        # so a single dense execute (e.g. 20 calls) is NOT penalised (v1.24.0 #5).
+        sparse = self._session_sparse_execute_count
         used_aggregate = any(nc.get(h, 0) for h in self._AGGREGATE_HELPERS)
-        if total >= 8 and not used_aggregate and "batch" not in emitted:
+        if sparse >= self._SPARSE_EXECUTES_TO_NUDGE and not used_aggregate and "batch" not in emitted:
             emitted.add("batch")
             out.append(
                 {
                     "id": "batch",
                     "helper": None,
-                    "count": total,
-                    "trigger": f"{total} single helper calls, no aggregate helper used",
+                    "count": sparse,
+                    "trigger": f"{sparse} sparse rlm_execute round-trips (1-2 calls each), no aggregate helper used",
                     "message": (
-                        "Много одиночных вызовов — батчи 3–5 связанных операций в один rlm_execute; "
-                        "для обзора объекта бери get_object_profile(name) (≈10 вызовов в 1)."
+                        "Много отдельных rlm_execute с 1-2 вызовами — батчи 3–5 связанных операций в один "
+                        "rlm_execute; для обзора объекта бери get_object_profile(name) (≈10 вызовов в 1)."
                     ),
                 }
             )
@@ -547,7 +567,7 @@ class Sandbox:
             hints.append(
                 "HINT: похоже, вы срезаете dict как список ([:N]). Ряд хелперов возвращают "
                 "dict, а не list: analyze_document_flow → {event_subscriptions, "
-                "register_movements, ...}; get_overrides → {overrides, total, source}; "
+                "register_movements, ...}; get_overrides → {overrides, total, truncated, source}; "
                 "find_register_movements → {code_registers, erp_mechanisms, ...}; "
                 "find_path/find_data_path → {found, path:[...], _meta}. "
                 "Сначала возьми нужный СПИСОК по ключу (напр. res['path']), потом срезай."
@@ -570,7 +590,8 @@ class Sandbox:
             hints.append(
                 "HINT: detect_extensions() возвращает dict {config_role, config_name, "
                 "config_prefix, warnings, nearby_extensions, nearby_main}, НЕ список. "
-                "Расширения — это список ctx['nearby_extensions']; роль — ctx['config_role']."
+                "Расширения — это список ctx['nearby_extensions'] (каждый: {name, purpose, prefix, "
+                "path, overrides_count}); роль — ctx['config_role']."
             )
 
         # v1.23.0 — three recurrent agent-shape errors (from A/B logs). Each caught retry
@@ -599,7 +620,7 @@ class Sandbox:
                 "возвращают dict с под-списками: find_register_movements → {code_registers, "
                 "erp_mechanisms, manager_tables, adapted_registers}; get_object_profile → "
                 "{object_name, category, sections:{...}, _meta}; get_overrides → {overrides, total, "
-                "source}. Сверь ключи: print(list(result.keys())) или rlm_help(helpers=['имя'])."
+                "truncated, source}. Сверь ключи: print(list(result.keys())) или rlm_help(helpers=['имя'])."
             )
 
         if "import" in error.lower() and "restricted" in error.lower():

@@ -224,6 +224,32 @@ class TestSearchModuleHeadersLive:
             assert set(row.keys()) == SEARCH_HEADERS_KEYS, row
 
 
+class TestCountOnlyExtension:
+    """v1.24.0 #1 — count_only is INDEX-side (main config only); ext rows that the
+    normal path merges live are NOT counted. scope=='main_index' makes that explicit,
+    so агент не примет это за «total mismatch»."""
+
+    def test_count_only_regions_is_index_side(self, helpers_with_ext):
+        bsl, _cf, _cfe, reader = helpers_with_ext
+        res = bsl["search_regions"]("ext_SearchRegion", count_only=True)
+        assert res["scope"] == "main_index"
+        assert res["source"] == "index"
+        assert res["truncated"] is False
+        # Index has no ext_SearchRegion (it lives only in the extension file) →
+        # index-side count is 0, even though the merged list path WOULD find it.
+        assert res["total"] == reader.count_regions("ext_SearchRegion")
+        # The live-merged path does surface the ext region — proving count_only
+        # is intentionally a different (cheaper, main-only) census.
+        merged = bsl["search_regions"]("ext_SearchRegion")
+        assert any(r["module_path"].startswith("../cfe/") for r in merged)
+
+    def test_count_only_module_headers_is_index_side(self, helpers_with_ext):
+        bsl, _cf, _cfe, reader = helpers_with_ext
+        res = bsl["search_module_headers"]("ext_SearchMarker", count_only=True)
+        assert res["scope"] == "main_index"
+        assert res["total"] == reader.count_module_headers("ext_SearchMarker")
+
+
 class TestSearchUnified:
     def test_search_unified_scope_all_includes_extension(self, helpers_with_ext):
         bsl, _cf, _cfe, _reader = helpers_with_ext

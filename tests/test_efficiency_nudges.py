@@ -90,6 +90,61 @@ def test_aggregator_is_instance_local():
         assert not res2.efficiency_hints
 
 
+def test_dense_batch_in_one_execute_no_batch_nudge():
+    """v1.24.0 #5 — 20 invocations of one helper in ONE execute is perfect batching;
+    the batch nudge (which counts rlm_execute ROUND-TRIPS now, not invocations) must
+    NOT fire. Regression: agent 06 did this and still got the hint."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = _bsl_sandbox(tmpdir)
+        code = "\n".join(f"find_module('Mod{i}')" for i in range(20))
+        res = sb.execute(code)
+        ids = {h["id"] for h in (res.efficiency_hints or [])}
+        assert "batch" not in ids, res.efficiency_hints
+
+
+def test_few_execute_with_one_dense_execute_no_batch_nudge():
+    """v1.24.0 #5 — 4 execute total, one of which packs 8 calls. Only 3 sparse
+    round-trips < threshold → no batch nudge (agent 08 case: 4 execute, ideal)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = _bsl_sandbox(tmpdir)
+        # one dense execute: 8 calls
+        sb.execute("\n".join(f"find_module('Dense{i}')" for i in range(8)))
+        # three single-call execute
+        last = None
+        for i in range(3):
+            last = sb.execute(f"find_module('Single{i}')")
+        ids = {h["id"] for h in (last.efficiency_hints or [])}
+        assert "batch" not in ids, last.efficiency_hints
+
+
+def test_many_sparse_execute_triggers_batch_with_roundtrip_count():
+    """v1.24.0 #5 — 8 separate execute, each a single non-aggregate call → batch
+    nudge fires, count reflects ROUND-TRIPS (8), not summed invocations."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = _bsl_sandbox(tmpdir)
+        last = None
+        for i in range(8):
+            last = sb.execute(f"find_module('Round{i}')")  # distinct args → no reuse_var
+        hints = last.efficiency_hints or []
+        batch = [h for h in hints if h["id"] == "batch"]
+        assert batch, hints
+        assert batch[0]["count"] == 8
+        assert "round-trip" in batch[0]["trigger"].lower()
+
+
+def test_zero_helper_execute_does_not_count_as_sparse():
+    """v1.24.0 #5 — execute with NO helper calls (pure Python/print) must not
+    increment the sparse counter and must not raise AttributeError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sb = _bsl_sandbox(tmpdir)
+        # 8 pure-python executes — would reach threshold if counted as sparse.
+        last = None
+        for i in range(8):
+            last = sb.execute(f"x = {i}; print(x)")
+        ids = {h["id"] for h in (last.efficiency_hints or [])}
+        assert "batch" not in ids, last.efficiency_hints
+
+
 def test_hints_in_metadata_not_stdout_and_return_unchanged():
     with tempfile.TemporaryDirectory() as tmpdir:
         sb = _txt_sandbox(tmpdir)

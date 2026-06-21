@@ -577,6 +577,117 @@ class TestRegionsHelpers:
         assert "search_module_headers()" in strategy
 
 
+class TestCountOnly:
+    """v1.24.0 #1 — count_only census для search_regions / search_module_headers."""
+
+    def test_index_count_regions_matches_search(self, built_regions_index):
+        db_path, _ = built_regions_index
+        reader = IndexReader(str(db_path))
+        try:
+            full = reader.search_regions("", limit=10**9)
+            assert reader.count_regions("") == len(full)
+            full_q = reader.search_regions("Программный", limit=10**9)
+            assert reader.count_regions("Программный") == len(full_q)
+        finally:
+            reader.close()
+
+    def test_index_count_module_headers_matches_search(self, built_regions_index):
+        db_path, _ = built_regions_index
+        reader = IndexReader(str(db_path))
+        try:
+            full = reader.search_module_headers("", limit=10**9)
+            assert reader.count_module_headers("") == len(full)
+            full_q = reader.search_module_headers("себестоимости", limit=10**9)
+            assert reader.count_module_headers("себестоимости") == len(full_q)
+        finally:
+            reader.close()
+
+    def test_index_count_regions_missing_table(self, tmp_path):
+        db = tmp_path / "empty_cnt.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE modules (id INTEGER PRIMARY KEY, rel_path TEXT)")
+        conn.commit()
+        conn.close()
+        reader = IndexReader(str(db))
+        try:
+            assert reader.count_regions("test") is None
+            assert reader.count_module_headers("test") is None
+        finally:
+            reader.close()
+
+    def _bsl(self, db_path, project):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+        reader = IndexReader(str(db_path))
+        bsl = make_bsl_helpers(
+            base_path=str(project),
+            resolve_safe=lambda p: __import__("pathlib").Path(p),
+            read_file_fn=lambda p: "",
+            grep_fn=lambda pat, path="": [],
+            glob_files_fn=lambda pat: [],
+            idx_reader=reader,
+        )
+        return bsl, reader
+
+    def test_helper_count_only_regions(self, built_regions_index):
+        db_path, project = built_regions_index
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_regions"]("", count_only=True)
+            assert isinstance(res, dict)
+            assert res == {
+                "total": reader.count_regions(""),
+                "source": "index",
+                "truncated": False,
+                "scope": "main_index",
+            }
+            assert res["total"] == 3
+        finally:
+            reader.close()
+
+    def test_helper_count_only_module_headers(self, built_regions_index):
+        db_path, project = built_regions_index
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            res = bsl["search_module_headers"]("себестоимости", count_only=True)
+            assert res == {
+                "total": reader.count_module_headers("себестоимости"),
+                "source": "index",
+                "truncated": False,
+                "scope": "main_index",
+            }
+            assert res["total"] == 1
+        finally:
+            reader.close()
+
+    def test_helper_count_only_false_is_unchanged(self, built_regions_index):
+        db_path, project = built_regions_index
+        bsl, reader = self._bsl(db_path, project)
+        try:
+            default = bsl["search_regions"]("Обработчики")
+            explicit = bsl["search_regions"]("Обработчики", count_only=False)
+            assert isinstance(default, list)
+            assert default == explicit
+        finally:
+            reader.close()
+
+    def test_helper_count_only_unavailable_without_index(self):
+        from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+        bsl = make_bsl_helpers(
+            base_path="/nonexistent",
+            resolve_safe=lambda p: __import__("pathlib").Path(p),
+            read_file_fn=lambda p: "",
+            grep_fn=lambda pat, path="": [],
+            glob_files_fn=lambda pat: [],
+        )
+        res = bsl["search_regions"]("x", count_only=True)
+        assert res == {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+        res_h = bsl["search_module_headers"]("x", count_only=True)
+        assert res_h == {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+
+
 class TestRegionsStrategy:
     def test_strategy_includes_search_regions(self, built_regions_index):
         db_path, _ = built_regions_index

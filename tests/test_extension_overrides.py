@@ -310,6 +310,108 @@ class TestLiveOverridesContract:
         assert names == {"ТестовоеРасширение"}
 
 
+class _FakeOverridesReader:
+    """Minimal idx_reader stub: only get_extension_overrides is exercised by get_overrides."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def get_extension_overrides(self, object_name="", method_name=""):
+        return list(self._rows)
+
+
+def _make_bsl_with_reader(idx_reader):
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+
+    return make_bsl_helpers(
+        base_path="/nonexistent",
+        resolve_safe=lambda p: __import__("pathlib").Path(p),
+        read_file_fn=lambda p: "",
+        grep_fn=lambda pat, path="": [],
+        glob_files_fn=lambda pat: [],
+        idx_reader=idx_reader,
+    )
+
+
+class TestGetOverridesTruncated:
+    """v1.24.0 #6 — truncated-флаг + cap=200 во ВСЕХ ветках get_overrides + find_ext_overrides."""
+
+    def test_index_branch_truncated_over_200(self):
+        rows = [{"object_name": "Об", "target_method": f"M{i}", "extension_name": "E"} for i in range(250)]
+        bsl = _make_bsl_with_reader(_FakeOverridesReader(rows))
+        res = bsl["get_overrides"]()
+        assert res["source"] == "index"
+        assert res["total"] == 250
+        assert len(res["overrides"]) == 200
+        assert res["truncated"] is True
+
+    def test_index_branch_not_truncated_under_200(self):
+        rows = [{"object_name": "Об", "target_method": f"M{i}", "extension_name": "E"} for i in range(50)]
+        bsl = _make_bsl_with_reader(_FakeOverridesReader(rows))
+        res = bsl["get_overrides"]()
+        assert res["total"] == 50
+        assert len(res["overrides"]) == 50
+        assert res["truncated"] is False
+
+    def test_unavailable_branch_has_truncated_false(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+
+        def _boom(_path):
+            raise RuntimeError("no context")
+
+        monkeypatch.setattr(ed, "detect_extension_context", _boom)
+        # idx_reader None → skip index branch, then _det raises → unavailable branch.
+        bsl = _make_bsl_with_reader(None)
+        res = bsl["get_overrides"]()
+        assert res["source"] == "unavailable"
+        assert res["truncated"] is False
+
+    def test_live_branch_truncated_over_200(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+        from rlm_tools_bsl.extension_detector import ConfigRole
+
+        big = [{"target_method": f"M{i}", "annotation": "После"} for i in range(250)]
+
+        class _Cur:
+            role = ConfigRole.EXTENSION
+            name = "РасшБольшое"
+            path = "/ext/path"
+
+        class _Ctx:
+            current = _Cur()
+            nearby_extensions = []
+
+        monkeypatch.setattr(ed, "detect_extension_context", lambda _p: _Ctx())
+        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(big))
+        bsl = _make_bsl_with_reader(None)
+        res = bsl["get_overrides"]()
+        assert res["source"] == "live"
+        assert res["total"] == 250
+        assert len(res["overrides"]) == 200
+        assert res["truncated"] is True
+
+    def test_find_ext_overrides_truncated(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+
+        big = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(250)]
+        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(big))
+        bsl = _make_bsl_with_reader(None)
+        res = bsl["find_ext_overrides"]("/ext/path")
+        assert res["total"] == 250
+        assert len(res["overrides"]) == 200
+        assert res["truncated"] is True
+
+    def test_find_ext_overrides_not_truncated(self, monkeypatch):
+        import rlm_tools_bsl.extension_detector as ed
+
+        small = [{"target_method": f"M{i}", "annotation": "Перед"} for i in range(5)]
+        monkeypatch.setattr(ed, "find_extension_overrides", lambda _p, _o=None: list(small))
+        bsl = _make_bsl_with_reader(None)
+        res = bsl["find_ext_overrides"]("/ext/path")
+        assert res["total"] == 5
+        assert res["truncated"] is False
+
+
 # ---------------------------------------------------------------------------
 # IndexReader methods
 # ---------------------------------------------------------------------------
@@ -566,6 +668,145 @@ class TestCaseInsensitiveCyrillic:
         # The single key should contain the override
         all_overrides = [ov for ovs in result.values() for ov in ovs]
         assert len(all_overrides) == 1
+
+
+_EXT_PLAIN_BSL = textwrap.dedent("""\
+    Процедура мр_ОбычныйМетод() Экспорт
+        // никаких &После/&Вместо — нет перехватов
+    КонецПроцедуры
+""")
+
+
+def _bsl_for(base_path, reader):
+    from rlm_tools_bsl.bsl_helpers import make_bsl_helpers
+    from rlm_tools_bsl.format_detector import detect_format
+    from rlm_tools_bsl.helpers import make_helpers
+
+    helpers, resolve_safe = make_helpers(base_path, idx_reader=reader)
+    fmt = detect_format(base_path)
+    return make_bsl_helpers(
+        base_path=base_path,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=fmt,
+        idx_reader=reader,
+    )
+
+
+class TestCountOverridesByExtensionRoot:
+    """v1.24.0 #7 — IndexReader.count_overrides_by_extension_root + detect_extensions.overrides_count."""
+
+    def test_index_reader_groups_by_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        cf, cfe = _make_main_with_extension(tmp_path)
+        builder = IndexBuilder()
+        db_path = builder.build(cf, build_calls=False, build_metadata=False, build_fts=False)
+        reader = IndexReader(db_path)
+        try:
+            counts = reader.count_overrides_by_extension_root()
+            assert counts is not None
+            assert counts.get(cfe) == 2
+        finally:
+            reader.close()
+
+    def test_index_reader_none_when_table_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        cf = str(tmp_path / "cf")
+        _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+        _write(os.path.join(cf, "CommonModules", "Test", "Ext", "Module.bsl"), "")
+        builder = IndexBuilder()
+        db_path = builder.build(cf, build_calls=False, build_metadata=False, build_fts=False)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE IF EXISTS extension_overrides")
+        conn.commit()
+        conn.close()
+        reader = IndexReader(db_path)
+        try:
+            assert reader.count_overrides_by_extension_root() is None
+        finally:
+            reader.close()
+
+    def test_detect_main_session_reports_count(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        cf, cfe = _make_main_with_extension(tmp_path)
+        builder = IndexBuilder()
+        db_path = builder.build(cf, build_calls=False, build_metadata=False, build_fts=False)
+        reader = IndexReader(db_path)
+        try:
+            bsl = _bsl_for(cf, reader)
+            ctx = bsl["detect_extensions"]()
+            assert ctx["config_role"] == "main"
+            nearby = ctx["nearby_extensions"]
+            assert nearby, ctx
+            # match by normalized path, NOT index i
+            import os as _os
+
+            def _norm(p):
+                return _os.path.normcase(_os.path.normpath(_os.path.abspath(p)))
+
+            by_path = {_norm(e["path"]): e for e in nearby}
+            assert by_path[_norm(cfe)]["overrides_count"] == 2
+        finally:
+            reader.close()
+
+    def test_detect_main_session_zero_when_no_overrides(self, tmp_path, monkeypatch):
+        """MAIN + nearby extension WITHOUT overrides + index built → 0 (known zero), not None."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        cf = os.path.join(str(tmp_path), "src", "cf")
+        cfe = os.path.join(str(tmp_path), "src", "cfe", "ПустоеРасширение")
+        _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
+        _write(os.path.join(cf, "Catalogs", "Номенклатура", "Ext", "ObjectModule.bsl"), _MAIN_MODULE_BSL)
+        _write(os.path.join(cfe, "Configuration.xml"), _cf_extension_xml(name="ПустоеРасширение"))
+        _write(os.path.join(cfe, "CommonModules", "мр_Модуль", "Ext", "Module.bsl"), _EXT_PLAIN_BSL)
+        builder = IndexBuilder()
+        db_path = builder.build(cf, build_calls=False, build_metadata=False, build_fts=False)
+        reader = IndexReader(db_path)
+        try:
+            bsl = _bsl_for(cf, reader)
+            ctx = bsl["detect_extensions"]()
+            assert ctx["config_role"] == "main"
+            nearby = ctx["nearby_extensions"]
+            assert nearby, ctx
+            assert all(e["overrides_count"] == 0 for e in nearby), nearby
+        finally:
+            reader.close()
+
+    def test_detect_no_index_none(self, tmp_path):
+        cf, _cfe = _make_main_with_extension(tmp_path)
+        bsl = _bsl_for(cf, None)
+        ctx = bsl["detect_extensions"]()
+        nearby = ctx["nearby_extensions"]
+        assert nearby, ctx
+        assert all(e["overrides_count"] is None for e in nearby), nearby
+
+    def test_detect_extension_session_sibling_is_none(self, tmp_path, monkeypatch):
+        """EXTENSION session: index covers only current.path; a sibling extension is
+        NOT covered → its overrides_count must be None (unknown), NOT a false 0."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+        ext1 = os.path.join(str(tmp_path), "src", "cfe", "Расширение1")
+        ext2 = os.path.join(str(tmp_path), "src", "cfe", "Расширение2")
+        # ext1 has real overrides (needs a main object to override → still records rows)
+        _write(os.path.join(ext1, "Configuration.xml"), _cf_extension_xml(name="Расширение1"))
+        _write(os.path.join(ext1, "Catalogs", "Номенклатура", "Ext", "ObjectModule.bsl"), _EXT_MODULE_BSL)
+        # ext2 sibling, plain
+        _write(os.path.join(ext2, "Configuration.xml"), _cf_extension_xml(name="Расширение2"))
+        _write(os.path.join(ext2, "CommonModules", "мр_Модуль", "Ext", "Module.bsl"), _EXT_PLAIN_BSL)
+        builder = IndexBuilder()
+        db_path = builder.build(ext1, build_calls=False, build_metadata=False, build_fts=False)
+        reader = IndexReader(db_path)
+        try:
+            bsl = _bsl_for(ext1, reader)
+            ctx = bsl["detect_extensions"]()
+            assert ctx["config_role"] == "extension"
+            nearby = ctx["nearby_extensions"]
+            # the sibling ext2 must be among nearby and report None (not covered by index)
+            sib = [e for e in nearby if "Расширение2" in e["path"]]
+            assert sib, ctx
+            assert all(e["overrides_count"] is None for e in sib), sib
+        finally:
+            reader.close()
 
 
 # ---------------------------------------------------------------------------

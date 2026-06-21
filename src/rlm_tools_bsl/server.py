@@ -7,6 +7,7 @@ import pathlib
 import sys
 import threading
 import time
+import traceback
 from typing import Annotated, Literal
 
 import anyio
@@ -1061,7 +1062,7 @@ async def rlm_start(
     admin can hard-lock depth via RLM_FORCE_EFFORT. Effective depth/limits are echoed in 'effective_effort' and 'limits'.
     On configs with very many extensions (> RLM_EXT_LIST_CAP, default 20) the 'extension_context.nearby_extensions'
     field is truncated to the top-N by overrides and carries 'nearby_extensions_truncated'/'nearby_extensions_total'/
-    'extensions_hint'; call detect_extensions() / get_overrides() for the full list (search and overrides scanning are unaffected).
+    'extensions_hint'; call detect_extensions() for the full extension list (get_overrides() returns the first 200 overrides + total/truncated — check truncated; search and overrides scanning are unaffected).
     IMPORTANT: For large 1C configs (23K+ files), NEVER grep on broad paths -- use find_module() first."""
     return await anyio.to_thread.run_sync(
         lambda: _rlm_start(
@@ -2058,6 +2059,52 @@ class _HealthLogFilter(logging.Filter):
         return "GET /health" not in msg
 
 
+class _AsyncioConnResetFilter(logging.Filter):
+    """Suppress ONLY the benign Windows ProactorEventLoop connection-teardown noise.
+
+    On Windows, ``_ProactorBasePipeTransport._call_connection_lost`` raises
+    ConnectionResetError [WinError 10054] when an HTTP client drops the connection;
+    the default asyncio handler logs it with a full traceback. We drop the record
+    ONLY when ALL three hold, so any real asyncio error still reaches the log:
+      1. the exception is a ConnectionResetError (or subclass), AND
+      2. its winerror or errno == 10054, AND
+      3. ``_call_connection_lost`` appears in the traceback frames/text.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc_info = record.exc_info
+        if not exc_info or not isinstance(exc_info, tuple):
+            return True
+        exc = exc_info[1]
+        if not isinstance(exc, ConnectionResetError):
+            return True
+        if getattr(exc, "winerror", None) != 10054 and getattr(exc, "errno", None) != 10054:
+            return True
+        tb = exc_info[2]
+        found = False
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "_call_connection_lost":
+                found = True
+                break
+            tb = tb.tb_next
+        if not found:
+            try:
+                text = "".join(traceback.format_exception(*exc_info))
+            except Exception:
+                text = ""
+            found = "_call_connection_lost" in text
+        # Suppress (return False) only the benign teardown; keep everything else.
+        return not found
+
+
+def _install_asyncio_conn_reset_filter() -> None:
+    """Attach _AsyncioConnResetFilter to the ``asyncio`` logger (idempotent)."""
+    asyncio_logger = logging.getLogger("asyncio")
+    if any(isinstance(f, _AsyncioConnResetFilter) for f in asyncio_logger.filters):
+        return
+    asyncio_logger.addFilter(_AsyncioConnResetFilter())
+
+
 def _setup_file_logging():
     """Add rotating file handler for HTTP transport mode."""
     from logging.handlers import RotatingFileHandler
@@ -2085,6 +2132,9 @@ def _setup_file_logging():
     )
     logging.getLogger().addHandler(handler)
     logging.getLogger("uvicorn.access").addFilter(_HealthLogFilter())
+    # Drop benign Windows ProactorEventLoop teardown noise (ConnectionResetError
+    # [WinError 10054] in _call_connection_lost). Idempotent — safe to re-call.
+    _install_asyncio_conn_reset_filter()
     logger.info("File logging enabled: %s", log_path)
 
 

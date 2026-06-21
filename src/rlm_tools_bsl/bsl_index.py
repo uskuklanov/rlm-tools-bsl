@@ -9162,6 +9162,55 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    def count_regions(self, query: str = "") -> int | None:
+        """COUNT of code regions matching ``query`` (same WHERE as search_regions).
+
+        Index-side total — does NOT include live extension rows. None if the
+        ``regions`` table is missing (как у search_regions).
+        """
+        with self._lock:
+            try:
+                # JOIN modules mirrors search_regions exactly: the INNER JOIN drops
+                # orphaned region rows (module_id w/o a modules row) so the count
+                # never diverges from len(search_regions(q, limit=huge)).
+                if not query or not query.strip():
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) FROM regions r JOIN modules m ON m.id = r.module_id"
+                    ).fetchone()
+                else:
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) FROM regions r JOIN modules m ON m.id = r.module_id "
+                        "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%'",
+                        (query.strip(),),
+                    ).fetchone()
+                return int(row[0]) if row is not None else 0
+            except sqlite3.OperationalError:
+                return None
+
+    def count_module_headers(self, query: str = "") -> int | None:
+        """COUNT of module headers matching ``query`` (same WHERE as search_module_headers).
+
+        Index-side total — does NOT include live extension rows. None if the
+        ``module_headers`` table is missing.
+        """
+        with self._lock:
+            try:
+                # JOIN modules mirrors search_module_headers exactly (drops orphaned
+                # header rows so the count matches len(search_module_headers(q, huge))).
+                if not query or not query.strip():
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) FROM module_headers mh JOIN modules m ON m.id = mh.module_id"
+                    ).fetchone()
+                else:
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) FROM module_headers mh JOIN modules m ON m.id = mh.module_id "
+                        "WHERE py_lower(mh.header_comment) LIKE '%' || py_lower(?) || '%'",
+                        (query.strip(),),
+                    ).fetchone()
+                return int(row[0]) if row is not None else 0
+            except sqlite3.OperationalError:
+                return None
+
     def get_event_subscriptions(
         self,
         object_name: str = "",
@@ -9601,6 +9650,22 @@ class IndexReader:
                     meth_lower = method_name.lower()
                     result = [r for r in result if r.get("target_method", "").lower() == meth_lower]
                 return result
+            except sqlite3.OperationalError:
+                return None
+
+    def count_overrides_by_extension_root(self) -> dict[str, int] | None:
+        """COUNT перехватов по корню расширения (index-side, дёшево).
+
+        Возвращает {extension_root: count}. None если таблицы нет (pre-v9 индекс).
+        Ключ — extension_root в той форме, как сохранил builder (ext.path /
+        current.path); потребитель нормализует пути на своей стороне.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT extension_root, COUNT(*) AS n FROM extension_overrides GROUP BY extension_root"
+                ).fetchall()
+                return {r["extension_root"]: int(r["n"]) for r in rows}
             except sqlite3.OperationalError:
                 return None
 

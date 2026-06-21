@@ -6261,15 +6261,26 @@ def make_bsl_helpers(
                     result = [item[3] for item in ranked]
         return result[:limit]
 
-    def search_regions(query: str = "", limit: int = 200) -> list[dict]:
+    def search_regions(query: str = "", limit: int = 200, count_only: bool = False) -> list[dict] | dict:
         """Search code regions (#Область/#Region) by name substring.
 
         Args:
             query: Search string (e.g. 'Себестоимость', 'Инициализация').
             limit: Max results (default 200).
+            count_only: если True — вернуть само-описательный dict
+                {total, source, truncated, scope:"main_index"} вместо списка.
+                Это INDEX-side счёт по основной конфигурации (расширения НЕ
+                учитываются — для них census обычно не нужен). Для учёта
+                расширений считай по полной выдаче (count_only=False).
 
-        Returns: list of dicts {name, line, end_line, module_path, object_name, category}.
+        Returns: list of dicts {name, line, end_line, module_path, object_name, category};
+                 либо dict {total, source, truncated, scope} при count_only=True.
                  Empty list if index not available or no regions built."""
+        if count_only:
+            total = idx_reader.count_regions(query) if idx_reader is not None else None
+            if total is None:
+                return {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+            return {"total": total, "source": "index", "truncated": False, "scope": "main_index"}
         result: list[dict] = []
         if idx_reader is not None:
             indexed = idx_reader.search_regions(query, limit)
@@ -6284,15 +6295,25 @@ def make_bsl_helpers(
             )
         return result[:limit]
 
-    def search_module_headers(query: str = "", limit: int = 200) -> list[dict]:
+    def search_module_headers(query: str = "", limit: int = 200, count_only: bool = False) -> list[dict] | dict:
         """Search module header comments by substring.
 
         Args:
             query: Search string (e.g. 'себестоимость', 'доработка').
             limit: Max results (default 200).
+            count_only: если True — вернуть само-описательный dict
+                {total, source, truncated, scope:"main_index"} вместо списка.
+                Это INDEX-side счёт по основной конфигурации (расширения НЕ
+                учитываются). Для учёта расширений считай по полной выдаче.
 
-        Returns: list of dicts {module_path, object_name, category, header_comment}.
+        Returns: list of dicts {module_path, object_name, category, header_comment};
+                 либо dict {total, source, truncated, scope} при count_only=True.
                  Empty list if index not available or no headers built."""
+        if count_only:
+            total = idx_reader.count_module_headers(query) if idx_reader is not None else None
+            if total is None:
+                return {"total": 0, "source": "unavailable", "truncated": False, "scope": "main_index"}
+            return {"total": total, "source": "index", "truncated": False, "scope": "main_index"}
         result: list[dict] = []
         if idx_reader is not None:
             indexed = idx_reader.search_module_headers(query, limit)
@@ -6663,17 +6684,54 @@ def make_bsl_helpers(
     # ── Extensions ───────────────────────────────────────────
 
     def detect_extensions() -> dict:
-        """Обнаружить расширения рядом и текущую роль конфигурации."""
-        from rlm_tools_bsl.extension_detector import detect_extension_context as _det
+        """Обнаружить расширения рядом и текущую роль конфигурации.
+
+        Каждый элемент ``nearby_extensions`` несёт ``overrides_count`` — счёт
+        перехватов из ИНДЕКСА по корню расширения (index-side, дёшево). В
+        MAIN-сессии: ``0`` = расширение без перехватов, ``int`` = число. ``None`` =
+        счётчик недоступен (нет индекса/таблицы) ЛИБО индекс не покрывал это
+        расширение (напр. EXTENSION-сессия → siblings не в индексе).
+        Caveat: ``0``/``int`` — по СНИМКУ индекса; таблица extension_overrides
+        хранит только строки перехватов, НЕ список покрытых расширений, поэтому на
+        stale-индексе НОВОЕ расширение без строк тоже отдаст ``0``. Для точного
+        live-счёта используй rlm_start или find_ext_overrides(ext_path)."""
+        from rlm_tools_bsl.extension_detector import ConfigRole, detect_extension_context as _det
 
         ctx = _det(base_path)
+
+        # Index-first overrides_count by extension_root (no live BSL scan — keeps
+        # detect_extensions a cheap discovery helper). Match by ONE normalized path
+        # form on both sides (codex round 4/5).
+        def _norm(p: str) -> str:
+            return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+        raw_counts = idx_reader.count_overrides_by_extension_root() if idx_reader is not None else None
+        norm_counts = {_norm(k): v for k, v in raw_counts.items()} if raw_counts is not None else None
+        # "Known zero" (0) is valid ONLY when the index covers the nearby set — i.e.
+        # a MAIN session builds rows for every nearby extension. In an EXTENSION
+        # session the index only covers current.path, so siblings are "unknown" (None).
+        main_covers = norm_counts is not None and ctx.current.role == ConfigRole.MAIN
+
+        def _ovr_count(ext_path: str):
+            if norm_counts is None:
+                return None
+            if main_covers:
+                return norm_counts.get(_norm(ext_path), 0)
+            return norm_counts.get(_norm(ext_path))
+
         result = {
             "config_role": ctx.current.role.value,
             "config_name": ctx.current.name,
             "config_prefix": ctx.current.name_prefix,
             "warnings": ctx.warnings,
             "nearby_extensions": [
-                {"name": e.name, "purpose": e.purpose, "prefix": e.name_prefix, "path": e.path}
+                {
+                    "name": e.name,
+                    "purpose": e.purpose,
+                    "prefix": e.name_prefix,
+                    "path": e.path,
+                    "overrides_count": _ovr_count(e.path),
+                }
                 for e in ctx.nearby_extensions
             ],
             "nearby_main": None,
@@ -6697,12 +6755,20 @@ def make_bsl_helpers(
             "object_filter": object_name or "(all)",
             "overrides": overrides[:200],
             "total": len(overrides),
+            "truncated": len(overrides) > 200,
         }
 
     def get_overrides(object_name: str = "", method_name: str = "") -> dict:
         """Перехваченные методы из индекса (мгновенно).
         object_name/method_name — фильтры ('' = все).
-        Возвращает: {overrides: [...], total: N, source: "index"|"live"|"unavailable"}.
+        Возвращает: {overrides: [...], total: N, truncated: bool,
+                     source: "index"|"live"|"unavailable"}.
+        Без фильтра отдаются ПЕРВЫЕ 200 перехватов (cap=200; порядок НЕ
+        гарантирован — index-источник делает SELECT без ORDER BY). ``total`` —
+        полное число перехватов; ``truncated`` сигналит обрезку (total>200). Для
+        более прицельного среза фильтруй по объекту/методу или вызывай
+        find_ext_overrides по конкретному расширению — но cap=200 действует и там,
+        ``truncated`` всё равно проверяй.
         Каждый перехват ГАРАНТИРОВАННО несёт ключ ``extension_name`` (имя расширения)
         во всех ветках источника — index, live из main-сессии и live из сессии,
         открытой прямо на расширении (нормализуется из идентичности текущего
@@ -6714,6 +6780,7 @@ def make_bsl_helpers(
                 return {
                     "overrides": result[:200],
                     "total": len(result),
+                    "truncated": len(result) > 200,
                     "source": "index",
                 }
         # Live fallback
@@ -6725,7 +6792,7 @@ def make_bsl_helpers(
         try:
             ctx = _det(base_path)
         except Exception:
-            return {"overrides": [], "total": 0, "source": "unavailable"}
+            return {"overrides": [], "total": 0, "truncated": False, "source": "unavailable"}
 
         from rlm_tools_bsl.extension_detector import ConfigRole
 
@@ -6756,6 +6823,7 @@ def make_bsl_helpers(
         return {
             "overrides": all_overrides[:200],
             "total": len(all_overrides),
+            "truncated": len(all_overrides) > 200,
             "source": "live",
         }
 
@@ -8363,24 +8431,30 @@ def make_bsl_helpers(
     _reg(
         "search_regions",
         search_regions,
-        "search_regions(query, limit=200) -> [{name, line, end_line, module_path, object_name, category}]",
+        "search_regions(query, limit=200, count_only=False) -> [{name, line, end_line, module_path, object_name, category}] "
+        "| {total, source, truncated, scope:'main_index'}",
         "discovery",
         ["область", "region", "search_regions", "#Область"],
         "FIND CODE REGIONS:\n"
         "  regions = search_regions('Себестоимость')\n"
         "  for r in regions:\n"
-        "      print(r['category'], r['object_name'], r['name'], f'L{r[\"line\"]}-{r[\"end_line\"]}')",
+        "      print(r['category'], r['object_name'], r['name'], f'L{r[\"line\"]}-{r[\"end_line\"]}')\n"
+        "  # CENSUS (молча усекается по limit без сигнала) — точное число без выдачи:\n"
+        "  n = search_regions('Себестоимость', count_only=True)['total']  # index-side, scope=main_index",
     )
     _reg(
         "search_module_headers",
         search_module_headers,
-        "search_module_headers(query, limit=200) -> [{module_path, object_name, category, header_comment}]",
+        "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name, category, header_comment}] "
+        "| {total, source, truncated, scope:'main_index'}",
         "discovery",
         ["заголовок", "header", "комментарий", "search_module_headers"],
         "FIND MODULES BY HEADER COMMENT:\n"
         "  headers = search_module_headers('себестоимость')\n"
         "  for h in headers:\n"
-        "      print(h['category'], h['object_name'], h['header_comment'][:80])",
+        "      print(h['category'], h['object_name'], h['header_comment'][:80])\n"
+        "  # CENSUS (молча усекается по limit) — точное число без выдачи:\n"
+        "  n = search_module_headers('доработка', count_only=True)['total']  # index-side, scope=main_index",
     )
     _reg(
         "search",
@@ -8571,39 +8645,42 @@ def make_bsl_helpers(
     _reg(
         "detect_extensions",
         detect_extensions,
-        "detect_extensions() -> {config_role, nearby_extensions, nearby_main, warnings}",
+        "detect_extensions() -> {config_role, nearby_extensions:[{name, purpose, prefix, path, overrides_count}], nearby_main, warnings}",
         "extension",
         ["обнаружить расширения", "детект", "detect", "extension list"],
         "DETECT EXTENSIONS (диагностика контекста):\n"
         "  ctx = detect_extensions()\n"
         "  print(f\"Роль: {ctx['config_role']}\")  # main / extension / unknown\n"
         "  for e in ctx.get('nearby_extensions', []):\n"
-        "      print(f\"  {e.get('name')} (prefix={e.get('prefix')})\")  # ключ 'prefix', не 'name_prefix'\n"
+        "      print(f\"  {e.get('name')} (prefix={e.get('prefix')}) перехватов={e.get('overrides_count')}\")  # ключ 'prefix', не 'name_prefix'\n"
+        "  # overrides_count — index-side счёт перехватов: int/0 в MAIN-сессии, None если индекс не покрывал расширение\n"
         "  # Дальше: get_overrides() для индексных перехватов или find_ext_overrides(ext_path) live",
     )
     _reg(
         "find_ext_overrides",
         find_ext_overrides,
-        "find_ext_overrides(ext_path, obj='') -> {extension_path, object_filter, overrides:[{annotation, target_method, extension_method, ...}], total}",
+        "find_ext_overrides(extension_path, object_name='') -> {extension_path, object_filter, overrides:[{annotation, target_method, extension_method, ...}] (первые 200), total, truncated}",
         "extension",
         ["перехваты расширения", "ext_overrides", "live overrides", "перехваты live"],
         "FIND OVERRIDES IN EXTENSION (live, без индекса):\n"
         "  ctx = detect_extensions()\n"
         "  for e in ctx.get('nearby_extensions', []):\n"
         "      print(f\"  {e.get('name')} -> {e.get('path')}\")\n"
-        "      ovr = find_ext_overrides(e['path'])  # все перехваты этого расширения\n"
-        "      print(f\"    total={ovr['total']}\")\n"
+        "      ovr = find_ext_overrides(e['path'])  # перехваты расширения (первые 200; см. total/truncated)\n"
+        "      print(f\"    total={ovr['total']} truncated={ovr['truncated']}\")\n"
         "      for o in ovr['overrides'][:5]:\n"
         "          print(f\"      &{o['annotation']} {o['target_method']}\")\n"
-        "  # Прицельный поиск по объекту:\n"
-        "  ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
+        "  # Прицельный поиск по объекту (если расширения есть):\n"
+        "  if ctx.get('nearby_extensions'):\n"
+        "      ext_path = ctx['nearby_extensions'][0]['path']\n"
+        "      ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
         "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
         "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.",
     )
     _reg(
         "get_overrides",
         get_overrides,
-        "get_overrides(object_name='', method_name='') -> {overrides: [...], total, source}",
+        "get_overrides(object_name='', method_name='') -> {overrides: [...] (первые 200, порядок не гарантирован), total, truncated, source}",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
         "GET OVERRIDES:\n"
