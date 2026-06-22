@@ -352,6 +352,12 @@ class TestIndexReaderNewMethods:
         assert result is not None
         assert len(result) == 0
 
+    def test_get_scheduled_jobs_cyrillic_case_insensitive(self, built_index):
+        # 'курс' (нижний регистр) должен найти 'ОбновлениеКурсовВалют' (py_lower);
+        # COLLATE NOCASE фолдит только ASCII → 'курс' не матчил 'Курс'.
+        result = built_index.get_scheduled_jobs("курс")
+        assert result is not None and len(result) >= 1
+
     def test_get_functional_options_all(self, built_index):
         result = built_index.get_functional_options()
         assert result is not None

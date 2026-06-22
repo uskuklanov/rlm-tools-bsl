@@ -1513,11 +1513,15 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
    - Из иерархии вызовов выбери низкоуровневый метод (например, экспортный метод общего модуля из
      цепочки проведения) и проверь find_path('<низкоуровневый>', 'ОбработкаПроведения',
      to_hint='Документ.РеализацияТоваровУслуг').
-   - Разбери результат: found, длина path, для каждого узла {name, module_path, call_line}.
-     Прочитай _meta.precision (exact/heuristic) и объясни разницу; call_line — это строка РЕБРА к
-     следующему узлу, не определения.
+   - Разбери результат: СНАЧАЛА `if 'error' in res` — многозначное имя (определено в >1 модуле) без
+     своего hint вернёт `{error, hint, candidates:[{object_name, category, module_type, file, line}]}`
+     (ambiguous_arg='to'|'from') БЕЗ обхода; добавь to_hint/from_hint (file из candidates надёжнее
+     всего) и повтори. Только затем интерпретируй found/длину path, для каждого узла {name,
+     module_path, call_line}. Прочитай _meta.precision (exact/heuristic) и объясни разницу; call_line —
+     это строка РЕБРА к следующему узлу, не определения.
    - Несвязанную пару проверь тоже — ожидается found=False; убедись, что _meta.budget_exceeded=False
-     (иначе обход обрезан, а не «не достижимо»).
+     (иначе обход обрезан, а не «не достижимо») и что нет 'error' (иначе это многозначность, не
+     «не достижимо»).
 
 5. **Связь по графу МЕТАДАННЫХ (find_data_path)**:
    - Выбери объект, на который документ ссылается (регистр/справочник) — например через
@@ -1565,7 +1569,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Triggers (NEW) | `find_call_hierarchy(include_triggers=True)` → `get_inbound_edges` | `node['triggers']` present ONLY under the flag; edge_type ∈ {subscription, form_event, scheduled_job, cfe_override}; `resolved` flag |
 | Default-form regression | `find_call_hierarchy()` | без флага ключа `triggers` нет (байт-в-байт прежнее) |
 | CFE triggers | `get_overrides()` + `find_call_hierarchy(include_triggers=True)` | `cfe_override` edge with `resolved=True` on an intercepted method |
-| Reachability (NEW) | `find_path(from, to, to_hint=...)` | forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False` = truly unreachable |
+| Reachability (NEW) | `find_path(from, to, to_hint=...)` | СНАЧАЛА `if 'error' in res` (многозначное имя без hint → `{error, hint, candidates}`); затем forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False`+нет `error` = truly unreachable |
 | Data path (NEW) | `find_data_path(from, to)` → `find_metadata_refs_from` | edge list {from,to,kind}; bare endpoint → structural hint (no traversal); `partial` on old index |
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
 | Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,source}`; `overrides`=первые 200 (`truncated` сигналит обрезку); key `extension_name` (incl. live extension session) |
@@ -1585,7 +1589,8 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | триггеры для проводимого документа | ≥1 `subscription` и/или `form_event`; на перехваченном методе — `cfe_override` |
 | `get_overrides()` | dict; каждый перехват имеет `extension_name`; `source='index'` (или `'live'` на сессии-расширении) |
 | `find_path` на связанной паре | `found=True`, `path` непустой, `_meta.precision='exact'` при разрешённых рёбрах |
-| `find_path` на несвязанной паре | `found=False`, `budget_exceeded=False` |
+| `find_path` на несвязанной паре | `found=False`, `budget_exceeded=False`, нет `error` |
+| `find_path` многозначное имя без hint | `found=False` + `error`/`hint`/`candidates`, `_meta.ambiguous=True` (обход НЕ запущен); с hint нужного конца — нормальный обход |
 | `find_data_path` (с префиксами) | цепочка рёбер `{from,to,kind}` или `found=False`; **без** Traceback |
 | `find_data_path` (bare endpoint) | `found=False` + `hint`, обход не запущен |
 | Ошибки контрактов (KeyError/AttributeError на get_overrides/find_roles/find_register_movements/parse_form/safe_grep) | 0 |

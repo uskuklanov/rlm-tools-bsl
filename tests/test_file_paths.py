@@ -417,6 +417,34 @@ class TestReaderFindFiles:
         assert result is None
 
 
+def test_find_files_indexed_cyrillic_case_insensitive(tmp_path, monkeypatch):
+    _make_test_fixture(tmp_path)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    db_path = IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=False, build_fts=False)
+    reader = IndexReader(db_path)
+    try:
+        hits = reader.find_files_indexed("поступлениетоваров")
+        assert any("ПоступлениеТоваров" in p for p in hits), hits
+    finally:
+        reader.close()
+
+
+def test_find_files_indexed_escapes_like_wildcards(tmp_path, monkeypatch):
+    _make_test_fixture(tmp_path)
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
+    db_path = IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=False, build_fts=False)
+    reader = IndexReader(db_path)
+    try:
+        # '%' и '_' должны искаться ЛИТЕРАЛЬНО (не как SQL-wildcards) → нет match-all.
+        # В фикстуре нет путей с '%' или '_', значит результат пуст, а не «все файлы».
+        assert reader.find_files_indexed("%") == []
+        assert reader.find_files_indexed("_") == []
+        # регресс: обычный кириллический поиск с РАЗНЫМ регистром не затронут escape'ом
+        assert any("ПоступлениеТоваров" in p for p in reader.find_files_indexed("поступлениеТОВАРОВ"))
+    finally:
+        reader.close()
+
+
 # ---------------------------------------------------------------------------
 # helpers.py integration tests (indexed vs FS)
 # ---------------------------------------------------------------------------

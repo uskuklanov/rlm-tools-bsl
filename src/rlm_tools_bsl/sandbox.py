@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import io
 import contextlib
 import builtins
@@ -27,7 +28,6 @@ ALLOWED_MODULES = frozenset(
         "fnmatch",
         "itertools",
         "functools",
-        "operator",
         "string",
         "textwrap",
         "difflib",
@@ -45,8 +45,66 @@ BLOCKED_BUILTINS = frozenset(
         "exit",
         "quit",
         "input",
+        # site._Printer объекты — читают файлы реальным open() в обход restricted_open
+        # (вектор license._Printer__filenames=[...]; license()).
+        "license",
+        "credits",
+        "copyright",
     }
 )
+
+# Опасные dunder — путь к классам/globals/коду (escape-гаджеты). НЕ блокируем
+# безопасные __name__/__doc__/__len__/… (легит. интроспекция, e.g. type(x).__name__).
+_BLOCKED_DUNDERS = frozenset(
+    {
+        "__class__",
+        "__bases__",
+        "__base__",
+        "__mro__",
+        "__subclasses__",
+        "__subclasshook__",
+        "__init_subclass__",
+        "__class_getitem__",
+        "__globals__",
+        "__builtins__",
+        "__import__",
+        "__dict__",
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__init__",
+        "__new__",
+        "__code__",
+        "__closure__",
+        "__func__",
+        "__self__",
+        "__wrapped__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__traceback__",
+    }
+)
+# Не-dunder интроспекция фрейма/кода/traceback генераторов и корутин.
+_BLOCKED_ATTRS = frozenset(
+    {
+        "gi_frame",
+        "gi_code",
+        "cr_frame",
+        "cr_code",
+        "ag_frame",
+        "ag_code",
+        "f_globals",
+        "f_builtins",
+        "f_locals",
+        "f_back",
+        "f_code",
+        "f_trace",
+        "tb_frame",
+        "tb_next",
+    }
+)
+_BLOCKED_ACCESS = _BLOCKED_DUNDERS | _BLOCKED_ATTRS
 
 
 # Частые «угаданные» имена хелперов → реальные (из e2e-логов бенчмарков).
@@ -175,6 +233,20 @@ class Sandbox:
             return original_open(safe_path, mode, *args, **kwargs)
 
         safe_builtins["open"] = restricted_open
+
+        # Best-effort read-only hardening: убрать интроспекцию, дающую путь к real-
+        # builtins/классам в обход AST-гейта; запретить запись атрибутов.
+        for _n in ("vars", "globals", "locals", "setattr", "delattr"):
+            safe_builtins.pop(_n, None)
+
+        _real_getattr = safe_builtins.get("getattr")
+
+        def restricted_getattr(obj, name, *default):
+            if isinstance(name, str) and name in _BLOCKED_ACCESS:
+                raise AttributeError(f"доступ к атрибуту '{name}' запрещён в песочнице")
+            return _real_getattr(obj, name, *default)
+
+        safe_builtins["getattr"] = restricted_getattr
 
         self._namespace["__builtins__"] = safe_builtins
 
@@ -423,8 +495,44 @@ class Sandbox:
                 if timed_out.is_set():
                     raise TimeoutError(f"Execution timed out after {self._execution_timeout_seconds} seconds")
 
+    @staticmethod
+    def _validate_readonly(code: str) -> str | None:
+        """Базовая защита песочницы (AST-гейт) от основных инжекций: блокирует (а) доступ к ОПАСНЫМ dunder,
+        frame-интроспекции и dunder-subscript (escape-гаджеты ().__class__...__subclasses__(),
+        vars()[...], фреймы генераторов); (б) ПРИСВАИВАНИЕ/УДАЛЕНИЕ атрибутов (obj.attr=… —
+        мутация объектов, напр. license._Printer__filenames). Безопасные dunder-ЧТЕНИЯ
+        (__name__/__doc__/…) и subscript-присваивание (d['k']=v) разрешены. НЕ полная
+        граница. SyntaxError пропускаем (exec поднимет на штатном пути)."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    return f"присваивание/удаление атрибута '.{node.attr}' запрещено в песочнице"
+                if node.attr in _BLOCKED_ACCESS:
+                    return f"доступ к атрибуту '.{node.attr}' запрещён в песочнице"
+            elif isinstance(node, ast.Name):
+                if node.id in _BLOCKED_DUNDERS:
+                    return f"доступ к имени '{node.id}' запрещён в песочнице"
+            elif isinstance(node, ast.Subscript):
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in _BLOCKED_DUNDERS:
+                    return f"subscript по ключу '{key.value}' запрещён в песочнице"
+        return None
+
     def execute(self, code: str) -> ExecutionResult:
         self._helper_calls.clear()
+        blocked = self._validate_readonly(code)
+        if blocked is not None:
+            return ExecutionResult(
+                stdout="",
+                error=f"SecurityError: {blocked}",
+                variables=self.list_variables(),
+                helper_calls=[],
+                efficiency_hints=None,
+            )
         stdout_capture = io.StringIO()
         error = None
 
@@ -570,7 +678,9 @@ class Sandbox:
                 "register_movements, ...}; get_overrides → {overrides, total, truncated, source}; "
                 "find_register_movements → {code_registers, erp_mechanisms, ...}; "
                 "find_path/find_data_path → {found, path:[...], _meta}. "
-                "Сначала возьми нужный СПИСОК по ключу (напр. res['path']), потом срезай."
+                "Сначала возьми нужный СПИСОК по ключу (напр. res['path']), потом срезай. "
+                "У find_path при многозначном имени без hint path=None, а ответ несёт "
+                "{error, hint, candidates} — сначала проверь `if 'error' in res`."
             )
 
         # read_procedure returns the procedure BODY as a string, not a dict.

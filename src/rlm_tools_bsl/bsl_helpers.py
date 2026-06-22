@@ -1900,6 +1900,18 @@ def make_bsl_helpers(
              from_key, to_exact, to_key, precision:'exact'|'heuristic',
              direction:'callers-reverse'}}
 
+            AMBIGUITY GUARD (v1.25.0): if an end name is defined in >1 module
+            (NOCASE COUNT > 1 → distinct modules on normal 1С code) AND its hint
+            is empty, find_path returns EARLY with the SAME keys plus
+            ``{error, hint, candidates:[{object_name, category, module_type, file,
+            line}]}`` and ``_meta.ambiguous=True`` / ``ambiguous_arg='to'|'from'``
+            — it does NOT run the (potentially huge) reverse-BFS. So check
+            ``if "error" in res`` FIRST, before interpreting ``found`` /
+            ``budget_exceeded``: add the matching ``to_hint``/``from_hint`` (a
+            ``file`` from ``candidates`` is the most reliable) and retry. A
+            one-sided hint pins only its own end; a name not matched by the index
+            NOCASE seek (incl. lowercase Cyrillic) is NOT guarded.
+
             ``call_line`` is EDGE metadata — the line where THIS node calls the NEXT
             (forward) node, NOT the line of the method definition; the terminal node
             (``to``) has no outgoing edge → ``call_line=None``.
@@ -1912,13 +1924,119 @@ def make_bsl_helpers(
             truncated (widen scope / add a hint), NOT a proven absence — either the
             visited cap was hit OR some expanded node had more callers than one page
             (so a reaching edge may have been skipped). Only ``found=False`` with
-            ``budget_exceeded=False`` is a conclusive "not reachable".
+            ``budget_exceeded=False`` AND no ``error`` key (the ambiguity guard
+            above also returns ``found=False`` / ``budget_exceeded=False``, but it
+            is "name ambiguous", NOT "not reachable") is a conclusive "not reachable".
         """
         try:
             max_depth_int = int(max_depth)
         except (TypeError, ValueError):
             max_depth_int = 4
         max_depth_int = max(1, min(8, max_depth_int))
+
+        # --- Cheap ambiguity guard (v1.25.0) --------------------------------
+        # A multi-defined name (NOCASE COUNT > 1 → distinct modules on normal 1С
+        # code) WITHOUT a matching hint sends the reverse-BFS into a pathological
+        # walk: every namesake definition fans out across the whole caller graph
+        # until the node budget trips (~150s observed for
+        # find_path('ОбработкаПроведения', <hot method>)). Probe the index NOCASE
+        # (idx_meth_name seek ~3 ms) and bail to {error, hint, candidates} BEFORE
+        # the py_lower resolve below — so an ambiguous bail never pays the
+        # Cyrillic SCAN of _resolve_target_key. Each unhinted end is checked
+        # independently (a one-sided hint pins only its own end). The guard runs
+        # ONLY on a FRESH authoritative index WITH a call graph: on a
+        # stale/no-calls index find_path falls back to FS anyway and the methods
+        # probe is unreliable, so it stays out of the way.
+        def _has_calls() -> bool:
+            # has_calls is a SQL-backed property (SELECT 1 FROM calls LIMIT 1) —
+            # evaluate it ONCE here, never per-end.
+            try:
+                return getattr(idx_reader, "has_calls", False) is True
+            except Exception:
+                return False
+
+        _guard_on = bool(idx_zero_callers_authoritative) and idx_reader is not None and _has_calls()
+
+        def _sample_name(name: str) -> tuple[int, list]:
+            """(total, candidates), normalised + defensive. (0, []) ⇒ guard OFF
+            for this end (missing/duck-typed probe, non-dict return, broken index
+            → None, or simply name not multi-defined)."""
+            try:
+                probe = getattr(idx_reader, "sample_method_definitions", None)
+            except Exception:  # a property/proxy may raise on ACCESS
+                return 0, []
+            if probe is None:
+                return 0, []
+            try:
+                sample = probe(name)
+            except Exception:
+                return 0, []
+            if not isinstance(sample, dict):  # MagicMock / duck-typed non-dict
+                return 0, []
+            try:
+                total = int(sample.get("total") or 0)
+            except (TypeError, ValueError):
+                return 0, []
+            cands = sample.get("candidates")
+            return total, (cands if isinstance(cands, list) else [])
+
+        def _ambiguous(arg: str, name: str, total: int, cands: list) -> dict:
+            # Carry BOTH the {error, hint, candidates} contract AND the standard
+            # keys, so an existing consumer reading res["found"]/_meta never
+            # breaks. We bail BEFORE resolve → identities are unresolved
+            # (to_key/from_key=None, to_exact=False), which is correct for an error.
+            return {
+                "found": False,
+                "from": from_name,
+                "to": to_name,
+                "path": None,
+                "depth": 0,
+                "error": f"Имя '{name}' неоднозначно: {total} определений в разных модулях",
+                "hint": (
+                    "Уточни to_hint/from_hint: rel_path (надёжнее всего — file из candidates) | "
+                    "'Документ.X'/'Document.X' | имя объекта/модуля."
+                ),
+                "candidates": [
+                    {
+                        "object_name": c.get("object_name"),
+                        "category": c.get("category"),
+                        "module_type": c.get("module_type"),
+                        "file": c.get("file"),
+                        "line": c.get("line"),
+                    }
+                    for c in cands[:5]
+                    if isinstance(c, dict)
+                ],
+                "_meta": {
+                    "ambiguous": True,
+                    "ambiguous_arg": arg,
+                    "definition_count": total,
+                    "max_depth": max_depth_int,
+                    "nodes_expanded": 0,
+                    "visited_cap": _HIERARCHY_VISITED_CAP,
+                    "budget_exceeded": False,
+                    "from_key": None,
+                    "to_exact": False,
+                    "to_key": None,
+                    "precision": "heuristic",
+                    "direction": "callers-reverse",
+                },
+            }
+
+        # Narrow self-exclusion: from==to AND no hints at all → a trivial
+        # self-path (found=True below), let it through. A one-sided hint does NOT
+        # suppress the guard on the OTHER (hintless) end.
+        _self_trivial = (from_name.casefold() == to_name.casefold()) and not from_hint and not to_hint
+        if _guard_on and not _self_trivial:
+            if not to_hint:
+                _t, _c = _sample_name(to_name)
+                if _t > 1:
+                    return _ambiguous("to", to_name, _t, _c)
+            if not from_hint:
+                _t, _c = _sample_name(from_name)
+                if _t > 1:
+                    return _ambiguous("from", from_name, _t, _c)
+        # --- end ambiguity guard --------------------------------------------
 
         # Resolve target identities once (LOCKED public wrapper — find_path runs
         # outside the reader lock, so it must NOT touch the lockless internal).
@@ -7833,8 +7951,10 @@ def make_bsl_helpers(
         "find_path(from_name, to_name, max_depth=4, from_hint='', to_hint='', include_triggers=False) -> "
         "{found, from, to, path:[{name, module_path, call_line, triggers?}]|None, depth, "
         "_meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded, from_key, to_exact, to_key, "
-        "precision:'exact'|'heuristic', direction:'callers-reverse'}}  "
-        "# ДОСТИЖИМОСТЬ по графу ВЫЗОВОВ (from → … → to). call_line = строка РЕБРА к следующему узлу (НЕ определения); у терминального (to) None",
+        "precision:'exact'|'heuristic', direction:'callers-reverse'}} | "
+        "{found:False, error, hint, candidates:[{object_name, category, module_type, file, line}], _meta:{ambiguous, ambiguous_arg}}  "
+        "# ДОСТИЖИМОСТЬ по графу ВЫЗОВОВ (from → … → to). call_line = строка РЕБРА к следующему узлу (НЕ определения); у терминального (to) None. "
+        "Многозначное имя без своего hint → ранний {error, hint, candidates} (проверяй 'error' in res ПЕРЕД found/budget_exceeded; добавь to_hint/from_hint из candidates)",
         "code",
         [
             "путь вызовов",
@@ -7847,6 +7967,12 @@ def make_bsl_helpers(
         ],
         "FIND PATH (достижим ли to_name из from_name по графу ВЫЗОВОВ):\n"
         "  res = find_path('НизкоуровневыйМетод', 'ОбработчикUI')\n"
+        "  if 'error' in res:  # многозначное имя без hint — проверь ПЕРЕД found/budget_exceeded\n"
+        "      # res['candidates'] = [{object_name, category, module_type, file, line}] — для МНОГОЗНАЧНОГО конца\n"
+        "      f = res['candidates'][0]['file']  # file — самый надёжный hint\n"
+        "      # пинь ИМЕННО многозначный конец: ambiguous_arg говорит, to это или from\n"
+        "      kw = {'to_hint': f} if res['_meta']['ambiguous_arg'] == 'to' else {'from_hint': f}\n"
+        "      res = find_path('НизкоуровневыйМетод', 'ОбработчикUI', **kw)  # (если многозначны ОБА конца — повтори ещё раз)\n"
         "  if res['found']:\n"
         "      for el in res['path']:  # forward: [from → … → to]\n"
         "          print(f\"  {el['name']} ({el['module_path']}) call_line={el['call_line']}\")\n"
@@ -7857,7 +7983,7 @@ def make_bsl_helpers(
         "  #   'heuristic' (старый индекс/FS/имя) → found=True = достижимость ПО ИМЕНИ, не доказанный путь.\n"
         "  # Одноимённые методы: from_hint/to_hint (rel_path | 'Документ.X' | object_name) пинят к модулю.\n"
         "  # _meta.budget_exceeded=True → обход обрезан (visited_cap ИЛИ у узла >одной страницы callers),\n"
-        "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False — точно «не достижим».",
+        "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False И без 'error' — точно «не достижим».",
     )
     _reg(
         "find_definition",

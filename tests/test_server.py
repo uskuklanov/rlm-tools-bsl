@@ -2809,3 +2809,34 @@ async def test_mcp_build_db_tables_valid():
 
             _rlm_index(action="drop", path=src)
             _cleanup_build_jobs()
+
+
+def test_rlm_start_failure_path_closes_reader(tmp_path, monkeypatch):
+    import rlm_tools_bsl.server as srv
+
+    closed = {"v": False}
+
+    class _FakeReader:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_statistics(self):
+            # FRESH-путь не читает built_at (только STALE_AGE) → константа; в
+            # test_server.py нет module-scope `import time` (codex-раунд4 #10).
+            return {"built_at": 0.0, "builder_version": srv.BUILDER_VERSION}
+
+        def get_startup_meta(self):
+            raise RuntimeError("boom after reader created, before registration")
+
+        def close(self):
+            closed["v"] = True
+
+    db = tmp_path / "bsl_index.db"
+    db.write_text("")  # .exists() == True
+    monkeypatch.setattr(srv, "get_index_db_path", lambda p: db)
+    monkeypatch.setattr(srv, "check_index_usable", lambda *a, **k: srv.IndexStatus.FRESH)
+    monkeypatch.setattr(srv, "IndexReader", _FakeReader)
+
+    out = srv._rlm_start(query="q", path=str(tmp_path))
+    assert "error" in out
+    assert closed["v"] is True  # reader ЯВНО закрыт на failure-path

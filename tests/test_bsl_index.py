@@ -1528,6 +1528,18 @@ class TestExactRefReaders:
         conn.commit()
         conn.close()
 
+    def test_get_roles_cyrillic_case_insensitive(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # нижний регистр кириллицы должен найти PascalCase object_name (py_lower)
+            roles = reader.get_roles("заказпоставщику")
+            assert roles, "get_roles должен фолдить кириллицу (заказпоставщику → ЗаказПоставщику)"
+            assert any(r["role_name"] == "РольА" for r in roles)
+        finally:
+            reader.close()
+
     def test_get_roles_exact_no_collision(self, tmp_path, monkeypatch):
         db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
         self._seed(db_path)
@@ -1631,3 +1643,35 @@ class TestExactRefReaders:
             assert reader.get_functional_options_exact("Document.НетТакого") == []
         finally:
             reader.close()
+
+
+def test_substr_readers_cyrillic_case_insensitive(tmp_path, monkeypatch):
+    db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO subsystem_content (subsystem_name, subsystem_synonym, object_ref, file) VALUES (?,?,?,?)",
+        ("Продажи", "", "Catalog.Контрагенты", "s.xml"),
+    )
+    conn.execute(
+        "INSERT INTO http_services (name, root_url, templates_json, file) VALUES (?,?,?,?)",
+        ("ОбменДанными", "/api", "[]", "h.xml"),
+    )
+    conn.execute(
+        "INSERT INTO web_services (name, namespace, operations_json, file) VALUES (?,?,?,?)",
+        ("ВебСервисОбмена", "ns", "[]", "w.xml"),
+    )
+    conn.execute(
+        "INSERT INTO xdto_packages (name, namespace, types_json, file) VALUES (?,?,?,?)",
+        ("ПакетОбмена", "ns", "[]", "x.xml"),
+    )
+    conn.commit()
+    conn.close()
+    reader = IndexReader(str(db_path))
+    try:
+        # нижний регистр кириллицы → должен найти (py_lower); раньше COLLATE NOCASE миссил
+        assert reader.get_subsystems_for_object("контрагенты")  # object_ref Catalog.Контрагенты
+        assert reader.get_http_services("обмен")  # ОбменДанными
+        assert reader.get_web_services("обмен")  # ВебСервисОбмена
+        assert reader.get_xdto_packages("обмен")  # ПакетОбмена
+    finally:
+        reader.close()

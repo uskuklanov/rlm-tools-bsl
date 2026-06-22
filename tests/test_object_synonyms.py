@@ -481,6 +481,19 @@ class TestSearchObjects:
         names = [r["object_name"] for r in results]
         assert "РасчетСебестоимости" in names
 
+    def test_search_objects_escapes_like_wildcards(self, built_cf_index):
+        # '_' должен искаться ЛИТЕРАЛЬНО, а не как SQL single-char wildcard.
+        # Без escape LIKE '%_%' матчит ВСЁ → ранжирование (else: rank=3) вернёт
+        # произвольные объекты без '_'. С escape — только литеральные '_'.
+        db_path, _ = built_cf_index
+        reader = IndexReader(db_path)
+        try:
+            results = reader.search_objects("_")
+            for r in results:
+                assert "_" in r["object_name"] or "_" in (r["synonym"] or ""), r
+        finally:
+            reader.close()
+
     def test_search_by_category(self, built_cf_index):
         db_path, _ = built_cf_index
         reader = IndexReader(db_path)

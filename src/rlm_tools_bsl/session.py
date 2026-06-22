@@ -43,6 +43,18 @@ class SessionManager:
             self._timeout_idle = timeout_idle_minutes * 60
             self._timeout_active = timeout_active_minutes * 60
         self._lock = threading.Lock()
+        # Опциональный хук: вызывается ВНЕ замка для каждого эвикченного sid.
+        self.on_evict = None
+
+    def _fire_on_evict(self, evicted):
+        cb = self.on_evict
+        if cb is None:
+            return
+        for sid in evicted:
+            try:
+                cb(sid)
+            except Exception:
+                _logger.warning("on_evict callback failed for %s", sid, exc_info=True)
 
     def create(
         self,
@@ -53,27 +65,32 @@ class SessionManager:
         max_execute_calls: int = 50,
     ) -> str:
         with self._lock:
-            self._cleanup_expired_locked()
-            if len(self._sessions) >= self._max_sessions:
-                raise RuntimeError(f"Cannot create session: max sessions ({self._max_sessions}) reached")
-            session_id = uuid.uuid4().hex[:12]
-            self._sessions[session_id] = Session(
-                session_id=session_id,
-                path=path,
-                query=query,
-                max_output_chars=max_output_chars,
-                max_llm_calls=max_llm_calls,
-                max_execute_calls=max_execute_calls,
-            )
-            return session_id
+            evicted = self._cleanup_expired_locked()
+            at_capacity = len(self._sessions) >= self._max_sessions
+            session_id = None
+            if not at_capacity:
+                session_id = uuid.uuid4().hex[:12]
+                self._sessions[session_id] = Session(
+                    session_id=session_id,
+                    path=path,
+                    query=query,
+                    max_output_chars=max_output_chars,
+                    max_llm_calls=max_llm_calls,
+                    max_execute_calls=max_execute_calls,
+                )
+        self._fire_on_evict(evicted)
+        if at_capacity:
+            raise RuntimeError(f"Cannot create session: max sessions ({self._max_sessions}) reached")
+        return session_id
 
     def get(self, session_id: str) -> Session | None:
         with self._lock:
-            self._cleanup_expired_locked()
+            evicted = self._cleanup_expired_locked()
             session = self._sessions.get(session_id)
             if session:
                 session.last_used = time.time()
-            return session
+        self._fire_on_evict(evicted)
+        return session
 
     def end(self, session_id: str) -> None:
         with self._lock:
@@ -81,7 +98,9 @@ class SessionManager:
 
     def cleanup_expired(self) -> list[str]:
         with self._lock:
-            return self._cleanup_expired_locked()
+            evicted = self._cleanup_expired_locked()
+        self._fire_on_evict(evicted)
+        return evicted
 
     def _cleanup_expired_locked(self) -> list[str]:
         now = time.time()

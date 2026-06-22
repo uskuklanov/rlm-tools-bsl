@@ -78,3 +78,23 @@ def test_build_session_manager_from_env_backward_compat(monkeypatch):
     sm = build_session_manager_from_env()
     assert sm._timeout_idle == 420
     assert sm._timeout_active == 420
+
+
+def test_on_evict_fires_for_session_evicted_inside_get():
+    seen = []
+    m = SessionManager(timeout_idle_minutes=0, timeout_active_minutes=10)
+    m.on_evict = lambda sid: seen.append(sid)
+    sid = m.create(path=tempfile.gettempdir(), query="q")
+    m._sessions[sid].last_used = time.time() - 1
+    m.get("nonexistent")
+    assert sid in seen
+
+
+def test_on_evict_fires_for_session_evicted_inside_create():
+    seen = []
+    m = SessionManager(max_sessions=5, timeout_idle_minutes=0, timeout_active_minutes=10)
+    m.on_evict = lambda sid: seen.append(sid)
+    sid = m.create(path=tempfile.gettempdir(), query="q")
+    m._sessions[sid].last_used = time.time() - 1
+    m.create(path=tempfile.gettempdir(), query="q2")
+    assert sid in seen

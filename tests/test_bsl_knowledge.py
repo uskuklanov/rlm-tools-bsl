@@ -217,6 +217,17 @@ def test_references_recipe_has_subsystem_membership_hint():
     assert "устаревш" in full_text.lower() or "live" in full_text.lower()
 
 
+def test_reachability_knowledge_mentions_error_contract():
+    """v1.25.0 — домен 'достижимость' должен учить проверять error/hint
+    (многозначное имя без hint у find_path) ПЕРЕД интерпретацией found/budget_exceeded."""
+    recipe = _BUSINESS_RECIPES["достижимость"]
+    text = " ".join(recipe["compact"]) + " " + " ".join(recipe["full"])
+    assert "error" in text
+    assert "hint" in text
+    # должно упоминать многозначность / неоднозначность имени
+    assert "многознач" in text.lower() or "неоднознач" in text.lower() or "candidates" in text
+
+
 def test_match_recipe_found():
     assert _match_recipe("Как рассчитывается себестоимость?") == "себестоимость"
     assert _match_recipe("Проведение документа РеализацияТоваров") == "проведение"

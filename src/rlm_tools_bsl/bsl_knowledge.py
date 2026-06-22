@@ -826,11 +826,13 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
     },
     "достижимость": {
         "compact": [
+            "if 'error' in res (find_path): имя многозначно (определено в >1 модуле) без своего hint → добавь to_hint/from_hint из res['candidates'] (file надёжнее всего); проверяй ПЕРЕД found/budget_exceeded",
             "find_path('МетодА', 'МетодБ') → есть ли путь вызовов from→to (forward)",
             "found=False + _meta.budget_exceeded → обход обрезан, сузь max_depth/дай hint",
             "find_call_hierarchy('Метод', include_triggers=True) → callers + триггеры (подписки/формы/рег.задания/CFE)",
         ],
         "full": [
+            "СНАЧАЛА if 'error' in res: find_path для многозначного имени (NOCASE-COUNT>1 = разные модули) БЕЗ своего hint вернёт {error, hint, candidates:[{object_name, category, module_type, file, line}], _meta:{ambiguous, ambiguous_arg}} вместо обхода — добавь to_hint/from_hint (file из candidates) и повтори; проверяй error ПЕРЕД found/budget_exceeded",
             "find_path('НизкоуровневыйМетод', 'ОбработчикUI', max_depth=4) → достижимость по графу ВЫЗОВОВ (forward path from→…→to)",
             "проверь _meta.precision: 'exact' = путь доказан по callee_key; 'heuristic' = по имени (старый индекс/FS/однофамильцы)",
             "одноимённые методы → from_hint/to_hint ('Документ.X' | rel_path | object_name) пинят концы к модулю",

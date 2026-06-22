@@ -7804,6 +7804,62 @@ class IndexReader:
             "slow_fallback": slow_fallback,
         }
 
+    def sample_method_definitions(self, name: str, limit: int = 5) -> dict | None:
+        """Cheap NOCASE probe for the find_path ambiguity guard (v1.25.0).
+
+        Returns ``{"total": int, "candidates": [{file, line, object_name,
+        category, module_type}]}`` — a fast yes/no on "is this name defined in
+        more than one module?" plus a small disambiguation sample. ``total > 1``
+        ⇔ multi-defined (on normal 1С code = distinct modules).
+
+        One locked round trip: a ``LIMIT (limit + 1)`` NOCASE seek
+        (``idx_meth_name`` ~3 ms). If the result is NOT truncated, ``total`` is
+        just ``len(rows)`` (no separate COUNT). Only when truncated do we pay a
+        single ``COUNT(*)`` — with the SAME ``methods JOIN modules`` predicate as
+        the SELECT, so orphan ``methods`` rows without a ``modules`` row can't
+        inflate ``total`` past what ``candidates`` could ever show (keeps the
+        ``{total, candidates}`` contract consistent, cf. ``get_definitions``).
+
+        NOCASE-only — NO ``py_lower`` fallback: the guard must never pay a
+        Cyrillic SCAN, so a lowercase / case-mismatched Cyrillic input simply
+        yields ``total == 0`` (guard stays OFF — deliberate, documented).
+
+        ``None`` on ``OperationalError`` (corrupt/missing core table), like
+        ``get_definitions`` — the caller treats ``None`` as guard-OFF, so "index
+        broken" is never conflated with "no such method" (``total == 0``).
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT mod.rel_path, mod.object_name, mod.category, mod.module_type, m.line "
+                    "FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                    "WHERE m.name = ? COLLATE NOCASE ORDER BY mod.rel_path, m.line LIMIT ?",
+                    (name, limit + 1),
+                ).fetchall()
+                if len(rows) > limit:
+                    total = self._conn.execute(
+                        "SELECT COUNT(*) AS c FROM methods m JOIN modules mod ON mod.id = m.module_id "
+                        "WHERE m.name = ? COLLATE NOCASE",
+                        (name,),
+                    ).fetchone()["c"]
+                else:
+                    total = len(rows)
+            except sqlite3.OperationalError:
+                return None
+            return {
+                "total": int(total),
+                "candidates": [
+                    {
+                        "file": r["rel_path"],
+                        "line": r["line"],
+                        "object_name": r["object_name"],
+                        "category": r["category"],
+                        "module_type": r["module_type"],
+                    }
+                    for r in rows[:limit]
+                ],
+            }
+
     def get_outline_data(self, rel_path: str) -> dict | None:
         """Atomically read everything needed to build a module outline tree.
 
@@ -8451,7 +8507,8 @@ class IndexReader:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT role_name, object_name, right_name, file FROM role_rights WHERE object_name LIKE ?",
+                    "SELECT role_name, object_name, right_name, file FROM role_rights "
+                    "WHERE py_lower(object_name) LIKE py_lower(?)",
                     (f"%{object_name}%",),
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -8761,17 +8818,22 @@ class IndexReader:
             return None
         with self._lock:
             try:
-                # NOTE: SQLite LOWER() only works for ASCII.
-                # For Unicode (Cyrillic) we match case-sensitively in SQL
-                # then do Python-side case-insensitive ranking.
-                needle_sql = "%" + name + "%"
+                # Cyrillic-aware: py_lower() UDF folds case for Unicode too (SQLite
+                # LIKE/NOCASE fold ASCII only). NO SQL LIMIT — Python ranking (below)
+                # needs ALL matches, иначе расширённый py_lower-набор вытолкнет
+                # качественный exact/prefix с длинным путём за окно ДО ранжирования
+                # (mirror search_objects; ORDER BY и так сканирует всё — LIMIT не экономил).
+                # %/_ в name экранируются (ESCAPE '\') → литеральный поиск, а не SQL-
+                # wildcard: иначе '%'/'_'/один символ дают match-all и SQL вытягивает
+                # все ~110K строк до Python-постфильтра.
+                needle_sql = "%" + _escape_for_sql_like(name) + "%"
                 rows = self._conn.execute(
                     "SELECT rel_path, filename "
                     "FROM file_paths "
-                    "WHERE filename LIKE ? OR rel_path LIKE ? "
-                    "ORDER BY length(rel_path), rel_path "
-                    "LIMIT ?",
-                    (needle_sql, needle_sql, limit * 3),
+                    "WHERE py_lower(filename) LIKE py_lower(?) ESCAPE '\\' "
+                    "   OR py_lower(rel_path) LIKE py_lower(?) ESCAPE '\\' "
+                    "ORDER BY length(rel_path), rel_path",
+                    (needle_sql, needle_sql),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return None
@@ -9026,15 +9088,18 @@ class IndexReader:
                     ).fetchall()
                 else:
                     q = query.strip()
-                    like_q = f"%{q}%"
+                    # %/_ экранируются (ESCAPE '\') → литеральный поиск, а не SQL-
+                    # wildcard: иначе '%'/'_' матчат ВСЁ, а ранжирование (else: rank=3)
+                    # вернуло бы произвольные объекты вместо литерального совпадения.
+                    like_q = f"%{_escape_for_sql_like(q)}%"
                     # No SQL LIMIT — full scan is <15ms on 15K rows,
                     # Python ranking needs ALL matches to guarantee
                     # exact name (rank 0) is never lost.
                     rows = self._conn.execute(
                         "SELECT object_name, category, synonym, file "
                         "FROM object_synonyms "
-                        "WHERE py_lower(synonym) LIKE py_lower(?) "
-                        "   OR py_lower(object_name) LIKE py_lower(?)",
+                        "WHERE py_lower(synonym) LIKE py_lower(?) ESCAPE '\\' "
+                        "   OR py_lower(object_name) LIKE py_lower(?) ESCAPE '\\'",
                         (like_q, like_q),
                     ).fetchall()
 
@@ -9378,7 +9443,7 @@ class IndexReader:
                 )
                 params: tuple = ()
                 if name:
-                    sql += " WHERE name LIKE ? COLLATE NOCASE"
+                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
                     params = (f"%{name}%",)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
@@ -9519,7 +9584,7 @@ class IndexReader:
             try:
                 rows = self._conn.execute(
                     "SELECT subsystem_name, subsystem_synonym, object_ref, file "
-                    "FROM subsystem_content WHERE object_ref LIKE ? COLLATE NOCASE",
+                    "FROM subsystem_content WHERE py_lower(object_ref) LIKE py_lower(?)",
                     (f"%{object_name}%",),
                 ).fetchall()
             except sqlite3.OperationalError:
@@ -9556,7 +9621,7 @@ class IndexReader:
                 sql = "SELECT name, root_url, templates_json, file FROM http_services"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE name LIKE ? COLLATE NOCASE"
+                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
                     params = (f"%{name}%",)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
@@ -9582,7 +9647,7 @@ class IndexReader:
                 sql = "SELECT name, namespace, operations_json, file FROM web_services"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE name LIKE ? COLLATE NOCASE"
+                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
                     params = (f"%{name}%",)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
@@ -9608,7 +9673,7 @@ class IndexReader:
                 sql = "SELECT name, namespace, types_json, file FROM xdto_packages"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE name LIKE ? COLLATE NOCASE"
+                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
                     params = (f"%{name}%",)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:

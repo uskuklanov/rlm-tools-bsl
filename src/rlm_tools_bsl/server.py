@@ -156,17 +156,23 @@ def _scan_metadata(path: str) -> dict:
     }
 
 
-def _cleanup_expired_resources() -> None:
-    expired_session_ids = session_manager.cleanup_expired()
+def _release_session_resources(session_id: str) -> None:
+    """Идемпотентный teardown ресурсов сессии (sandbox + idx_reader)."""
     with _sandboxes_lock:
-        for session_id in expired_session_ids:
-            _sandboxes.pop(session_id, None)
-            reader = _idx_readers.pop(session_id, None)
-            if reader is not None:
-                try:
-                    reader.close()
-                except Exception:
-                    pass
+        _sandboxes.pop(session_id, None)
+        reader = _idx_readers.pop(session_id, None)
+    if reader is not None:
+        try:
+            reader.close()
+        except Exception:
+            pass
+
+
+def _cleanup_expired_resources() -> None:
+    session_manager.cleanup_expired()  # on_evict → _release_session_resources
+
+
+session_manager.on_evict = _release_session_resources
 
 
 from rlm_tools_bsl._paths import (
@@ -381,12 +387,16 @@ def _rlm_start(
 
     logger.info("rlm_start: session=%s created for path=%s", session_id, resolved)
 
+    # ПЕРЕД outer-try: иначе исключение в _scan_metadata (ниже) до присваивания
+    # оставит idx_reader несвязанным и outer-except упадёт UnboundLocalError,
+    # замаскировав исходную ошибку.
+    idx_reader = None
+
     try:
         metadata = _scan_metadata(resolved) if include_metadata else {}
 
         # --- Try loading index FIRST (to enable fast-path startup) ---
         t_step = time.monotonic()
-        idx_reader = None
         idx_warnings: list[str] = []
         idx_stats: dict | None = None
         idx_status = None
@@ -585,6 +595,13 @@ def _rlm_start(
     except Exception as e:
         logger.error("rlm_start: session=%s failed: %s", session_id, e, exc_info=True)
         session_manager.end(session_id)
+        # idx_reader создан (405), но мог НЕ успеть зарегистрироваться в _idx_readers
+        # (исключение между созданием и 581) → on_evict его не увидит, end() callback не зовёт.
+        if idx_reader is not None:
+            try:
+                idx_reader.close()
+            except Exception:
+                pass
         return json.dumps(
             {"error": f"Session init failed: {type(e).__name__}: {e}"},
             ensure_ascii=False,
@@ -2171,6 +2188,7 @@ def main():
     load_project_env()
 
     session_manager = build_session_manager_from_env()
+    session_manager.on_evict = _release_session_resources
 
     parser = argparse.ArgumentParser(description="rlm-tools-bsl MCP server")
     parser.add_argument(
