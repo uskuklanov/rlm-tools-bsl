@@ -14,13 +14,33 @@ from rlm_tools_bsl.bsl_index import (
     IndexBuilder,
     IndexReader,
     IndexStatus,
+    _read_index_meta,
     check_index_freshness,
     check_index_strict,
     check_index_usable,
     get_index_db_path,
     get_index_dir,
+    index_incomplete,
 )
 from rlm_tools_bsl.cache import _paths_hash
+
+
+def _mark_incomplete(db_path, has_flags=None):
+    """Simulate a partially-built (in-place) index: set build_in_progress=1.
+
+    has_flags=None → keep existing has_* (e.g. as written by a real build).
+    has_flags={...} → DELETE all has_* then set only the provided ones (for the
+    recovery-default tests: missing/partial has_* must default to full-feature).
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+    if has_flags is not None:
+        for k in ("has_calls", "has_metadata", "has_fts", "has_synonyms"):
+            conn.execute("DELETE FROM index_meta WHERE key = ?", (k,))
+        for k, v in has_flags.items():
+            conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)", (k, "1" if v else "0"))
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +183,463 @@ def built_index_no_calls(tmp_bsl_project, monkeypatch):
     builder = IndexBuilder()
     db_path = builder.build(str(tmp_bsl_project), build_calls=False)
     return db_path, str(tmp_bsl_project)
+
+
+# =====================================================================
+# Finding #1a (v1.26.0): _BuildLock thread-aware (owner tid + depth)
+# =====================================================================
+
+
+class TestBuildLock:
+    def test_buildlock_nested_reentry(self, tmp_path):
+        """Same-thread reentry bumps depth; OS lock + lock-file released ONLY after
+        the OUTER release (nested _update_locked → self.build())."""
+        from rlm_tools_bsl.bsl_index import _BuildLock, _active_locks
+
+        db = tmp_path / "idx" / "bsl_index.db"
+        db.parent.mkdir(parents=True)
+        lock_key = str(db.with_suffix(".lock"))
+
+        outer = _BuildLock(db)
+        outer.acquire()
+        try:
+            assert _active_locks[lock_key]._depth == 1
+            inner = _BuildLock(db)
+            inner.acquire()  # same-thread reentry
+            assert _active_locks[lock_key]._depth == 2
+            inner.release()
+            # depth back to 1 → OS lock STILL held, lock-file STILL present
+            assert lock_key in _active_locks
+            assert _active_locks[lock_key]._depth == 1
+            assert db.with_suffix(".lock").exists()
+        finally:
+            outer.release()
+        # fully released after the outer release
+        assert lock_key not in _active_locks
+
+    def test_buildlock_depth_balanced_on_inner_exception(self, tmp_path):
+        """Inner work raising (with release in finally — like build()/update()) still
+        collapses depth back to the outer level; no OS-lock leak."""
+        from rlm_tools_bsl.bsl_index import _BuildLock, _active_locks
+
+        db = tmp_path / "idx" / "bsl_index.db"
+        db.parent.mkdir(parents=True)
+        lock_key = str(db.with_suffix(".lock"))
+
+        outer = _BuildLock(db)
+        outer.acquire()
+        try:
+            inner = _BuildLock(db)
+            inner.acquire()
+            try:
+                raise ValueError("boom inside inner build")
+            except ValueError:
+                pass
+            finally:
+                inner.release()
+            assert _active_locks[lock_key]._depth == 1
+        finally:
+            outer.release()
+        assert lock_key not in _active_locks
+
+    def test_buildlock_blocks_second_thread(self, tmp_path):
+        """A second THREAD of the same process must NOT enter the critical section —
+        it gets RuntimeError (not silent reentry that would corrupt in-place rebuild)."""
+        import threading
+
+        from rlm_tools_bsl.bsl_index import _BuildLock
+
+        db = tmp_path / "idx" / "bsl_index.db"
+        db.parent.mkdir(parents=True)
+
+        held = threading.Event()
+        release_now = threading.Event()
+        result: dict = {}
+
+        def holder():
+            lock = _BuildLock(db)
+            lock.acquire()
+            held.set()
+            release_now.wait(timeout=5)
+            lock.release()
+
+        def second():
+            held.wait(timeout=5)
+            lock2 = _BuildLock(db)
+            try:
+                lock2.acquire()
+                result["entered"] = True  # MUST NOT happen
+                lock2.release()
+            except RuntimeError:
+                result["blocked"] = True
+
+        t1 = threading.Thread(target=holder)
+        t2 = threading.Thread(target=second)
+        t1.start()
+        t2.start()
+        t2.join(timeout=5)
+        release_now.set()
+        t1.join(timeout=5)
+
+        assert result.get("blocked") is True
+        assert "entered" not in result
+
+
+# =====================================================================
+# Finding #1b/#1c (v1.26.0): in-place rebuild + marker + self-heal + M1
+# =====================================================================
+
+
+class TestInPlaceRebuild:
+    def test_build_no_unlink_on_db_path(self, tmp_bsl_project, monkeypatch):
+        """Anti-regression: a normal rebuild must NEVER unlink the db file (the root of
+        the Windows H1 reader clash). Spy distinguishes db_path from the .lock file."""
+        import pathlib
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+
+        unlinked: list[str] = []
+        real_unlink = pathlib.Path.unlink
+
+        def spy_unlink(self, *a, **k):
+            unlinked.append(str(self))
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(pathlib.Path, "unlink", spy_unlink)
+        builder.build(str(tmp_bsl_project))  # rebuild — must not unlink db_path
+        assert str(db_path) not in unlinked  # (.lock unlink is fine and expected)
+
+    def test_rebuild_under_open_reader(self, tmp_bsl_project, monkeypatch):
+        """H1 regress gate (real on the windows CI leg, trivially green on Linux):
+        rebuild while an IndexReader is open must NOT crash; a NEW reader sees fresh
+        data. Reader opened BEFORE the 2nd build. NOT skipif(win32)."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+        reader = IndexReader(db_path)
+        try:
+            db_path2 = builder.build(str(tmp_bsl_project))  # in-place under open reader
+            assert db_path2 == db_path
+            assert db_path.exists()
+            new_reader = IndexReader(db_path)
+            try:
+                assert new_reader.get_statistics()["modules"] >= 1
+            finally:
+                new_reader.close()
+        finally:
+            reader.close()
+
+    def test_rebuild_twice_with_fts_under_open_reader(self, tmp_bsl_project, monkeypatch):
+        """FTS5 shadow tables must drop/recreate cleanly under an open reader (no
+        OperationalError)."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project), build_fts=True)
+        reader = IndexReader(db_path)
+        try:
+            builder.build(str(tmp_bsl_project), build_fts=True)
+            results = reader.search_methods("Заполнить")
+            assert isinstance(results, list)
+        finally:
+            reader.close()
+
+    def test_old_reader_survives_rebuild(self, tmp_bsl_project, monkeypatch):
+        """The SAME old reader keeps working after an in-place rebuild (SQLite
+        re-prepares after SQLITE_SCHEMA) — statistics, file nav, FTS."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project), build_fts=True)
+        reader = IndexReader(db_path)
+        try:
+            assert reader.get_statistics()["modules"] >= 1
+            builder.build(str(tmp_bsl_project), build_fts=True)  # rebuild under old reader
+            assert reader.get_statistics()["modules"] >= 1
+            assert reader.find_files_indexed("Module.bsl") is not None
+            assert isinstance(reader.search_methods("Заполнить"), list)
+        finally:
+            reader.close()
+
+    def test_build_conn_closed_on_exception(self, tmp_bsl_project, monkeypatch):
+        """M1: an exception mid-build releases the lock (conn closed in finally) — a
+        fresh lock acquire on the same db_path does NOT block; the marker is left set."""
+        from rlm_tools_bsl.bsl_index import _BuildLock, _active_locks
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+
+        def boom(self, *a, **k):
+            raise RuntimeError("injected mid-build failure")
+
+        monkeypatch.setattr(IndexBuilder, "_bulk_insert", boom)
+        with pytest.raises(RuntimeError):
+            builder.build(str(tmp_bsl_project))
+
+        assert not _active_locks  # lock released by build()'s finally
+        # not blocked: a fresh acquire succeeds
+        lock = _BuildLock(db_path)
+        lock.acquire()
+        lock.release()
+        # marker left → not usable
+        assert index_incomplete(db_path) is True
+        assert check_index_usable(db_path, str(tmp_bsl_project)) == IndexStatus.MISSING
+
+    def test_update_releases_lock_on_connect_error(self, built_index, monkeypatch):
+        """codex: a connect-time error in update() must NOT leak the _BuildLock (connect
+        is inside the try/finally). Otherwise _active_locks stays registered and blocks
+        later builds in the same process."""
+        import rlm_tools_bsl.bsl_index as bi
+        from rlm_tools_bsl.bsl_index import _BuildLock, _active_locks
+
+        db_path, base_path = built_index
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("injected connect failure")
+
+        monkeypatch.setattr(bi.sqlite3, "connect", boom)
+        with pytest.raises(sqlite3.OperationalError):
+            IndexBuilder().update(base_path)
+        monkeypatch.undo()  # restore real sqlite3.connect
+
+        assert not _active_locks  # lock released despite the connect-time error
+        # not blocked: a fresh acquire succeeds
+        lock = _BuildLock(db_path)
+        lock.acquire()
+        lock.release()
+
+    def test_rebuild_clears_stale_rows(self, tmp_bsl_project, monkeypatch):
+        """An object removed from disk is gone from the index after rebuild (in-place
+        DROP+repopulate, not a stale leftover)."""
+        import shutil
+
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+        shutil.rmtree(tmp_bsl_project / "Documents" / "ТестовыйДокумент")
+        builder.build(str(tmp_bsl_project))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM modules WHERE object_name='ТестовыйДокумент'").fetchone()[0]
+        finally:
+            conn.close()
+        assert n == 0
+
+    def test_build_self_heals_corrupt_db(self, tmp_bsl_project, monkeypatch):
+        """A corrupt/incompatible file is recreated (not stuck forever): (a) non-SQLite
+        garbage; (b) valid SQLite with malformed index_meta (key not PK)."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        db_path = get_index_db_path(str(tmp_bsl_project))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        builder = IndexBuilder()
+
+        # (a) non-SQLite garbage
+        db_path.write_bytes(b"this is not a sqlite database at all")
+        builder.build(str(tmp_bsl_project))
+        reader = IndexReader(db_path)
+        try:
+            assert reader.get_statistics()["modules"] >= 1
+        finally:
+            reader.close()
+
+        # (b) valid SQLite, malformed index_meta (no key PRIMARY KEY)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE IF EXISTS index_meta")
+        conn.execute("CREATE TABLE index_meta (foo TEXT, bar TEXT)")
+        conn.commit()
+        conn.close()
+        builder.build(str(tmp_bsl_project))
+        reader = IndexReader(db_path)
+        try:
+            assert reader.get_statistics()["modules"] >= 1
+        finally:
+            reader.close()
+
+    def test_empty_rebuild_clears_old_rows(self, tmp_bsl_project, monkeypatch):
+        """A rebuild after all .bsl files are removed clears modules/methods, refreshes
+        file_paths, clears the marker, and reads FRESH (paths_hash of [], not '')."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+        for f in tmp_bsl_project.rglob("*.bsl"):
+            f.unlink()
+        builder.build(str(tmp_bsl_project))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM modules").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM methods").fetchone()[0] == 0
+        finally:
+            conn.close()
+        assert index_incomplete(db_path) is False  # marker cleared
+        assert check_index_strict(db_path, 0, _paths_hash([]), str(tmp_bsl_project)) == IndexStatus.FRESH
+
+    def test_partial_build_not_usable(self, tmp_bsl_project, monkeypatch):
+        """A marked (build_in_progress=1) index reads as MISSING from usable/strict;
+        update() does NOT increment it — it recovers via full rebuild."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project))
+        _mark_incomplete(db_path)
+
+        assert index_incomplete(db_path) is True
+        assert check_index_usable(db_path, str(tmp_bsl_project)) == IndexStatus.MISSING
+        # marker is checked before structural — any count/hash → still MISSING
+        assert check_index_strict(db_path, 999, "whatever", str(tmp_bsl_project)) == IndexStatus.MISSING
+
+        delta = builder.update(str(tmp_bsl_project))
+        assert delta.get("rebuild_reason") == "incomplete prior build"
+        assert index_incomplete(db_path) is False
+
+
+class TestIncompleteRecovery:
+    def test_recovery_preserves_build_options(self, tmp_bsl_project, monkeypatch):
+        """Recovery via update() preserves the intended (non-default) build options of
+        the interrupted build when all four has_* are present + valid."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project), build_fts=False, build_metadata=False)
+        _mark_incomplete(db_path)  # keeps has_fts=0/has_metadata=0 from the build
+        builder.update(str(tmp_bsl_project))
+        meta = _read_index_meta(db_path)
+        assert meta["has_fts"] == "0"
+        assert meta["has_metadata"] == "0"
+        assert meta["has_calls"] == "1"
+        assert meta["has_synonyms"] == "1"
+
+    def test_recovery_marker_only_defaults_full(self, tmp_bsl_project, monkeypatch):
+        """Marker present but NO has_* (legacy/manual partial) → recovery defaults to
+        full-feature (all has_* True)."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project), build_fts=False)
+        _mark_incomplete(db_path, has_flags={})  # delete all has_*, set none
+        builder.update(str(tmp_bsl_project))
+        meta = _read_index_meta(db_path)
+        assert meta["has_fts"] == "1"  # defaulted to full (was 0)
+        assert meta["has_metadata"] == "1"
+        assert meta["has_calls"] == "1"
+        assert meta["has_synonyms"] == "1"
+
+    def test_recovery_partial_has_flags_defaults_full(self, tmp_bsl_project, monkeypatch):
+        """Marker + only SOME has_* present → atomic validation fails → full-feature."""
+        monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_bsl_project / ".idx"))
+        builder = IndexBuilder()
+        db_path = builder.build(str(tmp_bsl_project), build_fts=False)
+        _mark_incomplete(db_path, has_flags={"has_fts": False, "has_metadata": False})
+        builder.update(str(tmp_bsl_project))
+        meta = _read_index_meta(db_path)
+        assert meta["has_fts"] == "1"  # not all 4 present → defaulted to full
+        assert meta["has_metadata"] == "1"
+
+
+# =====================================================================
+# Finding #1d (v1.26.0): defensive reader (_transient_safe + ZERO_STATS + gate)
+# =====================================================================
+
+
+class TestDefensiveReader:
+    def test_idx_reader_calls_are_transient_safe(self):
+        """Coverage gate (AST visitor, NOT regex): every IndexReader method called as
+        ``idx_reader.<m>(...)`` in bsl_helpers.py / server.py must be wrapped with
+        @_transient_safe. AST distinguishes a Call from a property access
+        (idx_reader.has_calls) and ignores docstrings/comments. Only close() is allowed
+        unwrapped."""
+        import ast
+        import pathlib
+
+        import rlm_tools_bsl.bsl_helpers as bh_mod
+        import rlm_tools_bsl.server as srv_mod
+
+        allow = {"close"}  # lifecycle / non-read
+        called: set[str] = set()
+        for mod in (bh_mod, srv_mod):
+            tree = ast.parse(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "idx_reader"
+                ):
+                    called.add(node.func.attr)
+
+        missing = [
+            name
+            for name in sorted(called - allow)
+            if not getattr(getattr(IndexReader, name, None), "_is_transient_safe", False)
+        ]
+        assert not missing, f"idx_reader.<m>() not @_transient_safe: {missing}"
+
+    def test_zero_stats_key_parity(self, built_index):
+        """ZERO_STATS sentinel carries EXACTLY the same key set as a real
+        get_statistics() (consumers do **stats / .get — drift would break them)."""
+        from rlm_tools_bsl.bsl_index import _zero_stats
+
+        db_path, _ = built_index
+        reader = IndexReader(db_path)
+        try:
+            real = reader.get_statistics()
+        finally:
+            reader.close()
+        assert set(_zero_stats()) == set(real)
+
+    def test_transient_safe_reraises_real_error(self, built_index):
+        """A REAL (engine, not mocked) non-transient OperationalError ('no such column')
+        propagates; the transient 'no such table' degrades to the sentinel."""
+        from rlm_tools_bsl.bsl_index import _transient_safe
+
+        db_path, _ = built_index
+        reader = IndexReader(db_path)
+        try:
+
+            @_transient_safe(lambda: "SENTINEL")
+            def bad_column(rdr):
+                return rdr._conn.execute("SELECT no_such_col FROM modules").fetchone()
+
+            @_transient_safe(lambda: "SENTINEL")
+            def missing_table(rdr):
+                return rdr._conn.execute("SELECT * FROM no_such_table_xyz").fetchone()
+
+            with pytest.raises(sqlite3.OperationalError):
+                bad_column(reader)  # real defect → NOT swallowed
+            assert missing_table(reader) == "SENTINEL"  # transient → sentinel
+        finally:
+            reader.close()
+
+    def test_reader_degrades_on_partial_db(self, built_index):
+        """An old reader whose tables are dropped mid-rebuild degrades to sentinels
+        (zeros / None) instead of raising OperationalError."""
+        db_path, _ = built_index
+        reader = IndexReader(db_path)
+        try:
+            w = sqlite3.connect(str(db_path))
+            w.execute("DROP TABLE IF EXISTS methods")
+            w.execute("DROP TABLE IF EXISTS modules")
+            w.commit()
+            w.close()
+            stats = reader.get_statistics()  # zeros, not crash
+            assert stats["modules"] == 0
+            assert stats["methods"] == 0
+            # get_methods_by_path → None sentinel (not crash)
+            assert reader.get_methods_by_path("CommonModules/МойМодуль/Ext/Module.bsl") is None
+        finally:
+            reader.close()
+
+    def test_stats_indicate_load_failure(self, built_index):
+        """The zero/load-failure discriminator (codex High): ZERO_STATS → True, a real
+        index (builder_version + built_at present) → False. Timing-independent guard so a
+        truthy ZERO_STATS during a concurrent rebuild is never reported as a loaded 'ok'."""
+        from rlm_tools_bsl.bsl_index import _zero_stats, stats_indicate_load_failure
+
+        db_path, _ = built_index
+        reader = IndexReader(db_path)
+        try:
+            real = reader.get_statistics()
+        finally:
+            reader.close()
+        assert stats_indicate_load_failure(_zero_stats()) is True
+        assert stats_indicate_load_failure(real) is False
 
 
 # =====================================================================

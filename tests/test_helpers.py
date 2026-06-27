@@ -1,6 +1,10 @@
 import os
 import tempfile
+
+import pytest
+
 from rlm_tools_bsl.helpers import make_helpers
+from rlm_tools_bsl.regex_safety import has_catastrophic_nesting
 
 
 def test_read_file():
@@ -206,6 +210,114 @@ def test_find_files_case_insensitive():
         helpers, _ = make_helpers(tmpdir)
         results = helpers["find_files"]("myfile")
         assert len(results) == 1
+
+
+class _StaleIndexReader:
+    """Стаб индекса для Finding #4: честный zero-hit (файла нет в индексе)."""
+
+    def find_files_indexed(self, name, limit=100):
+        return []
+
+
+def test_find_files_fallback_on_stale_index():
+    """Finding #4 (v1.26.0): индекс вернул [] (zero-hit), но файл есть на диске →
+    find_files уходит в FS-fallback (раньше `if indexed is not None:` глотал []
+    и возвращал пусто)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "НовыйФайл.bsl"), "w", encoding="utf-8") as f:
+            f.write("// code")
+
+        helpers, _ = make_helpers(tmpdir, idx_reader=_StaleIndexReader())
+        results = helpers["find_files"]("НовыйФайл")
+        assert len(results) >= 1
+        assert any("НовыйФайл" in r for r in results)
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="FS-кэш find_files строится раз за сессию; файл, добавленный ПОСЛЕ "
+    "прогрева кэша, в той же сессии не виден — отдельный follow-up (Finding #4 граница)",
+)
+def test_find_files_mid_session_cache_boundary():
+    """Граница mid-session: файл, добавленный ПОСЛЕ прогрева FS-кэша, не виден
+    в той же сессии. Закреплено как xfail (не passing-assert текущего ограничения),
+    чтобы не мешать будущему улучшению (детект stale + merge)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "ПервыйФайл.bsl"), "w", encoding="utf-8") as f:
+            f.write("// code")
+
+        helpers, _ = make_helpers(tmpdir, idx_reader=_StaleIndexReader())
+        # Прогрев FS-кэша через первый zero-hit
+        assert helpers["find_files"]("ПервыйФайл")
+        # Файл добавлен ПОСЛЕ прогрева кэша
+        with open(os.path.join(tmpdir, "ВторойФайл.bsl"), "w", encoding="utf-8") as f:
+            f.write("// code")
+        assert helpers["find_files"]("ВторойФайл")
+
+
+# --- Finding #2 (v1.26.0): regex catastrophic-backtracking guard ---
+
+
+def test_regex_guard_detects_nested():
+    """Неограниченная группа с неограниченным внутренним квантором → True."""
+    assert has_catastrophic_nesting(r"(a+)+b")
+    assert has_catastrophic_nesting(r"(a*)*")
+    assert has_catastrophic_nesting(r"(\d+)+$")
+    assert has_catastrophic_nesting(r"((ab)+)+")
+    # Перекрытие классов внутри группы — реальный ReDoS, ожидаемо True (round 25).
+    assert has_catastrophic_nesting(r"(\w+\s*)+")
+    assert has_catastrophic_nesting(r"(\d+\D*)+")
+    # Неограниченный квантор, спрятанный за bounded-квантором подгруппы: внешняя группа
+    # всё равно неограниченно-квантифицирована, а её тело транзитивно содержит a+ →
+    # реальный ReDoS (codex). Bounded {2} НЕ должен блокировать распространение факта.
+    assert has_catastrophic_nesting(r"((a+){2})+b")
+    assert has_catastrophic_nesting(r"((a+)?)*")
+
+
+def test_regex_guard_allows_bounded():
+    """Bounded inner кванторы линейны → НЕ блокировать (анти-регрессия, round 23)."""
+    assert not has_catastrophic_nesting(r"(\d{4})+")
+    assert not has_catastrophic_nesting(r"(\w{2,4})+")
+    assert not has_catastrophic_nesting(r"(\d{3}-?)+")
+    # Fully-bounded nesting stays linear → must NOT be blocked (no unbounded quantifier
+    # anywhere, even transitively).
+    assert not has_catastrophic_nesting(r"((\d{4}){2})+")
+
+
+def test_regex_guard_allows_common():
+    """Обычные паттерны не блокируются (нет вложенного неограниченного квантора)."""
+    for pat in (r"\w+", r"[А-Яа-я]+", r"Процедура\s+\w+", r".*Обработка.*", r"(abc)+", r"(a+)?b"):
+        assert not has_catastrophic_nesting(pat)
+
+
+def test_regex_guard_escaping_and_classes():
+    """Экранирование и классы символов не образуют группу/квантор;
+    non-capturing и lookaround блокируются наравне с capturing."""
+    assert not has_catastrophic_nesting(r"\(a+\)\+")  # экранированные скобки — не группа
+    assert not has_catastrophic_nesting(r"[(+)]a+")  # ( + ) внутри класса — не группа
+    assert has_catastrophic_nesting(r"(?:a+)+")  # non-capturing — блок
+    assert has_catastrophic_nesting(r"(?=a+)+")  # lookahead — блок
+
+
+def test_grep_rejects_catastrophic():
+    """generic grep отклоняет catastrophic-паттерны ValueError'ом, без зависания."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "f.txt"), "w") as f:
+            f.write("benign content\n")
+        helpers, _ = make_helpers(tmpdir)
+        for pat in (r"(a+)+b", r"(a*)*", r"(\d+)+$", r"((ab)+)+"):
+            with pytest.raises(ValueError):
+                helpers["grep"](pat, "f.txt")
+
+
+def test_grep_allows_common_patterns():
+    """Обычные паттерны работают как раньше."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "f.txt"), "w", encoding="utf-8") as f:
+            f.write("Процедура Обработка\nabc123\n")
+        helpers, _ = make_helpers(tmpdir)
+        for pat in (r"\w+", r"[А-Яа-я]+", r"Процедура\s+\w+", r".*Обработка.*"):
+            helpers["grep"](pat, "f.txt")  # не должно бросать
 
 
 def test_read_file_utf8_sig():

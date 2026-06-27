@@ -1,7 +1,10 @@
 from __future__ import annotations
 import json
+import logging
 import xml.etree.ElementTree as ET
 from rlm_tools_bsl.format_detector import METADATA_CATEGORIES
+
+logger = logging.getLogger(__name__)
 
 
 # Namespace maps for 1C metadata XML
@@ -1055,11 +1058,23 @@ def _parse_mdo_xml(root) -> dict:
     return result
 
 
-def parse_metadata_xml(xml_content: str) -> dict:
+def parse_metadata_xml(xml_content: str) -> dict | None:
     """Parse 1C metadata XML and extract structure: name, synonym, attributes,
     tabular sections, subsystem content, dimensions, resources, etc.
-    Auto-detects format: CF (Platform Export) or MDO (EDT/1C:DT)."""
-    root = ET.fromstring(xml_content)
+    Auto-detects format: CF (Platform Export) or MDO (EDT/1C:DT).
+
+    Returns None on empty/whitespace content or XML parse error (контракт
+    зеркалит сиблинг parse_form_xml). Ловится ТОЛЬКО ET.ParseError —
+    не-parse структурные ошибки _parse_cf_xml/_parse_mdo_xml пробрасываются
+    к callsite-обёрткам. Verbatim-текст ParseError логируется на debug,
+    т.к. callsite после перехода на None теряет str(exc)."""
+    if not xml_content or not xml_content.strip():
+        return None
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as exc:
+        logger.debug("parse_metadata_xml: ParseError: %s", exc)
+        return None
 
     # Detect format by root tag namespace
     root_ns = ""

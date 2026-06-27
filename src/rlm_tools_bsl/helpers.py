@@ -5,6 +5,8 @@ import pathlib
 import re
 import threading
 
+from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
+
 logger = logging.getLogger(__name__)
 
 _FILE_CACHE_MAX_SIZE = 500
@@ -135,6 +137,11 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
 
     def grep(pattern: str, path: str = ".") -> list[dict]:
         """Search for regex pattern in files. Returns list of dicts {file, line, text}."""
+        # Finding #2 (v1.26.0): отсечь явные catastrophic-backtracking паттерны ПЕРВЫМ
+        # оператором — до cache-lookup и re.compile. C-движок _sre повиснет на (a+)+b,
+        # а Windows-таймаут песочницы (PyThreadState_SetAsyncExc) его не прерывает.
+        if has_catastrophic_nesting(pattern):
+            raise ValueError(NESTED_QUANTIFIER_ERROR)
         cache_key = (pattern, path)
         with _grep_cache_lock:
             if cache_key in _grep_cache:
@@ -416,7 +423,11 @@ def make_helpers(base_path: str, idx_reader=None) -> tuple[dict, callable]:
                 indexed = idx_reader.find_files_indexed(name, limit=100)
             except Exception:
                 indexed = None
-            if indexed is not None:
+            # Finding #4 (v1.26.0): `if indexed:` (не `is not None`) — честный zero-hit
+            # из индекса ([]) теперь уходит в FS-fallback, а не возвращает пусто. Закрывает
+            # ТОЛЬКО zero-hit staleness (файл есть на диске, но отсутствует в stale-индексе);
+            # partial-hit staleness (индекс отдал старые строки) — вне scope.
+            if indexed:
                 return [p.replace("/", os.sep) for p in indexed]
         _build_file_index()
         needle = name.lower()

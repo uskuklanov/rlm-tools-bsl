@@ -7,6 +7,7 @@ The index is stored on disk and supports incremental updates.
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
@@ -37,14 +39,23 @@ BUILDER_VERSION = 14
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
+# Guards check/register/release on _active_locks against a TOCTOU race between two
+# threads (latent I3): the owner/depth check + OS-lock + registration must be atomic.
+# The OS lock is ALWAYS non-blocking (LK_NBLCK / LOCK_NB), so it is safe to take it
+# under this threading lock — RULE: never call a *blocking* OS-lock under _active_locks_lock.
+_active_locks_lock = threading.Lock()
 
 
 class _BuildLock:
     """Exclusive file lock for index build/update.
 
-    Uses OS-level file locking (fcntl on Unix, msvcrt on Windows)
-    which is automatically released when the process dies.
-    Reentrant within the same process (sequential build+update).
+    Uses OS-level file locking (fcntl on Unix, msvcrt on Windows) which is
+    automatically released when the process dies. Reentrant **only within the same
+    thread** (sequential build+update, and the nested ``_update_locked → self.build()``
+    recovery): a different thread of the same process gets ``RuntimeError`` (like the
+    cross-process case) — silent reentry would let two threads DROP/CREATE the same
+    in-place DB concurrently. Reentry is tracked via owner-thread-id + depth on a
+    shared owner record; the OS lock and lock-file are released only at ``depth == 0``.
     """
 
     def __init__(self, db_path: Path):
@@ -52,68 +63,90 @@ class _BuildLock:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._fd: int | None = None
         self._key = str(self.lock_path)
-        self._reentrant = False
+        self._owner_tid: int | None = None
+        self._depth = 0
+        self._acquired = False
 
     def acquire(self) -> None:
-        """Acquire exclusive lock. Raises RuntimeError if already held by another process."""
-        # Reentrant: same process already holds this lock (e.g. build then update)
-        if self._key in _active_locks:
-            self._reentrant = True
-            return
+        """Acquire exclusive lock. RuntimeError if held by another process OR thread."""
+        tid = threading.get_ident()
+        with _active_locks_lock:
+            existing = _active_locks.get(self._key)
+            if existing is not None:
+                # Already held in this process. Reentry allowed ONLY for the same thread.
+                if existing._owner_tid != tid:
+                    raise RuntimeError(f"Index build already in progress in another thread (lock: {self.lock_path}).")
+                existing._depth += 1
+                self._acquired = True
+                return
 
-        self._fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR)
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, IOError):
-            os.close(self._fd)
-            self._fd = None
-            raise RuntimeError(
-                f"Index build already in progress (lock: {self.lock_path}). "
-                "Wait for it to finish or remove the lock file manually."
-            )
-        _active_locks[self._key] = self
-
-    def release(self) -> None:
-        """Release the lock."""
-        if self._reentrant:
-            return
-        if self._fd is not None:
+            # New acquisition — take the non-blocking OS lock under the threading lock.
+            fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR)
             try:
                 if os.name == "nt":
                     import msvcrt
 
-                    try:
-                        msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
 
-                    fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, IOError):
+                os.close(fd)
+                raise RuntimeError(
+                    f"Index build already in progress (lock: {self.lock_path}). "
+                    "Wait for it to finish or remove the lock file manually."
+                )
+            self._fd = fd
+            self._owner_tid = tid
+            self._depth = 1
+            self._acquired = True
+            _active_locks[self._key] = self
+
+    def release(self) -> None:
+        """Release one acquisition level. OS-unlock + lock-file unlink only at depth 0."""
+        with _active_locks_lock:
+            if not self._acquired:
+                return
+            self._acquired = False
+            owner = _active_locks.get(self._key)
+            if owner is None:
+                return
+            owner._depth -= 1
+            if owner._depth > 0:
+                return
+            # depth == 0 → fully release the OS lock and unregister.
             _active_locks.pop(self._key, None)
+            fd = owner._fd
+            owner._fd = None
+            owner._owner_tid = None
+            if fd is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        try:
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
             try:
-                self.lock_path.unlink(missing_ok=True)
+                owner.lock_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
 
 # ---------------------------------------------------------------------------
-# Regex patterns copied from bsl_helpers._parse_procedures / _strip_code_line
+# Regex patterns copied from bsl_helpers._parse_procedures
 # (autonomous — no runtime import from bsl_helpers)
 # ---------------------------------------------------------------------------
 _PROC_DEF_RE = re.compile(BSL_PATTERNS["procedure_def"], re.IGNORECASE)
 _PROC_END_RE = re.compile(BSL_PATTERNS["procedure_end"], re.IGNORECASE)
-_STRING_LITERAL_RE = re.compile(r'"[^"\r\n]*"')
 
 # Call-extraction patterns
 _QUALIFIED_CALL_RE = re.compile(r"(\w+)\.(\w+)\s*\(")
@@ -1977,6 +2010,26 @@ def _read_index_meta(db_path: Path) -> dict[str, str] | None:
         conn.close()
 
 
+def _meta_incomplete(meta: dict[str, str]) -> bool:
+    """True ⇔ index_meta marks an UNFINISHED in-place build (``build_in_progress == "1"``).
+
+    Strict ``== "1"`` (three states: key absent / ``"0"`` / ``"1"``): ``_read_index_meta``
+    returns string values, so a naive ``bool(meta.get("build_in_progress"))`` would make
+    ``"0"`` truthy and strand the index MISSING forever (codex round 13)."""
+    return meta.get("build_in_progress") == "1"
+
+
+def index_incomplete(db_path: str | Path) -> bool:
+    """True ⇔ db_path is a partially-built (in-place) index that must not be used.
+
+    Light read of ``index_meta`` only (no full IndexReader). None-safe (cross-review
+    round 26): a missing / corrupt / locked db → ``_read_index_meta`` returns ``None`` →
+    ``False`` here (existence/validity is the caller's own MISSING concern; without this
+    guard ``_meta_incomplete(None)`` would ``AttributeError`` at no-stats / CLI info)."""
+    meta = _read_index_meta(Path(db_path))
+    return meta is not None and _meta_incomplete(meta)
+
+
 def _check_age(meta: dict[str, str]) -> IndexStatus | None:
     """Return STALE_AGE if index exceeds max age, else None."""
     max_age_days = int(os.environ.get("RLM_INDEX_MAX_AGE_DAYS", "7"))
@@ -2067,6 +2120,13 @@ def check_index_usable(
     if meta is None:
         return IndexStatus.MISSING
 
+    # --- Incomplete in-place build → strictly MISSING (codex round 10) ---
+    # rlm_start opens a reader for FRESH/STALE_AGE/STALE_CONTENT but NOT for MISSING,
+    # so a partial DB must read as MISSING (not STALE_*). `meta` is already in hand →
+    # _meta_incomplete directly, no second connection (round 25). Checked FIRST.
+    if _meta_incomplete(meta):
+        return IndexStatus.MISSING
+
     # --- Age check ---
     age_status = _check_age(meta)
     if age_status is not None:
@@ -2110,6 +2170,12 @@ def check_index_strict(
     if meta is None:
         return IndexStatus.MISSING
 
+    # --- Incomplete in-place build → MISSING ---
+    # A mid-fail AFTER _write_meta could have written built_at/bsl_count/paths_hash;
+    # without this guard strict would mistake the partial build for FRESH.
+    if _meta_incomplete(meta):
+        return IndexStatus.MISSING
+
     # --- Structural check ---
     stored_count = meta.get("bsl_count")
     stored_hash = meta.get("paths_hash")
@@ -2139,15 +2205,6 @@ check_index_freshness = check_index_strict
 # ---------------------------------------------------------------------------
 # Internal parsing helpers
 # ---------------------------------------------------------------------------
-def _strip_code_line(line: str) -> str:
-    """Remove comments and string literals from a BSL code line."""
-    line = _STRING_LITERAL_RE.sub("", line)
-    ci = line.find("//")
-    if ci >= 0:
-        line = line[:ci]
-    return line
-
-
 def _scan_module(lines: list[str]):
     """Yield ``(lineno, code, strings)`` for each line, tracking string state.
 
@@ -2871,6 +2928,11 @@ def _collect_metadata_tables(
             parsed = parse_metadata_xml(content)
         except Exception as exc:
             logger.warning("subsystems collector: skipping malformed %s: %s", fp, exc)
+            continue
+        if parsed is None:
+            # parse_metadata_xml глотает ParseError в None (Finding #5) — сохраняем warning,
+            # иначе битый XML тихо пропадёт в `if not parsed` ниже.
+            logger.warning("subsystems collector: skipping malformed %s (parser returned None)", fp)
             continue
         if not parsed or parsed.get("object_type") != "Subsystem":
             continue
@@ -4212,6 +4274,10 @@ def _refresh_object(
         parsed = parse_metadata_xml(content)
     except Exception as exc:  # noqa: BLE001 — diagnostic shim
         raise PointwiseRefreshFailed(category, object_name, f"parse error: {exc}") from exc
+    if parsed is None:
+        # parse_metadata_xml глотает ParseError в None (Finding #5); распознаём
+        # битый XML отдельно от валидного-но-пустого, чтобы причина rollback не терялась.
+        raise PointwiseRefreshFailed(category, object_name, "malformed metadata XML")
     if not parsed:
         raise PointwiseRefreshFailed(category, object_name, "parser returned empty")
 
@@ -4481,7 +4547,12 @@ def _refresh_xdto_package(
     # parse_metadata_xml, не parse_xdto_package_xml). Лишний разовый парсинг
     # одного файла гарантирует совпадение Tier 5.
     if opt.get("has_synonyms") and opt.get("has_synonyms_table"):
-        meta_parsed = parse_metadata_xml(main_content) or {}
+        meta_parsed = parse_metadata_xml(main_content)
+        if meta_parsed is None:
+            # Finding #5: ParseError → None. Ветка недостижима (тот же main_content уже
+            # успешно ET-распарсен parse_xdto_package_xml выше), debug-лог для hardening.
+            logger.debug("_refresh_xdto_package: parse_metadata_xml returned None for %s", rel)
+            meta_parsed = {}
         _insert_synonym_for_object(conn, "XDTOPackages", object_name, meta_parsed, rel)
 
 
@@ -4585,7 +4656,7 @@ def _refresh_global_object(
     # на объект гарантирует совпадение синонима с bulk path.
     if opt.get("has_synonyms") and opt.get("has_synonyms_table"):
         try:
-            meta_parsed = parse_metadata_xml(content) or {}
+            meta_parsed = parse_metadata_xml(content)
         except Exception as exc:
             logger.warning(
                 "pointwise synonym refresh: skipping %s/%s due to parse error: %s",
@@ -4594,6 +4665,15 @@ def _refresh_global_object(
                 exc,
             )
             meta_parsed = {}
+        else:
+            if meta_parsed is None:
+                # ParseError проглочена в None (Finding #5) — сохраняем warning
+                logger.warning(
+                    "pointwise synonym refresh: skipping %s/%s — malformed metadata XML",
+                    category,
+                    object_name,
+                )
+                meta_parsed = {}
         if meta_parsed:
             _insert_synonym_for_object(conn, category, object_name, meta_parsed, rel)
 
@@ -5143,8 +5223,6 @@ def _collect_object_synonyms(
     if not candidates:
         return all_results
 
-    import xml.etree.ElementTree as _ET
-
     def _parse_one(entry: tuple[str, str, str]) -> tuple[str, str, str, str] | None:
         cat, obj_name, rel = entry
         fp = base / rel
@@ -5154,19 +5232,20 @@ def _collect_object_synonyms(
             return None
         try:
             parsed = parse_metadata_xml(content)
-        except _ET.ParseError as exc:
-            logger.warning(
-                "_collect_object_synonyms: skipping malformed XML %s: %s",
-                fp,
-                exc,
-            )
-            return None
         except Exception as exc:
             logger.warning(
                 "_collect_object_synonyms: skipping %s due to unexpected parse error: %s: %s",
                 fp,
                 type(exc).__name__,
                 exc,
+            )
+            return None
+        if parsed is None:
+            # parse_metadata_xml глотает ParseError в None (Finding #5) — сохраняем warning,
+            # иначе битый XML тихо пропадёт в `if not parsed` ниже.
+            logger.warning(
+                "_collect_object_synonyms: skipping malformed XML %s",
+                fp,
             )
             return None
         if not parsed:
@@ -5574,6 +5653,143 @@ class IndexBuilder:
         conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('git_dirty_unreliable', '0')")
         return None
 
+    # --- In-place rebuild support (v1.26.0, Finding #1) -------------------------
+    # Keys preserved across the in-place schema clear: the marker itself + the
+    # intended build options (recovery via _update_locked reads these — clearing
+    # them would silently downgrade calls/metadata/fts/synonyms on a recovery build).
+    _MARKER_PRESERVE_KEYS = (
+        "build_in_progress",
+        "has_calls",
+        "has_metadata",
+        "has_fts",
+        "has_synonyms",
+    )
+
+    def _self_heal_db(self, db_path: Path) -> None:
+        """Before an in-place rebuild, ensure db_path is absent OR a valid SQLite with a
+        key/value ``index_meta`` (``key`` as PRIMARY KEY). A corrupt/incompatible file is
+        unlinked & recreated — safe, because a healthy open ``IndexReader`` cannot exist
+        on a corrupt file (no live handle to clash with). Cheap probe (``SELECT 1 FROM
+        index_meta LIMIT 1`` + ``PRAGMA table_info`` pk check), NOT a full
+        ``PRAGMA integrity_check`` (that would full-scan the whole DB on EVERY build)."""
+        if not db_path.exists():
+            return
+        valid = False
+        try:
+            probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                probe.execute("SELECT 1 FROM index_meta LIMIT 1").fetchone()
+                # table_info columns: (cid, name, type, notnull, dflt_value, pk).
+                # `key` must be the PRIMARY KEY (pk > 0) — else INSERT OR REPLACE on the
+                # marker could spawn duplicate rows with no row-order guarantee.
+                cols = probe.execute("PRAGMA table_info(index_meta)").fetchall()
+                valid = any(c[1] == "key" and c[5] > 0 for c in cols)
+            finally:
+                probe.close()
+        except sqlite3.Error:
+            valid = False
+        if valid:
+            return
+        logger.warning("build: existing index at %s is invalid/incompatible — recreating", db_path)
+        try:
+            db_path.unlink()
+        except OSError as exc:
+            # Windows: a live handle (very unlikely on a corrupt file) blocks unlink.
+            raise RuntimeError(
+                f"Cannot self-heal corrupt index at {db_path}: {exc}. Close active sessions and retry."
+            ) from exc
+
+    def _drop_all_objects_except_meta(self, conn: sqlite3.Connection) -> None:
+        """DROP every table/view/trigger/index except ``index_meta`` (FTS5-safe).
+
+        Order: triggers → views → ordinary tables → fts5-virtual → leftover indexes.
+        ``index_meta`` is preserved (it holds the build_in_progress marker). FTS5 virtual
+        tables are detected by ``sql LIKE '%USING fts5%'`` and dropped BY NAME; their
+        shadow tables (``<fts>_config/_data/_idx/_docsize/_content``) are excluded from
+        the explicit list (they cascade from the virtual-table drop) — addressed by the
+        found fts name, NOT a global suffix (codex round 12). ``IF EXISTS`` everywhere
+        (anti-regression on sqlite_master ordering)."""
+        rows = conn.execute(
+            "SELECT name, type, sql FROM sqlite_master "
+            "WHERE type IN ('table','view','trigger','index') "
+            "AND name NOT LIKE 'sqlite_%' AND name != 'index_meta'"
+        ).fetchall()
+        fts_names = {name for (name, _type, sql) in rows if sql and "using fts5" in sql.lower()}
+        shadows = {f"{fts}_{suf}" for fts in fts_names for suf in ("config", "data", "idx", "docsize", "content")}
+
+        for name, type_, _sql in rows:
+            if type_ == "trigger":
+                conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        for name, type_, _sql in rows:
+            if type_ == "view":
+                conn.execute(f'DROP VIEW IF EXISTS "{name}"')
+        for name, type_, _sql in rows:
+            if type_ == "table" and name not in fts_names and name not in shadows:
+                conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        for fts in fts_names:
+            conn.execute(f'DROP TABLE IF EXISTS "{fts}"')  # cascades its shadow tables
+        for name, type_, _sql in rows:
+            if type_ == "index":
+                conn.execute(f'DROP INDEX IF EXISTS "{name}"')
+
+    def _begin_inplace_rebuild(self, conn: sqlite3.Connection, opts: dict[str, bool]) -> None:
+        """In-place rebuild prologue (no unlink/rename → safe under an open RO reader on
+        Windows). Order matters — covers the whole dangerous window:
+          (a) ensure ``index_meta`` exists; (b) ``build_in_progress=1`` + intended build
+              options (``has_*``) + **commit** (durable marker BEFORE any destructive op;
+              recovery reads the right options); (c) DROP every object except
+              ``index_meta`` (FTS5-safe); (d) ``executescript(_SCHEMA_SQL)`` recreates
+              empty tables; (e) DELETE stale meta keys (built_at/bsl_count/paths_hash/
+              version/config_*) PRESERVING the marker + build options → strict-check can't
+              mistake a mid-fail for FRESH."""
+        conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+        for key, flag in (
+            ("has_calls", opts["has_calls"]),
+            ("has_metadata", opts["has_metadata"]),
+            ("has_fts", opts["has_fts"]),
+            ("has_synonyms", opts["has_synonyms"]),
+        ):
+            conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+                (key, "1" if flag else "0"),
+            )
+        conn.commit()
+        self._drop_all_objects_except_meta(conn)
+        conn.executescript(_SCHEMA_SQL)
+        placeholders = ",".join("?" * len(self._MARKER_PRESERVE_KEYS))
+        conn.execute(
+            f"DELETE FROM index_meta WHERE key NOT IN ({placeholders})",  # noqa: S608 — fixed-tuple
+            self._MARKER_PRESERVE_KEYS,
+        )
+        conn.commit()
+
+    def _finish_inplace_rebuild(self, conn: sqlite3.Connection) -> None:
+        """Success gate: clear the build_in_progress marker (data is now complete).
+        Marker cleared ⇔ index usable (this is the ONLY place it is cleared)."""
+        conn.execute("DELETE FROM index_meta WHERE key = 'build_in_progress'")
+        conn.commit()
+
+    def _finalize_build_best_effort(self, conn: sqlite3.Connection) -> None:
+        """Commit any pending writes, then ANALYZE + VACUUM (best-effort), then clear the
+        marker. The leading commit makes finalize SELF-CONTAINED — VACUUM cannot run inside
+        an open transaction. (Verified empirically: callers already commit before this and
+        ANALYZE runs in autocommit — ``conn.in_transaction`` is False after it — so VACUUM
+        already succeeds today; the commit is defensive against a future caller leaving a
+        transaction open, NOT a fix for a current failure.) ANALYZE/VACUUM affect only
+        size/planner, never data validity; ``except sqlite3.Error`` only (must not mask
+        KeyboardInterrupt/MemoryError). Marker cleared AFTER VACUUM = single success gate."""
+        try:
+            conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("finalize: pre-VACUUM commit failed (best-effort): %s", exc)
+        for stmt in ("ANALYZE", "VACUUM"):
+            try:
+                conn.execute(stmt)
+            except sqlite3.Error as exc:
+                logger.warning("%s failed (best-effort): %s", stmt, exc)
+        self._finish_inplace_rebuild(conn)
+
     def build(
         self,
         base_path: str,
@@ -5616,10 +5832,48 @@ class IndexBuilder:
         build_fts: bool,
         build_synonyms: bool,
     ) -> Path:
-        """Internal build with lock already acquired."""
-        # Remove old DB if it exists
-        if db_path.exists():
-            db_path.unlink()
+        """Internal build with lock already acquired.
+
+        In-place rebuild (v1.26.0): the DB file is NOT unlink/rename'd on the normal
+        path — on Windows that PermissionErrors under an open RO ``IndexReader``. The
+        schema is cleared IN PLACE under a ``build_in_progress`` marker (concurrent old
+        readers degrade via ``_transient_safe``; new sessions are refused until done).
+        Self-heal unlinks ONLY a corrupt/incompatible file (no healthy reader can hold
+        it). M1: the connection lifecycle is wrapped in try/finally so a mid-build
+        exception never leaks the handle / WAL."""
+        # Self-heal: recreate only a corrupt/incompatible file. Normal path NEVER
+        # unlinks → no Windows reader clash (the actual root of H1).
+        self._self_heal_db(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return self._build_into_conn(
+                conn, base_path, db_path, build_calls, build_metadata, build_fts, build_synonyms
+            )
+        finally:
+            conn.close()
+
+    def _build_into_conn(
+        self,
+        conn: sqlite3.Connection,
+        base_path: str,
+        db_path: Path,
+        build_calls: bool,
+        build_metadata: bool,
+        build_fts: bool,
+        build_synonyms: bool,
+    ) -> Path:
+        """Build into an already-open connection (the caller opened it and closes it in
+        a finally — M1). In-place: set the marker + clear the schema before populating,
+        and clear the marker only after ANALYZE/VACUUM (success gate)."""
+        opts = {
+            "has_calls": build_calls,
+            "has_metadata": build_metadata,
+            "has_fts": build_fts,
+            "has_synonyms": build_synonyms,
+        }
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
 
         logger.info("Building method index for %s -> %s", base_path, db_path)
         t0 = time.time()
@@ -5631,16 +5885,17 @@ class IndexBuilder:
         logger.info("Found %d .bsl files", total_files)
 
         if total_files == 0:
-            # Create empty DB with schema + file_paths for .mdo/.xml
-            conn = sqlite3.connect(str(db_path))
-            conn.executescript(_SCHEMA_SQL)
+            # Empty rebuild — same in-place marker lifecycle; populate empty tables +
+            # file_paths + meta only (codex round 8: must NOT skip the cleanup, else stale
+            # modules/methods/calls would survive the now-unlink-free rebuild).
+            self._begin_inplace_rebuild(conn, opts)
             fp_rows = _collect_file_paths(base_path)
             _insert_file_paths(conn, fp_rows)
             self._write_meta(
                 conn,
                 base_path,
                 0,
-                "",
+                _paths_hash([]),  # round 21: NOT "" — else check_index_strict false STALE on a valid empty index
                 build_calls,
                 build_metadata,
                 build_fts=build_fts,
@@ -5678,7 +5933,7 @@ class IndexBuilder:
                         # detection the flag forces a full scan on the first update.
                         self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=False)
             conn.commit()
-            conn.close()
+            self._finalize_build_best_effort(conn)
             return db_path
 
         # Compute paths hash
@@ -5707,11 +5962,9 @@ class IndexBuilder:
                 if result is not None:
                     results.append(result)
 
-        # Write to SQLite
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.executescript(_SCHEMA_SQL)
+        # Write to SQLite — in-place: set the build_in_progress marker + clear the schema
+        # before populating (conn is opened AND closed by the caller — M1 try/finally).
+        self._begin_inplace_rebuild(conn, opts)
 
         self._bulk_insert(conn, results, build_calls)
         self._refresh_call_resolution_stats(conn)
@@ -5871,9 +6124,9 @@ class IndexBuilder:
                     self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=False)
                 conn.commit()
 
-        conn.execute("ANALYZE")
-        conn.execute("VACUUM")
-        conn.close()
+        # ANALYZE + VACUUM (best-effort) then clear the marker (success gate). conn is
+        # closed by the caller (_build_locked) in a finally — M1.
+        self._finalize_build_best_effort(conn)
 
         elapsed = time.time() - t0
         total_methods = sum(len(r.methods) for r in results)
@@ -5901,20 +6154,67 @@ class IndexBuilder:
 
         lock = _BuildLock(db_path)
         lock.acquire()
+        conn = None
         try:
-            return self._update_locked(base_path, db_path)
+            # connect INSIDE the try (codex): a connect-time sqlite3.Error/OSError must
+            # NOT leak the acquired lock — otherwise it stays in _active_locks and blocks
+            # later builds/updates in the same process.
+            conn = sqlite3.connect(str(db_path))  # M1: closed in finally
+            return self._update_locked(base_path, db_path, conn)
         finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             lock.release()
 
-    def _update_locked(self, base_path: str, db_path: Path) -> dict:
-        """Internal update with lock already acquired."""
+    def _update_locked(self, base_path: str, db_path: Path, conn: sqlite3.Connection) -> dict:
+        """Internal update with lock held and the connection opened by the caller
+        (M1: ``update()`` closes it in a finally). Existing explicit ``conn.close()``
+        calls before each return remain (idempotent double-close — the safety net only
+        fires on an exception path)."""
         t0 = time.time()
         base = Path(base_path)
 
-        conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Recovery: a prior in-place build left build_in_progress=1 → meta/tables are
+        # untrustworthy. Do NOT increment a partial index — full rebuild (mirrors the
+        # schema-upgrade branch below: close conn → self.build → same return shape).
+        # Recover the intended build options only if ALL FOUR has_* are present AND
+        # valid 0/1 (codex round 6/18); otherwise full-feature + warning.
+        bip_row = conn.execute("SELECT value FROM index_meta WHERE key = 'build_in_progress'").fetchone()
+        if bip_row is not None and bip_row["value"] == "1":
+            opt_flags: dict[str, bool] = {}
+            valid = True
+            for key in ("has_calls", "has_metadata", "has_fts", "has_synonyms"):
+                row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
+                if row is None or row["value"] not in ("0", "1"):
+                    valid = False
+                    break
+                opt_flags[key] = row["value"] == "1"
+            if not valid:
+                logger.warning("update: incomplete prior build lacks valid has_* options → full-feature rebuild")
+                opt_flags = {"has_calls": True, "has_metadata": True, "has_fts": True, "has_synonyms": True}
+            bsl_files = sorted(base.rglob("*.bsl"))
+            conn.close()
+            self.build(
+                base_path,
+                build_calls=opt_flags["has_calls"],
+                build_metadata=opt_flags["has_metadata"],
+                build_fts=opt_flags["has_fts"],
+                build_synonyms=opt_flags["has_synonyms"],
+            )
+            return {
+                "added": len(bsl_files),
+                "changed": 0,
+                "removed": 0,
+                "git_fast_path": False,
+                "rebuild_reason": "incomplete prior build",
+            }
 
         # Read build settings from meta
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'has_calls'").fetchone()
@@ -7613,6 +7913,117 @@ def _can_index_glob(pattern: str) -> tuple[str, dict] | None:
 
 
 # ---------------------------------------------------------------------------
+# Defensive reader (v1.26.0, Finding #1): transient-safe wrapper + zero-stats
+# ---------------------------------------------------------------------------
+# Stable ASCII engine texts (locale-independent) of the ONLY two transient
+# OperationalError classes an in-place rebuild can produce on a concurrent old reader.
+_TRANSIENT_SQLITE_MARKERS = ("no such table", "database is locked")
+
+
+def _transient_safe(sentinel_factory):
+    """Decorate an IndexReader READ-method reachable via ``idx_reader.<m>()``.
+
+    An in-place rebuild can make a concurrent OLD reader hit a TRANSIENT
+    ``OperationalError`` — the DROP→CREATE window (``"no such table"``) or the brief
+    exclusive lock of best-effort ``VACUUM`` (``"database is locked"``). Those degrade
+    to a FRESH per-call sentinel instead of crashing. **Any other** ``OperationalError``
+    (``"no such column"``, a SQL typo, ``"disk I/O error"``, ``"malformed"``, …) is
+    **RE-RAISED** — swallowing a real defect into an empty result would slip past the
+    tests (that is the very 'new bug' to avoid). ``sentinel_factory()`` is called fresh
+    per invocation (mutable sentinels must NOT be shared singletons).
+
+    Honest caveat (also in scope): ``"database is locked"`` could in theory surface
+    OUTSIDE a rebuild under rare lock contention (unlikely with WAL + RO readers + a
+    single ``_BuildLock``-serialized writer) — there it too degrades to the sentinel.
+    Acceptable best-effort for a transient error. In normal operation (no rebuild) this
+    decorator is a no-op (nothing to catch)."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if not any(m in str(exc).lower() for m in _TRANSIENT_SQLITE_MARKERS):
+                    raise
+                logger.debug("_transient_safe: %s degraded to sentinel (%s)", fn.__name__, exc)
+                return sentinel_factory()
+
+        wrapper._is_transient_safe = True  # marker for the AST coverage gate
+        return wrapper
+
+    return decorator
+
+
+def _zero_stats() -> dict:
+    """Fresh zero-filled mirror of ``IndexReader.get_statistics()`` — the per-call
+    sentinel for the ``@_transient_safe``-wrapped ``get_statistics`` (a concurrent reader
+    during an in-place rebuild gets a stable-shaped payload, never an ``OperationalError``).
+
+    MUST carry the SAME key set as ``get_statistics`` (consumers do ``**stats`` and
+    ``.get(...)``); ``test_zero_stats_key_parity`` fails on any drift. Returned fresh
+    (factory) — never a shared singleton (a consumer mutating it would poison the next
+    call)."""
+    return {
+        "modules": 0,
+        "methods": 0,
+        "calls": 0,
+        "exports": 0,
+        "built_at": None,
+        "config_name": None,
+        "config_version": None,
+        "config_synonym": None,
+        "config_vendor": None,
+        "source_format": None,
+        "config_role": None,
+        "has_metadata": False,
+        "has_fts": False,
+        "bsl_count": None,
+        "builder_version": None,
+        "event_subscriptions": 0,
+        "scheduled_jobs": 0,
+        "functional_options": 0,
+        "role_rights": 0,
+        "register_movements": 0,
+        "enum_values": 0,
+        "subsystem_content": 0,
+        "http_services": 0,
+        "web_services": 0,
+        "xdto_packages": 0,
+        "file_paths": 0,
+        "object_synonyms": 0,
+        "regions": 0,
+        "module_headers": 0,
+        "extension_overrides": 0,
+        "form_elements": 0,
+        "object_attributes": 0,
+        "predefined_items": 0,
+        "metadata_references": 0,
+        "exchange_plan_content": 0,
+        "defined_types": 0,
+        "characteristic_types": 0,
+        "metadata_code_usages": 0,
+        "git_head_commit": None,
+        "git_accelerated": False,
+    }
+
+
+def stats_indicate_load_failure(stats: dict) -> bool:
+    """True ⇔ a ``get_statistics()`` result is a zero/load-failure sentinel rather than a
+    real index read.
+
+    A VALID index — even an empty one (0 .bsl) — ALWAYS has ``builder_version`` AND
+    ``built_at`` written by ``_write_meta``. ``_zero_stats()`` (the ``_transient_safe``
+    sentinel) and a mid-rebuild read (where ``_begin_inplace_rebuild`` has stripped those
+    keys) both leave BOTH of them ``None``. This is **timing-independent** — it inspects
+    the stats actually returned, not the ``build_in_progress`` marker (which a finishing
+    rebuild may have already cleared between ``get_statistics`` and a marker re-check).
+    Lets consumers refuse to report a partial/transient read as a loaded ``"ok"`` index
+    with zero counts (codex High)."""
+    return stats.get("builder_version") is None and stats.get("built_at") is None
+
+
+# ---------------------------------------------------------------------------
 # IndexReader (read-only)
 # ---------------------------------------------------------------------------
 class IndexReader:
@@ -7666,6 +8077,7 @@ class IndexReader:
             except sqlite3.Error:
                 return False
 
+    @_transient_safe(lambda: None)
     def get_methods_by_path(self, rel_path: str) -> list[dict] | None:
         """Get all methods for a given module path.
 
@@ -7695,6 +8107,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def get_definitions(self, name: str, module_hint: str = "", limit: int = 50) -> dict | None:
         """Find every place a method ``name`` is defined (forward go-to-definition).
 
@@ -7860,6 +8273,7 @@ class IndexReader:
                 ],
             }
 
+    @_transient_safe(lambda: None)
     def get_outline_data(self, rel_path: str) -> dict | None:
         """Atomically read everything needed to build a module outline tree.
 
@@ -7985,6 +8399,7 @@ class IndexReader:
             return _make_callee_key(rel_paths[0], proc_name)
         return None
 
+    @_transient_safe(lambda: None)
     def get_callers(
         self,
         proc_name: str,
@@ -8193,6 +8608,7 @@ class IndexReader:
                 },
             }
 
+    @_transient_safe(lambda: None)
     def resolve_target_identity(self, proc_name: str, module_hint: str = "") -> str | None:
         """Public, LOCKED wrapper over ``_resolve_target_key`` (v1.19.0).
 
@@ -8208,6 +8624,7 @@ class IndexReader:
         with self._lock:
             return self._resolve_target_key(proc_name, module_hint)
 
+    @_transient_safe(list)
     def get_inbound_edges(self, proc_name: str, module_hint: str = "") -> list[dict]:
         """Non-call inbound edges into ``proc_name`` (the 1C control-flow graph).
 
@@ -8449,6 +8866,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def get_register_movements(self, document_name: str) -> list[dict] | None:
         """Get register movements for a given document.
 
@@ -8474,6 +8892,7 @@ class IndexReader:
 
             return [{"register_name": r["register_name"], "source": r["source"], "file": r["file"]} for r in rows]
 
+    @_transient_safe(lambda: None)
     def get_register_writers(self, register_name: str) -> list[dict] | None:
         """Get documents that write to a given register.
 
@@ -8498,6 +8917,7 @@ class IndexReader:
 
             return [{"document_name": r["document_name"], "source": r["source"], "file": r["file"]} for r in rows]
 
+    @_transient_safe(lambda: None)
     def get_roles(self, object_name: str) -> list[dict] | None:
         """Get roles that grant rights to a given object.
 
@@ -8539,6 +8959,7 @@ class IndexReader:
                     role_map[key]["rights"].append(right)
             return list(role_map.values())
 
+    @_transient_safe(lambda: None)
     def get_roles_exact(self, object_ref: str, include_members: bool = False) -> list[dict] | None:
         """Roles granting rights to an EXACT object ref — no substring false-positives.
 
@@ -8600,6 +9021,7 @@ class IndexReader:
                     role_map[key]["rights"].append(right)
             return list(role_map.values())
 
+    @_transient_safe(lambda: None)
     def get_enum_values(self, enum_name: str) -> dict | None:
         """Get enum definition from the index.
 
@@ -8636,6 +9058,7 @@ class IndexReader:
             # Table exists but enum not found — return error, don't fallback
             return {"error": f"Перечисление '{enum_name}' не найдено"}
 
+    @_transient_safe(lambda: None)
     def get_startup_meta(self) -> dict | None:
         """Get cached startup metadata for fast rlm_start.
 
@@ -8664,6 +9087,7 @@ class IndexReader:
 
             return meta
 
+    @_transient_safe(list)
     def get_detected_prefixes(self) -> list[str]:
         """Return detected custom prefixes from index_meta, or empty list."""
         with self._lock:
@@ -8675,7 +9099,8 @@ class IndexReader:
                     return []
             return []
 
-    def get_all_modules(self) -> list[dict]:
+    @_transient_safe(lambda: None)
+    def get_all_modules(self) -> list[dict] | None:
         """Return all modules from the index for fast _index_state init.
 
         Returns:
@@ -8858,6 +9283,7 @@ class IndexReader:
         ranked.sort(key=lambda x: (x[0], len(x[1]), x[1]))
         return [rp for _, rp in ranked[:limit]]
 
+    @_transient_safe(_zero_stats)
     def get_statistics(self) -> dict:
         """Get summary statistics about the index.
 
@@ -9014,6 +9440,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return False
 
+    @_transient_safe(list)
     def search_methods(self, query: str, limit: int = 30) -> list[dict]:
         """FTS5 full-text search for methods by substring.
 
@@ -9063,6 +9490,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return []
 
+    @_transient_safe(lambda: None)
     def search_objects(self, query: str, limit: int = 50) -> list[dict] | None:
         """Search objects by business name (synonym) or technical name.
 
@@ -9147,6 +9575,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def search_regions(self, query: str, limit: int = 200) -> list[dict] | None:
         """Search code regions (#Область) by name substring.
 
@@ -9188,6 +9617,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def search_module_headers(self, query: str, limit: int = 200) -> list[dict] | None:
         """Search module header comments by substring.
 
@@ -9227,6 +9657,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def count_regions(self, query: str = "") -> int | None:
         """COUNT of code regions matching ``query`` (same WHERE as search_regions).
 
@@ -9252,6 +9683,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def count_module_headers(self, query: str = "") -> int | None:
         """COUNT of module headers matching ``query`` (same WHERE as search_module_headers).
 
@@ -9276,6 +9708,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def get_event_subscriptions(
         self,
         object_name: str = "",
@@ -9372,6 +9805,7 @@ class IndexReader:
 
             return result
 
+    @_transient_safe(lambda: None)
     def get_event_subscriptions_exact(self, object_ref: str) -> list[dict] | None:
         """Event subscriptions whose source canonicalizes to an EXACT object ref.
 
@@ -9427,6 +9861,7 @@ class IndexReader:
                 )
             return result
 
+    @_transient_safe(lambda: None)
     def get_scheduled_jobs(self, name: str = "") -> list[dict] | None:
         """Get scheduled jobs from the index, optionally filtered by name.
 
@@ -9470,6 +9905,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def get_functional_options(self, object_name: str = "") -> list[dict] | None:
         """Get functional options from the index, optionally filtered.
 
@@ -9517,6 +9953,7 @@ class IndexReader:
 
             return result
 
+    @_transient_safe(lambda: None)
     def get_functional_options_exact(self, object_ref: str, include_members: bool = True) -> list[dict] | None:
         """Functional options whose content references an EXACT object ref.
 
@@ -9571,6 +10008,7 @@ class IndexReader:
                 )
             return result
 
+    @_transient_safe(lambda: None)
     def get_subsystems_for_object(self, object_name: str) -> list[dict] | None:
         """Find subsystems containing a given object.
 
@@ -9614,6 +10052,7 @@ class IndexReader:
                 for name, info in grouped.items()
             ]
 
+    @_transient_safe(lambda: None)
     def get_http_services(self, name: str = "") -> list[dict] | None:
         """Get HTTP services from the index, optionally filtered by name."""
         with self._lock:
@@ -9640,6 +10079,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def get_web_services(self, name: str = "") -> list[dict] | None:
         """Get web services from the index, optionally filtered by name."""
         with self._lock:
@@ -9666,6 +10106,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def get_xdto_packages(self, name: str = "") -> list[dict] | None:
         """Get XDTO packages from the index, optionally filtered by name."""
         with self._lock:
@@ -9694,6 +10135,7 @@ class IndexReader:
 
     # --- Level-8: extension overrides ---
 
+    @_transient_safe(lambda: None)
     def get_extension_overrides(
         self,
         object_name: str = "",
@@ -9718,6 +10160,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def count_overrides_by_extension_root(self) -> dict[str, int] | None:
         """COUNT перехватов по корню расширения (index-side, дёшево).
 
@@ -9734,6 +10177,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(dict)
     def get_overrides_for_path(self, rel_path: str) -> dict[str, list[dict]]:
         """Get all overrides for a module by source_path, grouped by target_method.
 
@@ -9789,6 +10233,7 @@ class IndexReader:
                 result.setdefault(key, []).append(d)
             return result
 
+    @_transient_safe(lambda: None)
     def get_form_elements(
         self,
         object_name: str = "",
@@ -9822,6 +10267,7 @@ class IndexReader:
             except sqlite3.OperationalError:
                 return None
 
+    @_transient_safe(lambda: None)
     def get_object_attributes(
         self,
         attr_name: str = "",
@@ -9882,6 +10328,7 @@ class IndexReader:
                 )
             return results
 
+    @_transient_safe(lambda: None)
     def get_predefined_items(
         self,
         item_name: str = "",
@@ -9957,6 +10404,7 @@ class IndexReader:
         "predefined_characteristic_type": 17,
     }
 
+    @_transient_safe(lambda: None)
     def find_metadata_references(
         self,
         ref_object: str,
@@ -10015,6 +10463,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def find_metadata_refs_from(
         self,
         source_object: str,
@@ -10074,6 +10523,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def count_metadata_references(
         self,
         ref_object: str,
@@ -10099,6 +10549,7 @@ class IndexReader:
             by_kind = {r["ref_kind"]: r["cnt"] for r in rows}
             return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
+    @_transient_safe(lambda: None)
     def find_code_usages(
         self,
         object_ref: str,
@@ -10155,6 +10606,7 @@ class IndexReader:
                 for r in rows
             ]
 
+    @_transient_safe(lambda: None)
     def count_code_usages(
         self,
         object_ref: str,
@@ -10179,6 +10631,7 @@ class IndexReader:
             by_kind = {r["usage_kind"]: r["cnt"] for r in rows}
             return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
+    @_transient_safe(lambda: None)
     def find_defined_type(self, name: str) -> dict | None:
         """Look up a DefinedType by name. Returns {name, types: list[str], path}
         or None if table missing or not found."""

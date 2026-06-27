@@ -120,12 +120,28 @@ def _cmd_build(args: argparse.Namespace) -> None:
         sys.exit(1)
     elapsed = time.time() - t0
 
-    # Read back stats
-    from rlm_tools_bsl.bsl_index import IndexReader
+    # Read back stats — explicit marker check (codex round 18: don't rely on the
+    # defensive wrapper turning a partial build into a "successful" zero-stats print).
+    from rlm_tools_bsl.bsl_index import IndexReader, index_incomplete, stats_indicate_load_failure
+
+    def _print_incomplete() -> None:
+        print(f"\nIndex build did NOT finish cleanly in {elapsed:.1f}s — index is incomplete.")
+        print("  Status:   incomplete/building — rebuild required")
+        print(f"  DB path:  {db_path}")
+
+    if index_incomplete(db_path):
+        _print_incomplete()
+        return
 
     reader = IndexReader(db_path)
     stats = reader.get_statistics()
     reader.close()
+    # Post-read recheck (codex High follow-up): a concurrent rebuild may set the marker
+    # DURING get_statistics; in the [empty tables + stale meta] window
+    # stats_indicate_load_failure is False, so re-check the marker too (mirror rlm_start).
+    if index_incomplete(db_path) or stats_indicate_load_failure(stats):
+        _print_incomplete()
+        return
 
     db_size = db_path.stat().st_size if db_path.exists() else 0
 
@@ -187,12 +203,26 @@ def _cmd_update(args: argparse.Namespace) -> None:
         sys.exit(1)
     elapsed = time.time() - t0
 
-    # Read back stats
-    from rlm_tools_bsl.bsl_index import IndexReader
+    # Read back stats — explicit marker check (codex round 18).
+    from rlm_tools_bsl.bsl_index import IndexReader, index_incomplete, stats_indicate_load_failure
+
+    def _print_incomplete() -> None:
+        print(f"\nUpdate did NOT finish cleanly in {elapsed:.1f}s — index is incomplete.")
+        print("  Status:  incomplete/building — rebuild required")
+
+    if index_incomplete(db_path):
+        _print_incomplete()
+        return
 
     reader = IndexReader(db_path)
     stats = reader.get_statistics()
     reader.close()
+    # Post-read recheck (codex High follow-up): a concurrent rebuild may set the marker
+    # DURING get_statistics; stats_indicate_load_failure misses the [empty + stale meta]
+    # window, so re-check the marker too (mirror rlm_start).
+    if index_incomplete(db_path) or stats_indicate_load_failure(stats):
+        _print_incomplete()
+        return
 
     print(f"\nUpdated in {elapsed:.1f}s")
     print(f"  Added:   {delta['added']}")
@@ -217,6 +247,8 @@ def _cmd_info(args: argparse.Namespace) -> None:
         IndexStatus,
         check_index_strict,
         get_index_db_path,
+        index_incomplete,
+        stats_indicate_load_failure,
     )
     from rlm_tools_bsl.cache import _paths_hash
 
@@ -228,9 +260,22 @@ def _cmd_info(args: argparse.Namespace) -> None:
         print(f"Index not found: {db_path}")
         sys.exit(0)
 
+    # Incomplete in-place build → report it without opening get_statistics on a partial DB.
+    if index_incomplete(db_path):
+        print(f"Index: {db_path}")
+        print("  Status:   incomplete/building — rebuild required")
+        return
+
     reader = IndexReader(db_path)
     stats = reader.get_statistics()
     reader.close()
+    # Post-read recheck (codex High follow-up): a concurrent rebuild may set the marker
+    # DURING get_statistics; in the [empty tables + stale meta] window
+    # stats_indicate_load_failure is False, so re-check the marker too (mirror rlm_start).
+    if index_incomplete(db_path) or stats_indicate_load_failure(stats):
+        print(f"Index: {db_path}")
+        print("  Status:   incomplete/building — rebuild required")
+        return
 
     db_size = db_path.stat().st_size
 

@@ -92,6 +92,112 @@ def _make_bsl_fixture(tmpdir):
     return bsl, helpers
 
 
+# --- Finding #3 (v1.26.0): multiline literals → no false callers in FS-fallback ---
+
+
+def _make_cold_bsl_for_callers(tmpdir, modules):
+    """Cold (no-index) BSL session с заданными CommonModule-исходниками → форсит
+    find_callers FS-fallback. modules: {object_name: bsl_source}."""
+    for obj_name, src in modules.items():
+        mod_dir = os.path.join(tmpdir, "CommonModules", obj_name, "Ext")
+        os.makedirs(mod_dir)
+        with open(os.path.join(mod_dir, "Module.bsl"), "w", encoding="utf-8") as f:
+            f.write(src)
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+    helpers, resolve_safe = make_helpers(tmpdir)
+    format_info = detect_format(tmpdir)
+    return make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=format_info,
+    )
+
+
+# Текст «вызова» ЦелеваяПроцедура(...) спрятан ВНУТРИ многострочного строкового
+# литерала запроса (строки с | — продолжение строки, открытой `"ВЫБРАТЬ`).
+_MULTILINE_LITERAL_MODULE = """\
+Процедура СформироватьЗапрос() Экспорт
+\tЗапрос = Новый Запрос;
+\tЗапрос.Текст = "ВЫБРАТЬ
+\t|\tТаблица.Ссылка
+\t|ИЗ
+\t|\tСправочник.Номенклатура КАК Таблица
+\t|ГДЕ
+\t|\tЦелеваяПроцедура(Таблица.Ссылка)";
+\tРезультат = Запрос.Выполнить();
+КонецПроцедуры
+"""
+
+# Настоящий вызов в коде — на ПЕРВОЙ строке тела процедуры (регресс + off-by-one guard).
+_REAL_CALL_MODULE = """\
+Процедура ВызватьЦелевую() Экспорт
+\tЦелеваяПроцедура(Параметр);
+КонецПроцедуры
+"""
+
+
+def test_fs_fallback_ignores_multiline_literal():
+    """Finding #3: текст «вызова» внутри многострочного строкового литерала
+    (запроса) НЕ должен давать ложного caller на FS-fallback (multiline-aware
+    _scan_module видит, что строка — содержимое литерала, а не код)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl = _make_cold_bsl_for_callers(tmpdir, {"МодульСЗапросом": _MULTILINE_LITERAL_MODULE})
+        results = bsl["find_callers"]("ЦелеваяПроцедура")
+        assert results == []
+
+
+def test_fs_fallback_finds_real_call():
+    """Регресс-якорь + off-by-one guard: настоящий вызов на первой строке тела
+    процедуры по-прежнему находится (scan_dict[line_idx + 1], не [line_idx])."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl = _make_cold_bsl_for_callers(tmpdir, {"МодульСВызовом": _REAL_CALL_MODULE})
+        results = bsl["find_callers"]("ЦелеваяПроцедура")
+        assert len(results) >= 1
+
+
+def test_helper_on_partial_index_degrades(tmp_path, monkeypatch):
+    """Finding #1d (helper-level, not only reader-level): a hot-path helper
+    (extract_procedures) on a reader whose tables were dropped mid-rebuild does NOT
+    crash — it degrades to the live fallback (parses the .bsl file)."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader, get_index_db_path
+
+    tmpdir = str(tmp_path)
+    _create_cf_fixture(tmpdir)
+    monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+    IndexBuilder().build(tmpdir, build_calls=False)
+    db_path = get_index_db_path(tmpdir)
+    reader = IndexReader(db_path)
+    try:
+        # simulate mid-rebuild: drop core tables under the open reader
+        w = sqlite3.connect(str(db_path))
+        w.execute("DROP TABLE IF EXISTS methods")
+        w.execute("DROP TABLE IF EXISTS modules")
+        w.commit()
+        w.close()
+
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,
+            idx_reader=reader,
+        )
+        # idx_reader.get_methods_by_path → None sentinel → live fallback (no crash).
+        procs = bsl["extract_procedures"]("CommonModules/МойМодуль/Ext/Module.bsl")
+        assert isinstance(procs, list)
+        assert "ЗаполнитьДанные" in [p["name"] for p in procs]
+    finally:
+        reader.close()
+
+
 # --- find_module ---
 
 
@@ -187,6 +293,27 @@ def test_find_exports(bsl_env):
 
 
 def test_safe_grep_with_hint(bsl_env):
+    results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")
+    assert len(results) >= 1
+
+
+def test_safe_grep_rejects_catastrophic(bsl_env):
+    """Finding #2 (v1.26.0): safe_grep отклоняет catastrophic-паттерны ValueError'ом."""
+    for pat in ("(a+)+b", "(a*)*", r"(\d+)+$", "((ab)+)+"):
+        with pytest.raises(ValueError):
+            bsl_env.bsl["safe_grep"](pat)
+
+
+def test_safe_grep_bad_pattern_no_index_warmup(bsl_env):
+    """Guard — самое первое действие safe_grep: на сессии без индекса bad-pattern
+    мгновенно даёт ValueError (не [], не прогрев индекса, не зависание; _grep_one
+    глотает Exception, поэтому полагаться на guard внутри grep_fn нельзя)."""
+    with pytest.raises(ValueError):
+        bsl_env.bsl["safe_grep"]("(a+)+b", name_hint="АвансовыйОтчет")
+
+
+def test_safe_grep_literal_unaffected(bsl_env):
+    """Литералы (в т.ч. git fast-path) guard'ом не затронуты."""
     results = bsl_env.bsl["safe_grep"]("ЗаполнитьДанные", name_hint="АвансовыйОтчет")
     assert len(results) >= 1
 
@@ -519,6 +646,38 @@ def test_parse_register_xml():
     assert result["resources"][0]["name"] == "Количество"
 
 
+# --- Finding #5 (v1.26.0): parse_metadata_xml error contract (dict | None) ---
+
+
+def test_parse_metadata_xml_malformed_returns_none():
+    """Битый / пустой / whitespace / не-XML контент → None (контракт сиблинга
+    parse_form_xml), а не ET.ParseError."""
+    assert parse_metadata_xml("<MetaDataObject><Catalog><unclosed>") is None
+    assert parse_metadata_xml("") is None
+    assert parse_metadata_xml("   \n\t ") is None
+    assert parse_metadata_xml("not xml at all") is None
+
+
+def test_parse_metadata_xml_nonparse_error_propagates(monkeypatch):
+    """Контракт «только ParseError→None»: не-ParseError НЕ проглатывается в None,
+    а пробрасывается к callsite-обёрткам (защита от ошибочного `except Exception`)."""
+    import rlm_tools_bsl.bsl_xml_parsers as bxp
+
+    def _boom(_content):
+        raise ValueError("non-parse failure")
+
+    monkeypatch.setattr(bxp.ET, "fromstring", _boom)
+    with pytest.raises(ValueError):
+        bxp.parse_metadata_xml(CATALOG_XML)
+
+
+def test_parse_metadata_xml_valid_unchanged():
+    """Регресс-якорь: валидный CF-XML по-прежнему парсится в dict."""
+    result = parse_metadata_xml(CATALOG_XML)
+    assert isinstance(result, dict)
+    assert result["name"] == "ВидыСпецодежды"
+
+
 def test_parse_object_xml_via_sandbox():
     """Test parse_object_xml as registered in sandbox helpers."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -570,6 +729,31 @@ def test_parse_object_xml_directory_path():
         result = bsl["parse_object_xml"]("Documents/АвансовыйОтчет")
         assert "name" in result
         assert result["name"] == "ВидыСпецодежды"  # from CATALOG_XML fixture
+
+
+def test_parse_object_xml_malformed_raises():
+    """Finding #5 п.4: agent-facing parse_object_xml на битом metadata XML
+    даёт ИСКЛЮЧЕНИЕ (а не None) — иначе консьюмеры (analyze_object,
+    find_custom_modifications) молча получат None вместо ловимого исключения."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _create_cf_fixture(tmpdir)
+        xml_dir = os.path.join(tmpdir, "Catalogs", "БитыйОбъект")
+        os.makedirs(xml_dir)
+        with open(os.path.join(xml_dir, "БитыйОбъект.xml"), "w", encoding="utf-8") as f:
+            f.write("<MetaDataObject><Catalog><unclosed>")
+
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,
+        )
+        with pytest.raises(ValueError):
+            bsl["parse_object_xml"]("Catalogs/БитыйОбъект/БитыйОбъект.xml")
 
 
 # --- MDO format tests ---
@@ -2517,6 +2701,37 @@ class TestGetIndexInfoNewFields:
             assert info["object_attributes_count"] >= 2
             assert info["predefined_items_count"] >= 2
             reader.close()
+
+    def test_post_read_marker_recheck(self, monkeypatch):
+        """get_index_info: a rebuild that sets build_in_progress=1 AFTER the pre-read
+        check but DURING get_statistics must NOT be reported as status:'ok'. In that
+        window stale meta is not yet cleared (built_at/builder_version still present), so
+        stats_indicate_load_failure stays False — only a post-read index_incomplete
+        recheck catches it, mirroring rlm_start (codex High follow-up)."""
+        import sqlite3
+
+        from rlm_tools_bsl.bsl_index import IndexReader, get_index_db_path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bsl, reader = _make_indexed_fixture(tmpdir)
+            db_path = get_index_db_path(tmpdir)
+
+            orig = IndexReader.get_statistics
+
+            def spy(self):
+                # The rebuild's marker becomes visible during the stats read (window opens).
+                w = sqlite3.connect(str(db_path))
+                w.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+                w.commit()
+                w.close()
+                return orig(self)
+
+            monkeypatch.setattr(IndexReader, "get_statistics", spy)
+            try:
+                info = bsl["get_index_info"]()
+            finally:
+                reader.close()
+            assert info["status"] == "incomplete"
 
 
 class TestSearchSynonymPath:

@@ -49,10 +49,21 @@ from rlm_tools_bsl.bsl_index import (
     IndexStatus,
     check_index_usable,
     get_index_db_path,
+    index_incomplete,
+    stats_indicate_load_failure,
 )
 from rlm_tools_bsl.sandbox import HelperCall
 
 logging.basicConfig(level=logging.INFO, encoding="utf-8")
+
+# rlm_start.index "index_status" — stable machine-readable contract (codex round 16/22/24):
+# explicit IndexStatus→string map (FRESH.value is "fresh", we expose "ok" to mirror
+# get_index_info.status); plain STALE/MISSING → "missing"; incomplete handled separately.
+_INDEX_STATUS_LABELS = {
+    IndexStatus.FRESH: "ok",
+    IndexStatus.STALE_AGE: "stale_age",
+    IndexStatus.STALE_CONTENT: "stale_content",
+}
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
@@ -400,8 +411,15 @@ def _rlm_start(
         idx_warnings: list[str] = []
         idx_stats: dict | None = None
         idx_status = None
+        # True when a reader was opened but its stats came back as a zero/load-failure
+        # sentinel (transient read of an EXISTING db mid-rebuild). Lets the no-stats branch
+        # report "incomplete" (retry) rather than "missing" even if the marker was already
+        # cleared by a finishing rebuild (codex Low).
+        idx_load_failed = False
+        # Computed BEFORE the try (round 27): the no-stats index_block branch below uses
+        # db_path for index_incomplete(); get_index_db_path is a pure path construction.
+        db_path = get_index_db_path(resolved)
         try:
-            db_path = get_index_db_path(resolved)
             if db_path.exists():
                 idx_status = check_index_usable(db_path, resolved)
                 logger.info(
@@ -414,25 +432,43 @@ def _rlm_start(
                 if idx_status in (IndexStatus.FRESH, IndexStatus.STALE_AGE, IndexStatus.STALE_CONTENT):
                     idx_reader = IndexReader(db_path)
                     idx_stats = idx_reader.get_statistics()
-                    if idx_status == IndexStatus.STALE_AGE:
-                        built_at = idx_stats.get("built_at")
-                        age_days = int((time.time() - float(built_at)) / 86400) if built_at else "?"
-                        idx_warnings.append(
-                            f"Index is {age_days} days old — verify critical findings with live read_file()"
-                        )
-                    elif idx_status == IndexStatus.STALE_CONTENT:
-                        idx_warnings.append(
-                            "Index content may be outdated — run 'rlm-bsl-index index update' to refresh"
-                        )
-                    # Check index builder version
-                    idx_version = int(idx_stats.get("builder_version") or 0)
-                    if idx_version < BUILDER_VERSION:
-                        msg = (
-                            f"Index built with v{idx_version}, current v{BUILDER_VERSION} — "
-                            f'new helpers available after rebuild: rlm-bsl-index index build "{resolved}"'
-                        )
-                        idx_warnings.append(msg)
-                        logger.warning("rlm_start: session=%s %s", session_id, msg)
+                    # Race guard (codex High): a rebuild may have set build_in_progress=1 and
+                    # dropped tables between check_index_usable() above and now. get_statistics
+                    # is _transient_safe → it returns ZERO_STATS (a TRUTHY dict), NOT an
+                    # exception, so the loaded index_block branch would mislabel a partial
+                    # index as loaded:true / index_status:"ok". Detect it two ways: the marker
+                    # (build_in_progress=1) AND the timing-independent zero/load-failure
+                    # sentinel (builder_version+built_at both None — the marker may have been
+                    # cleared by a finishing rebuild before this check). Either → not-loaded →
+                    # the no-stats branch reports loaded:false, index_status:"incomplete"/"missing".
+                    if index_incomplete(db_path) or stats_indicate_load_failure(idx_stats):
+                        try:
+                            idx_reader.close()
+                        except Exception:
+                            pass
+                        idx_reader = None
+                        idx_stats = None
+                        idx_load_failed = True  # existing db, transient/partial read → "incomplete"
+                    else:
+                        if idx_status == IndexStatus.STALE_AGE:
+                            built_at = idx_stats.get("built_at")
+                            age_days = int((time.time() - float(built_at)) / 86400) if built_at else "?"
+                            idx_warnings.append(
+                                f"Index is {age_days} days old — verify critical findings with live read_file()"
+                            )
+                        elif idx_status == IndexStatus.STALE_CONTENT:
+                            idx_warnings.append(
+                                "Index content may be outdated — run 'rlm-bsl-index index update' to refresh"
+                            )
+                        # Check index builder version
+                        idx_version = int(idx_stats.get("builder_version") or 0)
+                        if idx_version < BUILDER_VERSION:
+                            msg = (
+                                f"Index built with v{idx_version}, current v{BUILDER_VERSION} — "
+                                f'new helpers available after rebuild: rlm-bsl-index index build "{resolved}"'
+                            )
+                            idx_warnings.append(msg)
+                            logger.warning("rlm_start: session=%s %s", session_id, msg)
         except Exception as e:
             if idx_reader is not None:
                 try:
@@ -669,6 +705,9 @@ def _rlm_start(
             "metadata_code_usages_count": idx_stats.get("metadata_code_usages", 0),
             "config_name": idx_stats.get("config_name"),
             "config_version": idx_stats.get("config_version"),
+            # Reader loaded → map the freshness status (FRESH→"ok"). The with-stats branch
+            # is only reached for FRESH/STALE_AGE/STALE_CONTENT, so .get default is unused.
+            "index_status": _INDEX_STATUS_LABELS.get(idx_status, "ok"),
             "warnings": idx_warnings,
         }
     else:
@@ -696,6 +735,14 @@ def _rlm_start(
             "metadata_code_usages_count": 0,
             "config_name": None,
             "config_version": None,
+            # No reader: derive DIRECTLY (round 21/27) — NOT from a possibly-stale
+            # idx_status. "incomplete" when build_in_progress=1 (reachable here both via
+            # MISSING and the FRESH-but-reader-failed edge) OR when a reader was opened but
+            # its stats were a transient zero/load-failure of an EXISTING db (idx_load_failed
+            # — the marker may already be cleared by a finishing rebuild, so "missing" would
+            # lie; "incomplete" signals retry — codex Low). Else "missing". index_incomplete
+            # is None-safe → a non-existent db yields "missing".
+            "index_status": "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing",
             "warnings": idx_warnings,
         }
 
@@ -2020,6 +2067,22 @@ def _rlm_index(
             db_path = get_index_db_path(resolved)
             if not db_path.exists():
                 return json.dumps({"error": "Index not found", "path": resolved}, ensure_ascii=False)
+            # Incomplete in-place build → report incomplete WITHOUT get_statistics (its
+            # first COUNT(*) FROM modules/methods would hit the DROP→CREATE window).
+            if index_incomplete(db_path):
+                result = {
+                    "action": "info",
+                    "path": resolved,
+                    "build_status": "incomplete",
+                }
+                if resolved_project_name:
+                    result["project"] = resolved_project_name
+                # Don't hide the real failure cause (codex round 11): if the job errored,
+                # surface build_error/build_finished_at next to the incomplete marker.
+                if job and job["status"] == "error":
+                    result["build_error"] = job["error"]
+                    result["build_finished_at"] = job["finished_at"]
+                return json.dumps(result, ensure_ascii=False)
             try:
                 touch_project_cache(resolved)
             except Exception as exc:
@@ -2027,6 +2090,21 @@ def _rlm_index(
             reader = IndexReader(str(db_path))
             try:
                 stats = reader.get_statistics()
+                # Race guard (codex High): get_statistics is _transient_safe → during a
+                # concurrent rebuild's DROP window it returns a zero/load-failure sentinel
+                # (not an exception). Re-check the marker too (not just the stats sentinel):
+                # in the [empty tables + stale meta still present] sub-window of
+                # _begin_inplace_rebuild, built_at/builder_version are NOT yet cleared so
+                # stats_indicate_load_failure is False — the marker is the only signal.
+                # Mirror rlm_start's combined post-read check. Don't emit a payload of zeros.
+                if index_incomplete(db_path) or stats_indicate_load_failure(stats):
+                    result = {"action": "info", "path": resolved, "build_status": "incomplete"}
+                    if resolved_project_name:
+                        result["project"] = resolved_project_name
+                    if job and job["status"] == "error":
+                        result["build_error"] = job["error"]
+                        result["build_finished_at"] = job["finished_at"]
+                    return json.dumps(result, ensure_ascii=False)
                 result = {"action": "info", "path": resolved, **stats}
                 if resolved_project_name:
                     result["project"] = resolved_project_name

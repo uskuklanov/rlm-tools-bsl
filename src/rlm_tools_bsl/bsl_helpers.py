@@ -17,9 +17,10 @@ from rlm_tools_bsl.bsl_knowledge import (
     _normalize_method_params,
     _split_params,
 )
-from rlm_tools_bsl.bsl_index import _make_callee_key
+from rlm_tools_bsl.bsl_index import _make_callee_key, _scan_module
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import _SKIP_DIRS as _GENERIC_SKIP_DIRS
+from rlm_tools_bsl.regex_safety import NESTED_QUANTIFIER_ERROR, has_catastrophic_nesting
 
 logger = logging.getLogger(__name__)
 from rlm_tools_bsl.bsl_xml_parsers import (
@@ -496,18 +497,24 @@ def make_bsl_helpers(
         if idx_reader is not None:
             try:
                 rows = idx_reader.get_all_modules()
-                for r in rows:
-                    info = BslFileInfo(
-                        relative_path=r["rel_path"],
-                        category=r["category"],
-                        object_name=r["object_name"],
-                        module_type=r["module_type"],
-                        form_name=r["form_name"],
-                        command_name=None,
-                        is_form_module=bool(r["form_name"]),
-                    )
-                    _index_state.append((r["rel_path"], info))
-                return
+                # rows is None ⇒ no `modules` table (e.g. mid in-place rebuild) → fall
+                # through to the glob/cache fallback below. rows == [] is a VALID empty
+                # index → populate nothing and return (NOT a fallback trigger). Explicit
+                # (round 24) so the two cases are distinguished here, not via an implicit
+                # None→TypeError caught by the broad except.
+                if rows is not None:
+                    for r in rows:
+                        info = BslFileInfo(
+                            relative_path=r["rel_path"],
+                            category=r["category"],
+                            object_name=r["object_name"],
+                            module_type=r["module_type"],
+                            form_name=r["form_name"],
+                            command_name=None,
+                            is_form_module=bool(r["form_name"]),
+                        )
+                        _index_state.append((r["rel_path"], info))
+                    return
             except Exception:
                 pass  # fallback to glob
 
@@ -1061,7 +1068,7 @@ def make_bsl_helpers(
         return [p for p in extract_procedures(path) if p["is_export"]]
 
     def safe_grep(pattern: str, name_hint: str = "", max_files: int = 20) -> list[dict]:
-        """Timeout-safe grep across BSL files, optionally scoped by module name hint.
+        r"""Parallel grep across BSL files, optionally scoped by module name hint.
 
         Contract is unchanged: returns ``[{file, line, text}]`` (no sentinel, no
         result cap — scope is bounded by *max_files* candidates). When the sources
@@ -1072,7 +1079,23 @@ def make_bsl_helpers(
         ``-E`` is POSIX ERE, not equivalent to Python ``re``), and extension files
         always use the Python path (they live outside the sandbox base, which
         ``git -C base`` would not see).
+
+        **Regex guard (v1.26.0, Finding #2):** входной *pattern* проверяется на
+        вложенные неограниченные кванторы (``(a+)+b`` и т.п.) ПЕРВЫМ действием —
+        такие паттерны вызывают catastrophic backtracking в C-движке ``_sre``,
+        который таймаут песочницы (``PyThreadState_SetAsyncExc``) не прерывает.
+        При срабатывании — ``ValueError`` с подсказкой (литерал / ``name_hint``).
+        Guard отклоняет и «невинно выглядящие» перекрывающиеся паттерны
+        (``(\w+\s*)+``) — это ожидаемо (реальный ReDoS), не баг. Это отсечение
+        ЯВНЫХ exponential-паттернов по структуре, НЕ полноценный wall-clock-kill
+        (для него нужна процессная изоляция); ``Timeout-safe`` это ранее обещал
+        ложно. Литералы (git fast-path) guard'ом не затрагиваются.
         """
+        # Guard ПЕРВЫМ действием — до _ensure_index/find_module/выбора файлов/
+        # git-literal fast-path/thread-pool. _grep_one глотает Exception (см. ниже),
+        # поэтому полагаться на guard внутри grep_fn нельзя.
+        if has_catastrophic_nesting(pattern):
+            raise ValueError(NESTED_QUANTIFIER_ERROR)
         _ensure_index()
 
         if name_hint:
@@ -1382,19 +1405,6 @@ def make_bsl_helpers(
                     matched.append(result)
         return matched
 
-    # --- Regex for stripping comments and string literals ---
-    _re_string_literal = re.compile(r'"[^"\r\n]*"')
-
-    def _strip_code_line(line: str) -> str:
-        """Remove comments and string literals from a BSL code line."""
-        # Strip string literals first (so "//" inside strings is not treated as comment)
-        line = _re_string_literal.sub("", line)
-        # Strip comment (// with or without space)
-        ci = line.find("//")
-        if ci >= 0:
-            line = line[:ci]
-        return line
-
     def _find_callers_context_one(
         proc_name: str,
         module_hint: str = "",
@@ -1561,6 +1571,13 @@ def make_bsl_helpers(
                 lines = content.splitlines()
                 procs = extract_procedures(rel)
 
+                # Finding #3 (v1.26.0): multiline-aware очистка через _scan_module —
+                # содержимое многострочных строковых литералов (тексты запросов с |)
+                # больше НЕ даёт ложных callers (DRY с индексером). _scan_module
+                # нумерует строки 1-based, поэтому для lines[line_idx] (0-based) ключ
+                # scan_dict[line_idx + 1].
+                scan_dict = {lineno: code for lineno, code, _strings in _scan_module(lines)}
+
                 for proc in procs:
                     # Skip the definition line itself
                     body_start = proc["line"]  # 1-based, this is the def line
@@ -1570,7 +1587,7 @@ def make_bsl_helpers(
                         if line_idx >= len(lines):
                             break
                         raw_line = lines[line_idx]
-                        cleaned = _strip_code_line(raw_line)
+                        cleaned = scan_dict.get(line_idx + 1, "")
                         if not cleaned.strip():
                             continue
 
@@ -2682,6 +2699,12 @@ def make_bsl_helpers(
         resolved = _resolve_object_xml(path)
         content = _ext_read_file(resolved)
         parsed = parse_metadata_xml(content)
+        # Finding #5 (v1.26.0): parse_metadata_xml теперь возвращает None на битом
+        # XML (раньше бросал ET.ParseError). Agent-facing контракт parse_object_xml
+        # — исключение на битом XML (его ловят analyze_object/find_custom_modifications
+        # через except Exception). Воспроизводим факт «raise», тип меняется на ValueError.
+        if parsed is None:
+            raise ValueError(f"malformed metadata XML: {resolved}")
         # v1.18.0 Фикс 1: атрибутные записи толерантны к диалекту ключей
         # (name <-> attr_name). Оборачиваем ТОЛЬКО вложенные записи, не сам
         # верхний dict (его internal-консьюмеры проверяют isinstance(..., dict)).
@@ -6568,7 +6591,27 @@ def make_bsl_helpers(
         """Return index metadata: version, capabilities, staleness."""
         if idx_reader is None:
             return {"status": "no_index"}
+        # An in-place rebuild leaves build_in_progress=1; reporting status:"ok" with zeros
+        # would be a lie ("index empty and ok"). get_index_db_path is NOT imported at the
+        # bsl_helpers top level → local import (mirrors _git_grep usage elsewhere).
+        from rlm_tools_bsl.bsl_index import (
+            get_index_db_path,
+            index_incomplete,
+            stats_indicate_load_failure,
+        )
+
+        db_path = get_index_db_path(base_path)
+        if index_incomplete(db_path):
+            return {"status": "incomplete"}
         stats = idx_reader.get_statistics()
+        # Race guard (codex High): get_statistics is _transient_safe → a concurrent rebuild's
+        # DROP window yields a zero/load-failure sentinel (not an exception). Re-check the
+        # marker too (not just the stats sentinel): in the [empty tables + stale meta still
+        # present] sub-window of _begin_inplace_rebuild, built_at/builder_version are NOT yet
+        # cleared so stats_indicate_load_failure is False — the marker is the only signal.
+        # Mirror rlm_start's combined post-read check. Don't report status:"ok" with zeros.
+        if index_incomplete(db_path) or stats_indicate_load_failure(stats):
+            return {"status": "incomplete"}
         builder = int(stats.get("builder_version") or 0)
         return {
             "status": "ok",

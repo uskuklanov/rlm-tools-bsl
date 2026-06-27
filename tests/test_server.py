@@ -132,8 +132,10 @@ def test_rlm_start_index_block_carries_discovery_fields(monkeypatch):
         try:
             idx = result["index"]
             assert idx["loaded"] is True
+            assert idx["index_status"] == "ok"  # v1.26.0: FRESH→"ok" mapping
             assert isinstance(idx["builder_version"], int) and idx["builder_version"] >= 11
             for key in (
+                "index_status",
                 "has_synonyms",
                 "object_synonyms",
                 "has_object_attributes",
@@ -166,8 +168,10 @@ def test_rlm_start_index_block_shape_consistent_without_index(monkeypatch):
         try:
             idx = result["index"]
             assert idx["loaded"] is False
+            assert idx["index_status"] == "missing"  # v1.26.0: no index → "missing"
             # SAME discovery keys as the with-index branch, with safe defaults
             for key in (
+                "index_status",
                 "builder_version",
                 "has_synonyms",
                 "object_synonyms",
@@ -188,6 +192,219 @@ def test_rlm_start_index_block_shape_consistent_without_index(monkeypatch):
             assert idx["object_attributes_count"] == 0
         finally:
             _rlm_end(result["session_id"])
+
+
+def test_rlm_start_index_block_key_set_parity(monkeypatch):
+    """Full shape parity (codex round 24 — closes a long-standing gap): the index block
+    exposes the EXACT SAME key set whether an index is loaded or not, so an agent reading
+    any discovery key never KeyErrors across the two branches. The subset 'key in idx'
+    checks above miss drift in UNLISTED keys; this set-equality assert catches any."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder
+
+    with tempfile.TemporaryDirectory() as raw_a, tempfile.TemporaryDirectory() as raw_b:
+        # --- loaded branch (built index) ---
+        loaded_dir = _canonicalize_path(raw_a)
+        obj = os.path.join(loaded_dir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(loaded_dir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(loaded_dir, ".idx"))
+        IndexBuilder().build(loaded_dir, build_calls=False, build_metadata=True)
+        loaded = json.loads(_rlm_start(path=loaded_dir, query="parity loaded"))
+
+        # --- no-index branch (plain dir) ---
+        noindex_dir = _canonicalize_path(raw_b)
+        with open(os.path.join(noindex_dir, "example.py"), "w") as f:
+            f.write("def f():\n    return 1\n")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(noindex_dir, ".empty_idx"))
+        noidx = json.loads(_rlm_start(path=noindex_dir, query="parity no-index"))
+
+        try:
+            assert loaded["index"]["loaded"] is True
+            assert noidx["index"]["loaded"] is False
+            loaded_keys, noidx_keys = set(loaded["index"]), set(noidx["index"])
+            assert loaded_keys == noidx_keys, (
+                "index block key set drifted between loaded and no-index branches: "
+                f"loaded-only={loaded_keys - noidx_keys}, no-index-only={noidx_keys - loaded_keys}"
+            )
+        finally:
+            _rlm_end(loaded["session_id"])
+            _rlm_end(noidx["session_id"])
+
+
+def test_rlm_start_index_block_incomplete(monkeypatch):
+    """An index left mid-rebuild (build_in_progress=1) is NOT loaded by rlm_start;
+    index_status == 'incomplete' and loaded is False (v1.26.0, Finding #1)."""
+    import sqlite3
+
+    from rlm_tools_bsl.bsl_index import IndexBuilder, get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        tmpdir = _canonicalize_path(raw_tmpdir)
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+
+        db_path = get_index_db_path(tmpdir)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+        conn.commit()
+        conn.close()
+
+        result = json.loads(_rlm_start(path=tmpdir, query="incomplete index"))
+        try:
+            idx = result["index"]
+            assert idx["loaded"] is False
+            assert idx["index_status"] == "incomplete"
+        finally:
+            _rlm_end(result["session_id"])
+
+
+def test_rlm_start_index_block_incomplete_race(monkeypatch):
+    """Race guard (codex High): check_index_usable returns FRESH (a rebuild set
+    build_in_progress=1 AFTER the check), but get_statistics is _transient_safe and
+    returns a truthy dict, NOT an exception. rlm_start must still detect the marker and
+    report loaded:false / index_status:"incomplete" — not "ok"."""
+    import sqlite3
+
+    import rlm_tools_bsl.server as srv
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexStatus, get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        tmpdir = _canonicalize_path(raw_tmpdir)
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+
+        db_path = get_index_db_path(tmpdir)
+        # Simulate the race: marker set AFTER the (here bypassed) usable-check.
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+        conn.commit()
+        conn.close()
+        # Force check_index_usable to report FRESH (it ran before the marker was set).
+        monkeypatch.setattr(srv, "check_index_usable", lambda *a, **k: IndexStatus.FRESH)
+
+        result = json.loads(srv._rlm_start(path=tmpdir, query="race"))
+        try:
+            idx = result["index"]
+            assert idx["loaded"] is False
+            assert idx["index_status"] == "incomplete"
+        finally:
+            srv._rlm_end(result["session_id"])
+
+
+def test_rlm_start_zero_stats_not_reported_ok(monkeypatch):
+    """Race guard (codex High, timing-independent): if get_statistics returns the
+    zero/load-failure sentinel (a finishing rebuild may have cleared the marker before a
+    re-check), rlm_start must NOT report loaded:true / index_status:"ok" with zero counts."""
+    import rlm_tools_bsl.server as srv
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader, _zero_stats
+
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        tmpdir = _canonicalize_path(raw_tmpdir)
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+
+        # No marker set (rebuild "finished"), but the reader read during the DROP window →
+        # get_statistics returns the zero-sentinel. index_incomplete() would be False here,
+        # so only the stats-based discriminator can catch it.
+        monkeypatch.setattr(IndexReader, "get_statistics", lambda self: _zero_stats())
+
+        result = json.loads(srv._rlm_start(path=tmpdir, query="zerostats"))
+        try:
+            idx = result["index"]
+            assert idx["loaded"] is False
+            # marker not set (rebuild "finished") but the read was a transient zero of an
+            # EXISTING db → "incomplete" (retry), NOT "ok" and NOT "missing" (codex Low).
+            assert idx["index_status"] == "incomplete"
+        finally:
+            srv._rlm_end(result["session_id"])
+
+
+def test_rlm_index_info_incomplete(monkeypatch):
+    """MCP rlm_index(action='info') reports build_status:'incomplete' for a marked index
+    (does NOT open get_statistics on a partial DB)."""
+    import sqlite3
+
+    from rlm_tools_bsl.bsl_index import IndexBuilder, get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        tmpdir = _canonicalize_path(raw_tmpdir)
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+
+        db_path = get_index_db_path(tmpdir)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+        conn.commit()
+        conn.close()
+
+        res = json.loads(_rlm_index(action="info", path=tmpdir))
+        assert res.get("build_status") == "incomplete"
+
+
+def test_rlm_index_info_post_read_marker_recheck(monkeypatch):
+    """MCP rlm_index info: a rebuild setting build_in_progress=1 DURING get_statistics
+    (after the pre-read marker check) must report build_status:'incomplete', not a normal
+    payload. stats_indicate_load_failure is False here (stale meta still present), so only a
+    post-read index_incomplete recheck catches it (codex High follow-up)."""
+    import sqlite3
+
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader, get_index_db_path
+
+    with tempfile.TemporaryDirectory() as raw_tmpdir:
+        tmpdir = _canonicalize_path(raw_tmpdir)
+        obj = os.path.join(tmpdir, "Documents", "X", "Ext")
+        os.makedirs(obj)
+        with open(os.path.join(obj, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+            f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+        monkeypatch.setenv("RLM_INDEX_DIR", os.path.join(tmpdir, ".idx"))
+        IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+        db_path = get_index_db_path(tmpdir)
+
+        orig = IndexReader.get_statistics
+
+        def spy(self):
+            # Marker becomes visible during the stats read; stale meta NOT yet cleared →
+            # stats_indicate_load_failure stays False, so only a post-read marker recheck
+            # can catch the partial state.
+            w = sqlite3.connect(str(db_path))
+            w.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+            w.commit()
+            w.close()
+            return orig(self)
+
+        monkeypatch.setattr(IndexReader, "get_statistics", spy)
+
+        res = json.loads(_rlm_index(action="info", path=tmpdir))
+        assert res.get("build_status") == "incomplete"
 
 
 def test_efficiency_hints_in_execute_response_and_log(caplog):

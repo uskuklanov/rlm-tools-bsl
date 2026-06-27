@@ -170,8 +170,8 @@ _MULTILINE_HARD_CAP_CHARS = 2000
 def _count_unquoted_parens(line: str) -> tuple[int, int]:
     """Count `(` and `)` in a line, skipping string-literal contents.
 
-    Matches the trick used by ``bsl_index._strip_code_line`` so that
-    `Знач X = "(не скобка)"` does not unbalance signature merging.
+    Uses the same single-line string-literal trick (strip ``"..."`` content) so
+    that `Знач X = "(не скобка)"` does not unbalance signature merging.
     """
     sanitized = _PROC_STRING_LITERAL_RE.sub("", line)
     return sanitized.count("("), sanitized.count(")")
@@ -1204,7 +1204,10 @@ def _build_full_strategy(
             instant_helpers.extend(["find_register_movements()", "find_register_writers()"])
         file_paths_count = idx_stats.get("file_paths", 0)
         if file_paths_count:
-            instant_helpers.extend(["glob_files(indexed)", "tree(indexed)", "find_files(indexed)"])
+            # find_files() is NOT listed here: it is instant on an index-hit but falls back
+            # to an FS-scan on a zero-hit (v1.26.0) — the conditional behaviour is described
+            # in the tips below, so it must not appear in the unconditional INSTANT list.
+            instant_helpers.extend(["glob_files(indexed)", "tree(indexed)"])
         if synonyms_count:
             instant_helpers.append("search_objects()")
         form_elements_count = idx_stats.get("form_elements", 0)
@@ -1248,7 +1251,7 @@ def _build_full_strategy(
             tips.extend(
                 [
                     f"  - File navigation indexed: {file_paths_count} paths (.bsl/.mdo/.xml) — "
-                    "glob_files(), tree(), find_files() are instant for supported patterns.",
+                    "glob_files(), tree() instant for supported patterns; find_files() instant on index-hit, else FS-fallback (may scan).",
                     "  - FAST: glob_files('**/*.mdo'), glob_files('Subsystems/**/*.mdo'), glob_files('Documents/**'), tree('Documents'), find_files('name')",
                     "  - SLOW (FS fallback): complex globs with multiple wildcards, glob_files('**/Dir*/*.xml')",
                     "  - For BSL modules: ALWAYS prefer find_module()/find_by_type() over glob_files() — faster and more precise.",
@@ -1531,7 +1534,10 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
         instant_helpers.extend(["find_register_movements()", "find_register_writers()"])
     file_paths_count = idx_stats.get("file_paths", 0)
     if file_paths_count:
-        instant_helpers.extend(["glob_files(indexed)", "tree(indexed)", "find_files(indexed)"])
+        # find_files() is NOT listed here: it is instant on an index-hit but falls back
+        # to an FS-scan on a zero-hit (v1.26.0) — the conditional behaviour is described
+        # in the tips below, so it must not appear in the unconditional INSTANT list.
+        instant_helpers.extend(["glob_files(indexed)", "tree(indexed)"])
     if synonyms_count:
         instant_helpers.append("search_objects()")
     form_elements_count = idx_stats.get("form_elements", 0)
@@ -1573,7 +1579,7 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
         tips.extend(
             [
                 f"  - File navigation indexed: {file_paths_count} paths (.bsl/.mdo/.xml) — "
-                "glob_files(), tree(), find_files() are instant for supported patterns.",
+                "glob_files(), tree() instant for supported patterns; find_files() instant on index-hit, else FS-fallback (may scan).",
                 "  - FAST: glob_files('**/*.mdo'), glob_files('Subsystems/**/*.mdo'), glob_files('Documents/**'), tree('Documents'), find_files('name')",
                 "  - SLOW (FS fallback): complex globs with multiple wildcards, glob_files('**/Dir*/*.xml')",
                 "  - For BSL modules: ALWAYS prefer find_module()/find_by_type() over glob_files() — faster and more precise.",

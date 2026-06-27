@@ -510,6 +510,83 @@ def test_cmd_info_missing(_cli_cf_project, capsys):
     assert "Index not found" in capsys.readouterr().out
 
 
+def _build_real_cli_index(tmp_path, monkeypatch):
+    """Build a real (tiny) index under tmp_path and return its db_path."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder, get_index_db_path
+
+    (tmp_path / "Configuration.xml").write_text(_CF_MAIN_XML_FOR_CLI, encoding="utf-8")
+    obj = tmp_path / "Documents" / "X" / "Ext"
+    obj.mkdir(parents=True)
+    (obj / "ObjectModule.bsl").write_text("Процедура П() Экспорт\nКонецПроцедуры\n", encoding="utf-8")
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "_idx"))
+    IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
+    return get_index_db_path(str(tmp_path))
+
+
+def _marker_setting_get_statistics(db_path):
+    """Spy: set build_in_progress=1 DURING the stats read (race window opens), then return
+    real stats. Models a rebuild starting after the pre-read marker check; stale meta stays
+    present so stats_indicate_load_failure is False — only a post-read recheck catches it."""
+    import sqlite3
+
+    from rlm_tools_bsl.bsl_index import IndexReader
+
+    orig = IndexReader.get_statistics
+
+    def spy(self):
+        w = sqlite3.connect(str(db_path))
+        w.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_in_progress', '1')")
+        w.commit()
+        w.close()
+        return orig(self)
+
+    return spy
+
+
+def test_cmd_info_post_read_marker_recheck(tmp_path, monkeypatch, capsys):
+    """CLI 'index info': a concurrent rebuild that marks the DB DURING get_statistics (after
+    the pre-read check) must print 'incomplete', not normal stats (codex High follow-up)."""
+    from rlm_tools_bsl import cli
+    from rlm_tools_bsl.bsl_index import IndexReader
+
+    db_path = _build_real_cli_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(IndexReader, "get_statistics", _marker_setting_get_statistics(db_path))
+
+    cli._cmd_info(_make_cmd_args(path=str(tmp_path)))
+    out = capsys.readouterr().out
+    assert "incomplete" in out.lower()
+    assert "Modules:" not in out
+
+
+def test_cmd_build_post_read_marker_recheck(tmp_path, monkeypatch, capsys):
+    """CLI 'index build' post-read: a marker appearing DURING the read-back get_statistics
+    must print 'incomplete', not a success stats block (codex High follow-up)."""
+    from rlm_tools_bsl import cli
+    from rlm_tools_bsl.bsl_index import IndexReader
+
+    db_path = _build_real_cli_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(IndexReader, "get_statistics", _marker_setting_get_statistics(db_path))
+
+    cli._cmd_build(_make_cmd_args(path=str(tmp_path)))
+    out = capsys.readouterr().out
+    assert "incomplete" in out.lower()
+    assert "Modules:" not in out
+
+
+def test_cmd_update_post_read_marker_recheck(tmp_path, monkeypatch, capsys):
+    """CLI 'index update' post-read: a marker appearing DURING the read-back get_statistics
+    must print 'incomplete', not a normal update summary (codex High follow-up)."""
+    from rlm_tools_bsl import cli
+    from rlm_tools_bsl.bsl_index import IndexReader
+
+    db_path = _build_real_cli_index(tmp_path, monkeypatch)
+    monkeypatch.setattr(IndexReader, "get_statistics", _marker_setting_get_statistics(db_path))
+
+    cli._cmd_update(_make_cmd_args(path=str(tmp_path)))
+    out = capsys.readouterr().out
+    assert "incomplete" in out.lower()
+
+
 def test_cmd_drop_happy_path(_cli_cf_project, capsys, tmp_path):
     from rlm_tools_bsl import cli
 

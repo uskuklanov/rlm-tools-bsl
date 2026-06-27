@@ -32,7 +32,12 @@ _BASELINES = {
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
-_PAYLOAD_BASELINES = {"slim": 18961, "full": 40242}
+# v1.26.0 re-baseline (intentional growth, per this test's own guidance): the new
+# index.index_status machine-contract key (+~22 chars) and the find_files "instant on
+# index-hit, else FS-fallback" hint update. Restores the +5% margin (the v1.23.0
+# baseline sat at ~99% of ceiling, so the documented order-dependent extension-leak
+# flakiness could tip it once the margin shrank).
+_PAYLOAD_BASELINES = {"slim": 19832, "full": 42125}
 _DRIFT = 1.05  # allow ≤5% growth before failing
 
 _IDX_STATS = {
